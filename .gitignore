@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.tgz
+.agents-state/
+__pycache__/

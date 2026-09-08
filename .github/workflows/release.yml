@@ -1,0 +1,56 @@
+# Publishing is human-in-the-loop (bundle/policies/agent-safety-and-autonomy.md §1): this runs on a
+# tag a person cut, never on a merge. A published version is what twenty repositories pin against,
+# and a bad one cannot be recalled from a checkout that already vendored it.
+name: release
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyyaml
+      - name: Tag, package.json and CHANGELOG agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != package.json $pkg"; exit 1; }
+          grep -q "^## \[$tag\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## [$tag]' section (ADR-085 §H.27)"; exit 1; }
+          # The section, bounded at the next release heading. A fixed -A window spills into the
+          # neighbouring release, so a version with no Breaking section passes on someone else's.
+          # index(...)==1 not equality: a Keep-a-Changelog heading carries a date
+          # ("## [1.0.0] - 2026-09-08"), so an exact match finds nothing and the gate would
+          # pass every release by finding no section at all.
+          awk -v tag="## [$tag]" '
+            index($0, tag) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | grep -q '^### Breaking' || {
+            echo "::error::release $tag has no Breaking section (ADR-085 §H.27 makes it mandatory,"
+            echo "::error::and 'Breaking: nothing' is an answer — an absent section is not)"; exit 1; }
+      - name: Record the bundle digest in the release notes
+        run: |
+          echo "digest=$(python tools/agents_bundle.py digest --from .)" >> "$GITHUB_ENV"
+      - run: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: GitHub release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          {
+            echo "Bundle digest for the manifest pin:"
+            echo
+            echo "    sha256: ${{ env.digest }}"
+            echo
+            echo "See CHANGELOG.md for the contract change."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md

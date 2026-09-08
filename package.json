@@ -1,0 +1,17 @@
+{
+  "name": "@exeris/agents",
+  "version": "1.0.0",
+  "description": "Shared Exeris agent bundle: organisation-wide policies, base decision schemas, the L0 hook dispatcher, the eval runner, and the renderer that turns .agents/ into every provider's adapters.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/exeris-systems/exeris-agents.git" },
+  "homepage": "https://github.com/exeris-systems/exeris-agents#readme",
+  "bugs": { "url": "https://github.com/exeris-systems/exeris-agents/issues" },
+  "publishConfig": { "access": "public" },
+  "keywords": ["agents", "agents.md", "agent-skills", "mcp", "claude", "exeris"],
+  "files": ["bundle", "tools", "README.md", "CHANGELOG.md", "LICENSE"],
+  "scripts": {
+    "digest": "python3 tools/agents_bundle.py digest --from .",
+    "check": "python3 tools/agents_file_check.py --root ."
+  }
+}

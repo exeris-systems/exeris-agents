@@ -1,0 +1,23 @@
+# This repository ships the bundle rather than consuming it, so its own agent layer is deliberately
+# thin: no role profiles, no hooks, no evals. It is here so that agents_file_check.py has something
+# to check, and so the repository that defines the v2 layout is itself v2-conformant — a standard
+# whose own home does not follow it is the first thing a reader stops believing.
+version: 2
+repository: exeris-agents
+
+# The bundle cannot import itself. This is the one repository where `imports: []` is structural
+# rather than provisional.
+imports: []
+
+agents: []
+skills: []
+workflows: []
+policies: []
+references: []
+nested: []
+
+adapters: {}
+degradations: {}
+
+provider-owned:
+  - .github/workflows/
