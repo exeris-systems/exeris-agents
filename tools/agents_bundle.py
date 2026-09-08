@@ -151,12 +151,38 @@ def cmd_vendor(a) -> int:
     d = digest_of(entries)
     with open(os.path.join(dest, STAMP), "w", encoding="utf-8") as fh:
         fh.write(d + "\n")
+    retarget_refs(a.root, version)
     print(f"vendored {BUNDLE_NAME} {version} -> {os.path.relpath(dest, a.root)}")
     print(f"digest   {d}")
     print("\nRecord it in .agents/manifest.yaml:\n")
     print(f"imports:\n  - bundle: {BUNDLE_NAME}\n    version: {version}\n"
           f"    ref: {a.ref or '<full commit sha of the bundle checkout>'}\n    sha256: {d}")
     return 0
+
+
+def retarget_refs(root: str, version: str) -> None:
+    """Point the repository's composing schemas at the version just vendored.
+
+    The vendored path carries the version, so every `$ref` into it goes stale on a bump. The
+    agent-file check catches that immediately — but leaving it to be caught means every consuming
+    repository hand-edits every composing schema on every bump, forever. Vendoring owns it
+    instead, and prints what it moved so the change is visible in review rather than silent.
+    """
+    import re
+    d = os.path.join(root, ".agents", "schemas")
+    if not os.path.isdir(d):
+        return
+    pattern = re.compile(rf"(\.\./vendor/{re.escape(BUNDLE_NAME)}-)[^/\"]+(/)")
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(d, name)
+        before = open(path, encoding="utf-8").read()
+        after = pattern.sub(rf"\g<1>{version}\g<2>", before)
+        if after != before:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(after)
+            print(f"retargeted {os.path.join('.agents/schemas', name)} -> {version}")
 
 
 def cmd_verify(a) -> int:
