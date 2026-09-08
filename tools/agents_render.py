@@ -223,8 +223,12 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
             "matcher": hm["matchers"].get(h.get("tool"), "") if h.get("tool") else "",
             "hooks": [{
                 "type": "command",
+                # --on-error is rendered from the hook's own `decision`, so whether it fails
+                # closed is a property of the rule rather than of the hook's name.
                 "command": f"python3 {dispatcher} --hook {h['id']} "
-                           f"--vendor {mapping['vendor']}",
+                           f"--vendor {mapping['vendor']} "
+                           f"--event {h.get('event', 'pre-tool')} "
+                           f"--on-error {'deny' if h.get('decision') in ('deny', 'block-or-allow') else 'allow'}",
                 "timeout": h.get("timeout", 15),
             }],
         }
