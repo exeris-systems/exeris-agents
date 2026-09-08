@@ -8,7 +8,28 @@ and wording is PATCH.
 
 ## [Unreleased]
 
-Nothing yet.
+### Breaking
+
+- Nothing.
+
+### Fixed
+
+- **The L0 layer enforced almost nothing it declared.** Shipped in 1.0.0 and found by review
+  immediately afterwards. Three defects, together making a layer ADR-085 calls "runtime, hard"
+  closer to advisory: hook state was keyed per *checkout* rather than per session, so the first
+  check ever run in a clone discharged the stop gate for every session after it; the recorder
+  matched a script name anywhere in a command string, so `echo adr-filename-check.sh` discharged
+  the gate; and the deny path answered `allow` on a missing pyyaml, an unknown hook id and any
+  exception. State is now keyed by the session the runtime names, recorder patterns are anchored
+  to a command position and ignore a call the runtime reported as failed, and a denying hook that
+  cannot read its own rules refuses instead of allowing.
+- `deny-irreversible` missed `git push origin HEAD:main`, `+main`, `-fu`, `--mirror`, `--all`,
+  `npm publish`, `mvn deploy`, `gh repo delete` and `gh release create`, and denied `git tag -l`,
+  which is read-only.
+- Generated adapters attributed themselves to `exeris-systems/.github`, from before the move.
+
+**Anyone who vendored 1.0.0 should re-vendor.** The 1.0.0 dispatcher reports enforcement it does
+not perform, which is the failure mode the layer exists to prevent.
 
 ## [1.0.0] - 2026-09-08
 
