@@ -42,8 +42,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STOP_BLOCKS = {"claude", "codex"}
 
 
-def repo_root() -> str:
-    d = os.path.abspath(HERE)
+def repo_root(start: str | None = None) -> str:
+    d = os.path.abspath(start or HERE)
     while d != "/":
         if os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git")):
             return d
@@ -115,6 +115,12 @@ def extract(event: dict) -> tuple[str, str]:
     return str(command), str(path)
 
 
+# Canonical event -> the name the Claude/Codex/Copilot envelope must carry. A hook wired to
+# PostToolUse that answers "PreToolUse" is claiming to gate an action that already happened.
+ENVELOPE_EVENT = {"pre-tool": "PreToolUse", "post-tool": "PostToolUse",
+                  "stop": "Stop", "session-start": "SessionStart"}
+
+
 def emit(vendor: str, event_kind: str, decision: str, reason: str) -> int:
     """Print the vendor's decision shape. `decision` is allow | deny | block."""
     if vendor == "cursor":
@@ -126,11 +132,15 @@ def emit(vendor: str, event_kind: str, decision: str, reason: str) -> int:
         payload = {"decision": decision, "reason": reason} if reason else {"decision": decision}
     elif event_kind == "stop":
         payload = {"decision": "block", "reason": reason} if decision == "block" else {}
-    else:
+    elif event_kind == "pre-tool":
         out = {"permissionDecision": "allow" if decision == "allow" else "deny"}
         if reason:
             out["permissionDecisionReason"] = reason
         payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", **out}}
+    else:
+        # post-tool and session-start take no permission decision: there is nothing left to permit.
+        # An empty object is the documented "nothing to say" answer.
+        payload = {}
     print(json.dumps(payload))
     if decision != "allow" and reason:
         print(reason, file=sys.stderr)
@@ -220,10 +230,16 @@ def run(hook_id: str, vendor: str) -> int:
             if not hits:
                 continue
             required = rule.get("requires") or []
-            if any(any(req.rstrip("$").replace("\\", "") in r for r in ran) for req in required):
+            # ALL of them. `any` here would mean a rule listing two checks is discharged by
+            # running either — the gate softens silently the moment a second requirement is added,
+            # which is the failure this whole layer exists to prevent.
+            missing = [req for req in required
+                       if not any(req.rstrip("$").replace("\\", "") in r for r in ran)]
+            if not missing:
                 continue
             reason = " ".join((rule.get("reason") or "").split())
-            blocked.append(f"{reason} (edited: {', '.join(sorted(hits)[:4])})")
+            blocked.append(f"{reason} (edited: {', '.join(sorted(hits)[:4])}; "
+                           f"not run: {', '.join(missing)})")
         if not blocked:
             return emit(vendor, kind, "allow", "")
         text = "L0 gate: " + " | ".join(blocked)

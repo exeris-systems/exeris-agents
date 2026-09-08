@@ -25,7 +25,16 @@ jobs:
           [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != package.json $pkg"; exit 1; }
           grep -q "^## \[$tag\]" CHANGELOG.md || {
             echo "::error::CHANGELOG.md has no '## [$tag]' section (ADR-085 §H.27)"; exit 1; }
-          grep -A40 "^## \[$tag\]" CHANGELOG.md | grep -q '^### Breaking' || {
+          # The section, bounded at the next release heading. A fixed -A window spills into the
+          # neighbouring release, so a version with no Breaking section passes on someone else's.
+          # index(...)==1 not equality: a Keep-a-Changelog heading carries a date
+          # ("## [1.0.0] - 2026-09-08"), so an exact match finds nothing and the gate would
+          # pass every release by finding no section at all.
+          awk -v tag="## [$tag]" '
+            index($0, tag) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | grep -q '^### Breaking' || {
             echo "::error::release $tag has no Breaking section (ADR-085 §H.27 makes it mandatory,"
             echo "::error::and 'Breaking: nothing' is an answer — an absent section is not)"; exit 1; }
       - name: Record the bundle digest in the release notes

@@ -47,6 +47,7 @@ hooks:
     pre-tool:  PreToolUse
     post-tool: PostToolUse
     stop:      Stop
+    session-start: SessionStart
   matchers:
     shell: Bash
     edit:  "Edit|Write|MultiEdit"

@@ -44,6 +44,8 @@ MARK_BEGIN = "<!-- BEGIN GENERATED: composition (agents-md-schema.md rule 5) -->
 MARK_END = "<!-- END GENERATED -->"
 
 CAPABILITIES = {"read", "search", "edit", "shell", "web", "subagents"}
+# How a rendered hook entry is recognised as this renderer's on the next run.
+DISPATCHER_MARK = "hooks/bin/hook.py"
 
 
 def die(msg: str):
@@ -147,6 +149,23 @@ def yaml_scalar(v) -> str:
     return str(v)
 
 
+def yaml_frontmatter(pairs: list[tuple[str, str]]) -> str:
+    """Serialise frontmatter with a YAML dumper.
+
+    An f-string is wrong here and fails silently: a description containing ': ' produces a mapping
+    where a scalar was meant, and one opening with '*', '&', '[' or '{' produces an alias, an
+    anchor or a flow collection. The renderer then reports success over an adapter whose
+    frontmatter no runtime can parse.
+    """
+    import yaml
+    lines = []
+    for k, v in pairs:
+        dumped = yaml.safe_dump({k: v}, default_flow_style=False, allow_unicode=True,
+                                width=10 ** 6, sort_keys=False).rstrip("\n")
+        lines.append(dumped)
+    return "---\n" + "\n".join(lines) + "\n---\n"
+
+
 def render_agent(src: str, mapping: dict, rel: str, vendor_root: str | None = None) -> str:
     fm, body = split_frontmatter(src)
     over = ((fm.get("adapters") or {}).get(mapping["vendor"]) or {})
@@ -159,19 +178,17 @@ def render_agent(src: str, mapping: dict, rel: str, vendor_root: str | None = No
     out.update({k: yaml_scalar(v) for k, v in over.items()})
     keys = [k for k in mapping["frontmatter"] if k in out] + \
            [k for k in out if k not in mapping["frontmatter"]]
-    head = "---\n" + "\n".join(f"{k}: {out[k]}" for k in keys) + "\n---\n"
+    head = yaml_frontmatter([(k, out[k]) for k in keys])
     return f"{head}\n{marker(rel)}\n{body.rstrip()}{generated_section(fm, vendor_root)}"
 
 
 def render_workflow(src: str, mapping: dict, rel: str) -> str:
     fm, body = split_frontmatter(src)
-    head = ("---\n"
-            f"name: {fm['name']}\n"
-            f"description: {fm['description']}\n"
-            # The user invokes it with /name; the model must not pick it up on its own, which is
-            # what the legacy commands/ form guaranteed by being a different file kind.
-            "disable-model-invocation: true\n"
-            "---\n")
+    # The user invokes it with /name; the model must not pick it up on its own, which is what the
+    # legacy commands/ form guaranteed by being a different file kind.
+    head = yaml_frontmatter([("name", fm["name"]),
+                             ("description", fm["description"]),
+                             ("disable-model-invocation", True)])
     return f"{head}\n{marker(rel)}\n{body.rstrip()}\n"
 
 
@@ -194,7 +211,12 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
     for h in spec.get("hooks") or []:
         name = hm["events"].get(h.get("event"))
         if not name:
-            continue
+            # Dropping it quietly is how a hook stops existing on one vendor with nobody knowing.
+            # Either the mapping gains the event or the manifest records losing it.
+            die(f"vendor '{mapping['vendor']}' has no mapping for canonical event "
+                f"'{h.get('event')}' (hook '{h.get('id')}') — add it to "
+                f"agents/adapters/{mapping['vendor']}.yaml, or remove the hook. A silently "
+                f"dropped hook is an unrecorded degradation.")
         if h.get("event") == "stop" and not hm.get("can-block-stop"):
             continue
         entry = {
@@ -214,9 +236,29 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
     settings = {}
     if os.path.exists(path):
         settings = json.loads(open(path, encoding="utf-8").read() or "{}")
-    settings["hooks"] = events
-    settings["_generated"] = ("hooks are generated from .agents/hooks/hooks.yaml by "
-                              "agents_render.py — edit the source, not this block")
+
+    # Merge, never replace. `settings.json` is shared with the human: replacing the whole `hooks`
+    # key deletes every hand-authored hook, silently and irreversibly. Ours are identifiable by the
+    # dispatcher they invoke, so they can be swapped out without touching anything else.
+    def ours(entry) -> bool:
+        return any(DISPATCHER_MARK in (h or {}).get("command", "")
+                   for h in (entry or {}).get("hooks") or [])
+
+    existing = settings.get("hooks") or {}
+    merged: dict[str, list] = {}
+    for name in sorted(set(existing) | set(events)):
+        kept = [e for e in existing.get(name, []) if not ours(e)]
+        merged[name] = kept + events.get(name, [])
+        if not merged[name]:
+            del merged[name]
+    if merged:
+        settings["hooks"] = merged
+    elif "hooks" in settings:
+        del settings["hooks"]
+    # No `_generated` key: settings.json has a schema this renderer does not own, and an
+    # unrecognised top-level key is the renderer editing a document it only contributes to.
+    # `.claude/README.md` is where the generated block is described.
+    settings.pop("_generated", None)
     return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -254,11 +296,11 @@ def link_skills(root: str, skills_dir: str, names: list[str], check: bool, copy:
         dest = os.path.join(dest_root, name)
         rel = os.path.relpath(os.path.join(skills_dir, name))
         if copy:
-            import filecmp, shutil
-            same = (os.path.isdir(dest) and not os.path.islink(dest)
-                    and not filecmp.dircmp(src, dest).diff_files
-                    and not filecmp.dircmp(src, dest).left_only)
-            if same:
+            import shutil
+            # filecmp.dircmp compares one level. A skill's references/ and scripts/ are exactly
+            # where its content lives, so a top-level comparison reports "up to date" over a
+            # stale copy — the silent green this whole review was about.
+            if os.path.isdir(dest) and not os.path.islink(dest) and tree_equal(src, dest):
                 continue
             if check:
                 changes.append(f"{rel} is not an up-to-date copy of .agents/skills/{name}")
@@ -281,6 +323,22 @@ def link_skills(root: str, skills_dir: str, names: list[str], check: bool, copy:
         changes.append(f"{rel} -> {want}")
 
 
+def tree_equal(a: str, b: str) -> bool:
+    """Byte-for-byte over the whole tree, both directions."""
+    def files(base):
+        out = {}
+        for dirpath, dirnames, names in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+            for n in names:
+                full = os.path.join(dirpath, n)
+                out[os.path.relpath(full, base).replace(os.sep, "/")] = full
+        return out
+    fa, fb = files(a), files(b)
+    if set(fa) != set(fb):
+        return False
+    return all(open(fa[k], "rb").read() == open(fb[k], "rb").read() for k in fa)
+
+
 def prune(root: str, directory: str, keep: set[str], check: bool, changes: list[str]) -> None:
     """Remove generated entries the manifest no longer names.
 
@@ -296,12 +354,15 @@ def prune(root: str, directory: str, keep: set[str], check: bool, changes: list[
             continue
         path = os.path.join(d, entry)
         head = ""
-        if os.path.isfile(path):
+        # islink FIRST. os.path.isdir follows a symlink, finds the canonical SKILL.md — which
+        # carries no marker by design — and concludes the entry is not ours, so a stale per-skill
+        # link would never be pruned and the islink branch would be unreachable.
+        if os.path.islink(path):
+            head = "generated from"          # a per-skill link this renderer made
+        elif os.path.isfile(path):
             head = open(path, encoding="utf-8", errors="replace").read(600)
         elif os.path.isdir(path) and os.path.exists(os.path.join(path, "SKILL.md")):
             head = open(os.path.join(path, "SKILL.md"), encoding="utf-8", errors="replace").read(600)
-        elif os.path.islink(path):
-            head = "generated from"          # a per-skill link this renderer made
         if "DO NOT EDIT" not in head and "generated from" not in head.lower():
             continue                          # not ours; leave it and let the check report it
         rel = os.path.join(directory, entry)

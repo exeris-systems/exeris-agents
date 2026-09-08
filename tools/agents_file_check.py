@@ -293,8 +293,12 @@ def check_profile(d: str, rep: Report, strict: bool = True):
         fail(rel, f"profile body is {len(body)} characters (cap {PROFILE_BODY_MAX}) — the "
                        f"tightest vendor agent-body limit", rule="size")
     out = fm.get("output")
-    if out and not os.path.exists(os.path.join(".agents", out)):
-        fail(rel, f"output schema '.agents/{out}' does not exist (rule 13)", rule="schema")
+    if out:
+        # The renderer accepts both spellings, so the checker must too — otherwise the
+        # renderer-supported form is a CI error nobody can act on.
+        target = out if out.startswith(".agents/") else os.path.join(".agents", out)
+        if not os.path.exists(target):
+            fail(rel, f"output schema '{target}' does not exist (rule 13)", rule="schema")
     return fm
 
 
@@ -506,9 +510,13 @@ def check_manifest_agreement(rep: Report, manifest: dict):
         for v in values or []:
             v = str(v)
             v = v[len(sub) + 1:] if v.startswith(sub + "/") else v
-            for suffix in (".md", "/SKILL.md", "/AGENT.md"):
+            # Longest first, and stop at the first match: ".md" tested first would reduce
+            # "x/AGENT.md" to "x/AGENT" and then match nothing else, so the very v1 forms this
+            # helper's docstring promises to accept came out mangled.
+            for suffix in ("/SKILL.md", "/AGENT.md", ".md"):
                 if v.endswith(suffix):
                     v = v[: -len(suffix)]
+                    break
             out.add(v.rstrip("/"))
         return out
 
@@ -586,8 +594,13 @@ def main():
     ap.add_argument("--strict-adapters", action="store_true",
                     help="fail on provider-authored semantics (schema rule 2 — error once the renderer is adopted)")
     a = ap.parse_args()
+    # GitHub resolves ::error file=… against GITHUB_WORKSPACE, and this checker chdirs into the
+    # tree under test. Checking a second checked-out repository would otherwise annotate
+    # same-named files in the first one — the `against-consumer` job annotating the bundle's own
+    # AGENTS.md instead of the consumer's.
+    prefix = os.path.relpath(os.path.abspath(a.root), os.getcwd())
     os.chdir(a.root)
-    rep = Report("agents_file_check")
+    rep = Report("agents_file_check", path_prefix="" if prefix == "." else prefix)
 
     if not os.path.exists("AGENTS.md"):
         rep.error("AGENTS.md", "AGENTS.md is required at the repository root and is the canonical "

@@ -70,17 +70,26 @@ def staged(source: str):
     `digest` and `vendor` MUST agree, or the number a release publishes is not the number a
     consumer can verify — which is how the first pin written here was already wrong.
     """
-    out = []
+    out, missing = [], []
     for sub in VENDORED:
         s = os.path.join(source, "bundle", sub)
         if not os.path.isdir(s):
+            missing.append(f"bundle/{sub}/")
             continue
         for full, rel in iter_files(s):
             out.append((f"{sub}/{rel}", open(full, "rb").read()))
     for src_rel, dest_rel in EXTRA:
         full = os.path.join(source, src_rel)
-        if os.path.exists(full):
-            out.append((dest_rel, open(full, "rb").read()))
+        if not os.path.exists(full):
+            missing.append(src_rel)
+            continue
+        out.append((dest_rel, open(full, "rb").read()))
+    if missing:
+        # Skipping quietly would let a partial checkout — a sparse clone, an interrupted copy —
+        # digest as if it were whole, and that digest then VERIFIES against the pin it produced.
+        # A bundle is either complete or it is not a bundle.
+        sys.exit("agents_bundle: incomplete bundle at "
+                 f"{source} — missing {', '.join(missing)}")
     return out
 
 

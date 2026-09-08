@@ -26,7 +26,25 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+
+
+def repo_root(start: str) -> str:
+    """Walk up to the git checkout.
+
+    `HERE/../..` would be right only when this file sits at `.agents/evals/`. Vendored — and
+    `evals` is in the bundle's vendored set — it sits at `.agents/vendor/<bundle>-<v>/evals/`,
+    where two levels up is `.agents/vendor/`. The same trap the hook dispatcher was written to
+    avoid, and the same escape.
+    """
+    d = os.path.abspath(start)
+    while d != os.path.dirname(d):
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        d = os.path.dirname(d)
+    return os.getcwd()
+
+
+REPO = repo_root(HERE)
 
 # Each runtime returns schema-validated JSON on stdout, which is why the schemas of rule 13 are the
 # grader's input rather than a parsing problem.
