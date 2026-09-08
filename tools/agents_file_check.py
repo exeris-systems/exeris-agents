@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""Agent-file checker — ADR-085 §I.29, agents-md-schema.md hard rules 1, 2, 4, 5, 7, 8, 10-13.
+
+Rule 8's checksum half is delegated to agents_bundle.py, which owns the digest.
+
+Replaces claude_md_check.py, which enforced the superseded CLAUDE.md schema: a fixed list of
+verbatim headings. The current schema puts the canonical entry point at AGENTS.md, the canonical
+semantics under .agents/, and leaves the prose and heading names to the repository — so this
+checker verifies structure, size, skill layout, manifest pinning and adapter discipline, and
+deliberately checks nothing about wording.
+
+Schema v2 (2026-09-08) added five rules and this checker covers four of them: role profiles live
+at .agents/agents/<name>/AGENT.md and never at a lowercase agent.md (10), canonical frontmatter is
+vendor-neutral and carries no tool names (11), hooks are declared once and their dispatcher exists
+(12), and a declared output schema is a real, valid JSON Schema (13). Rule 14 — that a covered
+change reran its evals — is not checkable from a checkout and stays [L2].
+
+Not mechanically checkable, and therefore left to review ([L2] in the schema): whether AGENTS.md
+covers its six concerns in order, whether a rule is encoded as the right kind of artefact, and
+whether a reference is linked rather than copied.
+"""
+from __future__ import annotations
+import argparse, io, os, re, sys
+sys.path.insert(0, os.path.dirname(__file__))
+from _common import Report, read_frontmatter
+
+ROOT_LIMIT = 8 * 1024          # rule 1: AGENTS.md is an index and a safety boundary
+NESTED_LIMIT = 4 * 1024        # nested AGENTS.md add scope-specific rules only
+ADAPTER_MAX_LINES = 20         # a provider entry file points at the canonical source
+
+# Provider directories are adapters (rule 7). Semantic content must not be authored here (rule 2).
+PROVIDER_DIRS = [".claude", ".github", ".codex", ".cursor", ".gemini", ".clinerules"]
+# Subtrees inside them that carry semantics rather than operational configuration.
+SEMANTIC_SUBDIRS = ["agents", "prompts", "skills", "rules", "policies", "workflows"]
+# Rule 7 keeps operational configuration provider-owned: GitHub Actions are not a semantic adapter,
+# and .github/workflows collides by name with the semantic .agents/workflows.
+OPERATIONAL = {os.path.join(".github", "workflows")}
+# Provider entry files that may exist only as thin adapters.
+ADAPTER_FILES = ["CLAUDE.md", "GEMINI.md", ".cursorrules", ".github/copilot-instructions.md"]
+# A generated adapter says so and says where it came from (rule 7).
+GENERATED = re.compile(r"do[- ]not[- ]edit|generated from|@generated", re.I)
+
+# A path rooted in somebody's home directory is true on one machine. In a public repository an
+# instruction built on one does not fail for a reader who does not have it — the grep finds nothing
+# and they draw a conclusion from the silence. Repository names are public and carry no such
+# problem, so the fix is to name the repository and leave the sibling checkout as a convenience,
+# not to delete the reference.
+#
+# `/home/runner/` is excluded: that is the GitHub Actions user, and an agent file describing what
+# CI does is describing a real, shared machine.
+MACHINE_PATH = re.compile(
+    r"(?<![\w/~])~/[\w.]"                                    # ~/exeris-systems, ~/.m2 — not a bare ~ or ~~struck~~
+    r"|(?<![\w/])/home/(?!runner/)[a-z_][a-z0-9_-]*/"        # /home/<someone>/ but not the Actions user
+    r"|(?<![\w/])/Users/[A-Za-z][\w .-]*/"                   # macOS
+    r"|(?<![\w])[A-Za-z]:\\Users\\[^\\\s]+")               # Windows, which has no trailing-slash rule
+
+SKIP = (".git", "node_modules", "target", "build", "dist")
+# .agents/vendor/ holds a pinned copy of the shared bundle. Its portability and its
+# contents are the bundle repository's to check; here it is verified by digest, and
+# re-reporting its findings would put them on a worklist nobody can act on locally.
+VENDOR = os.path.join(".agents", "vendor")
+
+
+def nested_checkout(dirpath: str, name: str) -> bool:
+    """True for a directory that is its own git checkout — a worktree parked under .claude/, a
+    submodule. Its files belong to that repository and are reported when *it* is checked; CI never
+    sees them at all, because a fresh clone has none. Before this, a worktree left under
+    .claude/worktrees/ produced a size ERROR against an AGENTS.md that is not this repo's copy.
+    """
+    return os.path.exists(os.path.join(dirpath, name, ".git"))
+
+
+SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+NAME_MAX = 64
+
+# rule 11 — the canonical vocabulary. A vendor's tool names are not in it, which is the point:
+# a profile that names them has been written against one runtime.
+CAPABILITIES = {"read", "search", "edit", "shell", "web", "subagents"}
+MCP_CAPABILITY = re.compile(r"^mcp:[a-z0-9][a-z0-9_-]*$")
+ROLES = {"router", "reviewer", "implementer", "evaluator", "specialist"}
+MODES = {"read-only", "edit", "autonomous"}
+MODEL_TIERS = {"inherit", "fast", "balanced", "strong"}
+
+# Vendor tool names seen in the wild, used only to give a better message than "unknown capability"
+# when someone pastes a v1 profile in.
+VENDOR_TOOL_HINT = re.compile(r"^(Read|Write|Edit|Grep|Glob|Bash|WebFetch|WebSearch|Task|TodoWrite)$")
+
+# rule 1 / naming table — the tightest cap each vendor imposes on a body.
+PROFILE_BODY_MAX = 30_000
+WORKFLOW_BODY_MAX = 12_000
+# rule 8: an import is pinned to a version, never to a moving target.
+FLOATING = re.compile(r"^(latest|main|master|head|\*|~|\^)", re.I)
+
+
+def check_agents_md(path: str, rep: Report, limit: int, kind: str):
+    size = os.path.getsize(path)
+    if size > limit:
+        rep.error(path, f"{kind} AGENTS.md is {size // 1024} KB (limit {limit // 1024} KB) — "
+                        f"move detail into .agents/ or docs/ and link it", rule="size")
+    text = open(path, encoding="utf-8", errors="replace").read()
+    if not text.strip():
+        rep.error(path, "AGENTS.md is empty", rule="content")
+    return text
+
+
+def check_skill(d: str, rep: Report):
+    """rule 4 — .agents/skills/<name>/SKILL.md, with name and a precise description."""
+    name = os.path.basename(d)
+    path = os.path.join(d, "SKILL.md")
+    rel = os.path.relpath(path)
+    if not os.path.exists(path):
+        rep.error(os.path.relpath(d), f"skill directory '{name}' has no SKILL.md", rule="skill-path")
+        return
+    if not SKILL_NAME.match(name):
+        rep.error(rel, f"skill directory '{name}' is not lowercase kebab-case", rule="skill-path")
+    fm, _ = read_frontmatter(path)
+    if fm is None or fm.get("__invalid__"):
+        rep.error(rel, "SKILL.md needs YAML frontmatter with 'name' and 'description'", rule="skill-metadata")
+        return
+    if fm.get("name") != name:
+        rep.error(rel, f"frontmatter name '{fm.get('name')}' does not match the directory '{name}'",
+                  rule="skill-metadata")
+    desc = (fm.get("description") or "").strip()
+    if not desc:
+        rep.error(rel, "SKILL.md frontmatter needs a 'description'", rule="skill-metadata")
+    elif len(desc) < 40:
+        rep.warning(rel, "description should name both what the skill does and when it applies "
+                         f"(got {len(desc)} characters)", rule="skill-metadata")
+
+
+def check_manifest(path: str, rep: Report) -> dict:
+    """rules 5 and 8 — the manifest composes, and imports are pinned to an approved bundle."""
+    import yaml
+    rel = os.path.relpath(path)
+    try:
+        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+    except Exception as e:
+        rep.error(rel, f"manifest.yaml is not valid YAML ({type(e).__name__})", rule="manifest")
+        return {}
+    if not isinstance(data, dict):
+        rep.error(rel, "manifest.yaml must be a mapping", rule="manifest")
+        return {}
+    for key in ("version", "imports"):
+        if key not in data:
+            rep.warning(rel, f"manifest.yaml has no '{key}' key", rule="manifest")
+    imports = data.get("imports") or []
+    if isinstance(imports, dict):
+        imports = [{"name": k, **(v if isinstance(v, dict) else {"version": v})} for k, v in imports.items()]
+    for imp in imports if isinstance(imports, list) else []:
+        if not isinstance(imp, dict):
+            rep.error(rel, f"import entry is not a mapping: {imp!r}", rule="pinned-import")
+            continue
+        nm = imp.get("bundle") or imp.get("name") or "?"
+        ver = str(imp.get("version", "")).strip()
+        if not ver:
+            rep.error(rel, f"import '{nm}' has no version — rule 8 requires a version-pinned bundle",
+                      rule="pinned-import")
+        elif FLOATING.match(ver):
+            rep.error(rel, f"import '{nm}' is pinned to a moving target ('{ver}')", rule="pinned-import")
+        src = str(imp.get("url", "") or imp.get("source", ""))
+        if src.startswith(("http://", "https://")) and not (imp.get("checksum") or imp.get("sha256")):
+            rep.error(rel, f"import '{nm}' fetches from {src} without a checksum", rule="pinned-import")
+    return data
+
+
+def check_pinned_bundle(rep: Report, manifest: dict, root: str):
+    """rule 8, the half that needs the bytes — a pin nobody verifies is a comment.
+
+    The digest lives in agents_bundle.py so there is one definition of it; this is the CI entry
+    point that makes `[L1: pinned-import and checksum check]` name a check that exists.
+    """
+    if not pinned_bundle(manifest):
+        return
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents_bundle.py")
+    if not os.path.exists(script):
+        rep.warning(os.path.join(".agents", "manifest.yaml"),
+                    "a bundle is pinned but agents_bundle.py is not beside this checker, so the "
+                    "digest was not verified", rule="pinned-import")
+        return
+    rep.checked += 1
+    proc = subprocess.run([sys.executable, script, "verify", "--root", root],
+                          capture_output=True, text=True)
+    if proc.returncode == 0:
+        return
+    # agents_bundle.py already emitted its own annotations, with the two digests in them. Record
+    # exactly one finding here so emit() exits 1, rather than paraphrasing them at a second
+    # severity and making one problem look like three.
+    rep.error(os.path.join(".agents", "manifest.yaml"),
+              "the pinned bundle import does not verify — see the agents_bundle annotation above "
+              "for which half is wrong (rule 8)", rule="pinned-import")
+
+
+def pinned_bundle(manifest: dict) -> dict | None:
+    for imp in manifest.get("imports") or []:
+        if isinstance(imp, dict) and imp.get("bundle"):
+            return imp
+    return None
+
+
+def check_machine_paths(path: str, rep: Report):
+    """agents-md-schema rule 4 — an agent file is portable to whoever checks the repository out.
+
+    Warning, not error: nothing here is wrong on the machine that wrote it, and every finding
+    needs a human to decide what the reference should say instead.
+    """
+    try:
+        lines = io.open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return
+    hits = [(i, m.group(0)) for i, l in enumerate(lines, 1)
+            for m in [MACHINE_PATH.search(l)] if m]
+    if not hits:
+        return
+    first_line, first = hits[0]
+    rep.warning(os.path.relpath(path),
+                f"{len(hits)} line(s) hard-code a path under someone's home directory "
+                f"(first: '{first}…'). An agent reading this repository on another machine has no "
+                f"such directory and the instruction fails silently — name the repository, and make "
+                f"the sibling path a stated convenience",
+                line=first_line, rule="machine-path")
+
+
+def _body_of(path: str) -> str:
+    text = open(path, encoding="utf-8", errors="replace").read()
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---", 4)
+    return text[end + 4:] if end >= 0 else text
+
+
+def check_profile(d: str, rep: Report, strict: bool = True):
+    """rules 10 and 11 — the AGENT.md layout, and frontmatter that is safe to be read raw.
+
+    `strict` follows the repository's own manifest version. A repository still on v1 gets these as
+    warnings: the checker ships to every repository at once and the migrations land one at a time,
+    so binding v2 before a repository has migrated turns its CI red for work it has not been asked
+    to do yet. Declaring `version: 2` is what opts a repository in — the same shape as
+    frontmatter_check.py's ramp/strict, and the same reason.
+    """
+    fail = rep.error if strict else rep.warning
+    name = os.path.basename(d)
+    path = os.path.join(d, "AGENT.md")
+    rel = os.path.relpath(path)
+    if not os.path.exists(path):
+        fail(os.path.relpath(d), f"role profile '{name}' has no AGENT.md — a profile lives at "
+                                      f".agents/agents/<name>/AGENT.md (rule 10)", rule="profile-path")
+        return
+    if not SKILL_NAME.match(name) or len(name) > NAME_MAX:
+        fail(rel, f"profile directory '{name}' must be lowercase kebab-case, at most "
+                       f"{NAME_MAX} characters (rule 10)", rule="profile-path")
+    fm, _ = read_frontmatter(path)
+    if fm is None or fm.get("__invalid__"):
+        fail(rel, "AGENT.md needs YAML frontmatter (rule 11)", rule="profile-metadata")
+        return
+    if fm.get("name") != name:
+        fail(rel, f"frontmatter name '{fm.get('name')}' does not match the directory '{name}'",
+                  rule="profile-metadata")
+    if not (fm.get("description") or "").strip():
+        fail(rel, "AGENT.md frontmatter needs a 'description' — it is the routing text every "
+                       "runtime reads", rule="profile-metadata")
+
+    if "tools" in fm:
+        fail(rel, "canonical frontmatter must not carry a vendor 'tools' list (rule 11): "
+                       "declare `capabilities`, and put a vendor list under `adapters.<vendor>.tools`",
+                  rule="vendor-neutral")
+    caps = fm.get("capabilities")
+    if not caps:
+        fail(rel, "'capabilities' is required (rule 11)", rule="vendor-neutral")
+    else:
+        for c in caps if isinstance(caps, list) else [caps]:
+            if c in CAPABILITIES or MCP_CAPABILITY.match(str(c)):
+                continue
+            hint = (" — that is a vendor tool name, not a capability" if VENDOR_TOOL_HINT.match(str(c))
+                    else f" — expected one of {', '.join(sorted(CAPABILITIES))} or mcp:<server>")
+            fail(rel, f"unknown capability '{c}'{hint}", rule="vendor-neutral")
+    for key, allowed in (("role", ROLES), ("mode", MODES)):
+        if key not in fm:
+            fail(rel, f"'{key}' is required (rule 11)", rule="profile-metadata")
+        elif fm[key] not in allowed:
+            fail(rel, f"{key} '{fm[key]}' is not one of {', '.join(sorted(allowed))}",
+                      rule="profile-metadata")
+    if fm.get("model", "inherit") not in MODEL_TIERS:
+        fail(rel, f"model '{fm.get('model')}' is a model id, not a tier — use one of "
+                       f"{', '.join(sorted(MODEL_TIERS))} and map it in the vendor adapter (rule 11)",
+                  rule="vendor-neutral")
+    # A read-only role holding edit capability is the contradiction that makes `mode` worth having.
+    if fm.get("mode") == "read-only" and isinstance(caps, list) and "edit" in caps:
+        fail(rel, "mode is read-only but capabilities include 'edit'", rule="vendor-neutral")
+
+    body = _body_of(path)
+    if len(body) > PROFILE_BODY_MAX:
+        fail(rel, f"profile body is {len(body)} characters (cap {PROFILE_BODY_MAX}) — the "
+                       f"tightest vendor agent-body limit", rule="size")
+    out = fm.get("output")
+    if out and not os.path.exists(os.path.join(".agents", out)):
+        fail(rel, f"output schema '.agents/{out}' does not exist (rule 13)", rule="schema")
+    return fm
+
+
+def check_no_lowercase_agent_md(rep: Report, strict: bool = True):
+    """rule 10 — one runtime discovers .agents/agents/<name>/agent.md natively, which is the same
+    path as the canonical file on a case-insensitive filesystem. A single file must not be both the
+    source and an adapter."""
+    fail = rep.error if strict else rep.warning
+    root = os.path.join(".agents", "agents")
+    if not os.path.isdir(root):
+        return
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            if f == "agent.md":
+                fail(os.path.relpath(os.path.join(dirpath, f)),
+                          "a lowercase 'agent.md' under .agents/agents/ collides with the canonical "
+                          "AGENT.md on a case-insensitive filesystem (rule 10) — rename it, or let "
+                          "the renderer emit the vendor adapter elsewhere", rule="profile-path")
+        if os.path.normpath(dirpath) == os.path.normpath(root):
+            for f in files:
+                if f.endswith(".md"):
+                    fail(os.path.relpath(os.path.join(dirpath, f)),
+                              "a role profile lives at .agents/agents/<name>/AGENT.md, not as a flat "
+                              "file (rule 10)", rule="profile-path")
+
+
+def check_workflows(rep: Report, agents: set[str], skills: set[str]):
+    """rule 5 plus the workflow header — declared steps and gates must name things that exist."""
+    d = os.path.join(".agents", "workflows")
+    if not os.path.isdir(d):
+        return
+    for f in sorted(os.listdir(d)):
+        if not f.endswith(".md"):
+            continue
+        path, rel = os.path.join(d, f), os.path.relpath(os.path.join(d, f))
+        rep.checked += 1
+        fm, _ = read_frontmatter(path)
+        if fm is None or fm.get("__invalid__"):
+            rep.error(rel, "workflow needs YAML frontmatter with a name and a description",
+                      rule="workflow")
+            continue
+        stem = f[:-3]
+        if fm.get("name") and fm["name"] != stem:
+            rep.error(rel, f"frontmatter name '{fm['name']}' does not match the filename '{stem}'",
+                      rule="workflow")
+        if not (fm.get("description") or "").strip():
+            rep.error(rel, "workflow frontmatter needs a 'description'", rule="workflow")
+        body = _body_of(path)
+        if len(body) > WORKFLOW_BODY_MAX:
+            rep.error(rel, f"workflow body is {len(body)} characters (cap {WORKFLOW_BODY_MAX})",
+                      rule="size")
+        for step in fm.get("steps") or []:
+            if not isinstance(step, dict):
+                rep.error(rel, f"step is not a mapping: {step!r}", rule="workflow")
+                continue
+            if step.get("agent") and step["agent"] not in agents:
+                rep.error(rel, f"step names agent '{step['agent']}', which does not exist",
+                          rule="workflow")
+            if step.get("skill") and step["skill"] not in skills:
+                rep.error(rel, f"step names skill '{step['skill']}', which does not exist",
+                          rule="workflow")
+
+
+def refs_in(node):
+    """Every $ref value anywhere in a schema."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "$ref" and isinstance(v, str):
+                yield v
+            else:
+                yield from refs_in(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from refs_in(v)
+
+
+def check_schemas(rep: Report):
+    """rule 13 — the decision handoffs are real, valid JSON Schema."""
+    import json
+    d = os.path.join(".agents", "schemas")
+    if not os.path.isdir(d):
+        return
+    try:
+        from jsonschema import Draft202012Validator as Validator
+    except ImportError:
+        Validator = None
+    for f in sorted(os.listdir(d)):
+        if not f.endswith(".json"):
+            continue
+        rel = os.path.relpath(os.path.join(d, f))
+        rep.checked += 1
+        try:
+            schema = json.load(open(os.path.join(d, f), encoding="utf-8"))
+        except Exception as e:
+            rep.error(rel, f"not valid JSON ({type(e).__name__}: {e})", rule="schema")
+            continue
+        if not f.endswith(".schema.json"):
+            rep.error(rel, "a schema file is named <name>.schema.json", rule="schema")
+        # A relative $ref is how a repository narrows a vendored base without copying it. It is
+        # also the thing that silently stops resolving when a bundle version is bumped and the
+        # composing schema is not, so the target is checked as a file rather than assumed.
+        for ref in refs_in(schema):
+            # A fragment-only ref points inside this same document — local, offline, fine. It is a
+            # URL that is the problem: resolving one needs a fetch, and rule 8 forbids fetching.
+            if ref.startswith("#"):
+                continue
+            if ref.startswith(("http://", "https://")):
+                rep.error(rel, f"$ref '{ref}' is a URL — a vendored bundle resolves from the "
+                               f"filesystem, and fetching one at validation time is what rule 8 "
+                               f"forbids. Use a relative path into .agents/vendor/.", rule="schema")
+                continue
+            target = os.path.normpath(os.path.join(d, ref.split("#", 1)[0]))
+            if not os.path.exists(target):
+                rep.error(rel, f"$ref target does not exist: {ref}", rule="schema")
+        if Validator is None:
+            rep.warning(rel, "jsonschema is not installed; only JSON syntax was checked",
+                        rule="schema")
+            continue
+        try:
+            Validator.check_schema(schema)
+        except Exception as e:
+            rep.error(rel, f"not a valid JSON Schema: {e}", rule="schema")
+
+
+def check_hooks(rep: Report, manifest: dict):
+    """rule 12 — hooks are authored once, their dispatcher exists, and what a vendor cannot do is
+    written down rather than assumed."""
+    import yaml
+    spec_path = os.path.join(".agents", "hooks", "hooks.yaml")
+    if not os.path.exists(spec_path):
+        return
+    rel = os.path.relpath(spec_path)
+    rep.checked += 1
+    try:
+        spec = yaml.safe_load(open(spec_path, encoding="utf-8")) or {}
+    except Exception as e:
+        rep.error(rel, f"hooks.yaml is not valid YAML ({type(e).__name__})", rule="hooks")
+        return
+    events = {"pre-tool", "post-tool", "stop", "session-start"}
+    seen = set()
+    for h in spec.get("hooks") or []:
+        hid = h.get("id")
+        if not hid:
+            rep.error(rel, f"hook without an id: {h!r}", rule="hooks")
+            continue
+        if hid in seen:
+            rep.error(rel, f"duplicate hook id '{hid}'", rule="hooks")
+        seen.add(hid)
+        if h.get("event") not in events:
+            rep.error(rel, f"hook '{hid}' has event '{h.get('event')}' — expected one of "
+                           f"{', '.join(sorted(events))}", rule="hooks")
+        for pat in h.get("match") or []:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                rep.error(rel, f"hook '{hid}' has an invalid pattern {pat!r}: {e}", rule="hooks")
+        if h.get("decision") == "deny" and not (h.get("reason") or "").strip():
+            rep.error(rel, f"hook '{hid}' denies without a reason — a denial names the policy "
+                           f"clause it enforces (rule 12)", rule="hooks")
+    # The dispatcher normally arrives with the pinned bundle; a repository that imports none keeps
+    # its own copy. Either is fine, neither is optional.
+    candidates = [os.path.join(".agents", "hooks", "bin", "hook.py")]
+    imp = pinned_bundle(manifest)
+    if imp:
+        candidates.insert(0, os.path.join(VENDOR, f"{imp['bundle']}-{imp.get('version')}",
+                                          "hooks", "bin", "hook.py"))
+    dispatcher = next((c for c in candidates if os.path.exists(c)), None)
+    if dispatcher is None:
+        rep.error(rel, f"no hook dispatcher at any of {', '.join(candidates)} — the rendered "
+                       f"vendor configs invoke it and carry no patterns of their own", rule="hooks")
+    elif not os.access(dispatcher, os.X_OK):
+        rep.warning(dispatcher, "dispatcher is not executable", rule="hooks")
+    state = (spec.get("state-dir") or ".agents-state").rstrip("/")
+    ignored = ""
+    if os.path.exists(".gitignore"):
+        ignored = open(".gitignore", encoding="utf-8", errors="replace").read()
+    if state not in ignored:
+        rep.error(".gitignore", f"hook state directory '{state}/' is not git-ignored — session "
+                                f"state is not repository content", rule="hooks")
+    # A stop hook that cannot block everywhere must say where it degrades.
+    if any(h.get("event") == "stop" for h in spec.get("hooks") or []):
+        if not manifest.get("degradations"):
+            rep.error(os.path.join(".agents", "manifest.yaml"),
+                      "hooks include a stop gate but the manifest records no `degradations` — only "
+                      "some runtimes can block a stop, and an unrecorded degradation is an operator "
+                      "believing a gate runs where it does not (rule 12)", rule="hooks")
+
+
+def check_manifest_agreement(rep: Report, manifest: dict):
+    """rule 5 — the manifest and the filesystem agree in BOTH directions."""
+    rel = os.path.join(".agents", "manifest.yaml")
+
+    def on_disk_dirs(sub, marker_file):
+        d = os.path.join(".agents", sub)
+        if not os.path.isdir(d):
+            return set()
+        return {n for n in os.listdir(d)
+                if os.path.exists(os.path.join(d, n, marker_file))}
+
+    def on_disk_files(sub, suffix=".md"):
+        d = os.path.join(".agents", sub)
+        if not os.path.isdir(d):
+            return set()
+        return {n[:-len(suffix)] for n in os.listdir(d) if n.endswith(suffix)}
+
+    def stems(values, sub):
+        """v1 listed paths ('agents/x.md'); v2 lists names. Accept both, compare names."""
+        out = set()
+        for v in values or []:
+            v = str(v)
+            v = v[len(sub) + 1:] if v.startswith(sub + "/") else v
+            for suffix in (".md", "/SKILL.md", "/AGENT.md"):
+                if v.endswith(suffix):
+                    v = v[: -len(suffix)]
+            out.add(v.rstrip("/"))
+        return out
+
+    for key, sub, disk in (
+        ("agents", "agents", on_disk_dirs("agents", "AGENT.md")),
+        ("skills", "skills", on_disk_dirs("skills", "SKILL.md")),
+        ("workflows", "workflows", on_disk_files("workflows")),
+        ("policies", "policies", on_disk_files("policies")),
+        ("references", "references", on_disk_files("references")),
+    ):
+        declared = stems(manifest.get(key), sub)
+        for missing in sorted(declared - disk):
+            rep.error(rel, f"manifest lists {key[:-1]} '{missing}' but it does not exist on disk",
+                      rule="manifest")
+        for undeclared in sorted(disk - declared):
+            rep.error(rel, f".agents/{sub}/{undeclared} exists but the manifest does not name it — "
+                           f"an unlisted file is invisible to the renderer and to the reviewer",
+                      rule="manifest")
+    declared_schemas = {str(s).replace(".schema.json", "") for s in manifest.get("schemas") or []}
+    disk_schemas = {n[: -len(".schema.json")] for n in
+                    (os.listdir(os.path.join(".agents", "schemas"))
+                     if os.path.isdir(os.path.join(".agents", "schemas")) else [])
+                    if n.endswith(".schema.json")}
+    for missing in sorted(declared_schemas - disk_schemas):
+        rep.error(rel, f"manifest lists schema '{missing}' but it does not exist", rule="manifest")
+    for undeclared in sorted(disk_schemas - declared_schemas):
+        rep.error(rel, f".agents/schemas/{undeclared}.schema.json exists but is not in the manifest",
+                  rule="manifest")
+
+
+def check_adapters(rep: Report, strict: bool, provider_owned: set[str] | None = None):
+    """rules 2 and 7 — provider directories adapt; they do not author."""
+    level = rep.error if strict else rep.warning
+    for pf in ADAPTER_FILES:
+        if not os.path.exists(pf):
+            continue
+        lines = [l for l in open(pf, encoding="utf-8", errors="replace").read().splitlines() if l.strip()]
+        if len(lines) > ADAPTER_MAX_LINES and not GENERATED.search("\n".join(lines[:10])):
+            level(pf, f"{pf} has {len(lines)} non-empty lines — a provider entry file is a thin adapter "
+                      f"(<= {ADAPTER_MAX_LINES} lines) pointing at AGENTS.md, or is generated and says so",
+                  rule="adapter")
+    owned = OPERATIONAL | {p.rstrip("/") for p in (provider_owned or set())}
+
+    def is_owned(rel_path: str) -> bool:
+        rel_path = rel_path.replace(os.sep, "/")
+        return any(rel_path == o or rel_path.startswith(o.rstrip("/") + "/") for o in owned)
+
+    for pd in PROVIDER_DIRS:
+        for sub in SEMANTIC_SUBDIRS:
+            d = os.path.join(pd, sub)
+            if not os.path.isdir(d) or is_owned(d):
+                continue
+            authored = []
+            # followlinks stays off: a per-skill symlink into .agents/skills/ points at the
+            # canonical source, which carries no marker by design. Following it would report every
+            # skill as provider-authored — the exact opposite of what the link achieves.
+            for dirpath, _, files in os.walk(d):
+                for f in files:
+                    if not f.endswith((".md", ".mdc", ".yaml", ".yml")):
+                        continue
+                    p = os.path.join(dirpath, f)
+                    if is_owned(os.path.relpath(p)):
+                        continue
+                    head = open(p, encoding="utf-8", errors="replace").read(600)
+                    if not GENERATED.search(head):
+                        authored.append(os.path.relpath(p))
+            if authored:
+                level(d, f"{len(authored)} file(s) under {d}/ carry no generated-from marker — "
+                         f"semantic content belongs in .agents/ (first: {authored[0]})", rule="adapter")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--strict-adapters", action="store_true",
+                    help="fail on provider-authored semantics (schema rule 2 — error once the renderer is adopted)")
+    a = ap.parse_args()
+    os.chdir(a.root)
+    rep = Report("agents_file_check")
+
+    if not os.path.exists("AGENTS.md"):
+        rep.error("AGENTS.md", "AGENTS.md is required at the repository root and is the canonical "
+                               "agent entry point (agents-md-schema.md rule 1)", rule="present")
+    else:
+        rep.checked += 1
+        text = check_agents_md("AGENTS.md", rep, ROOT_LIMIT, "root")
+        if os.path.isdir(".agents") and ".agents" not in text:
+            rep.warning("AGENTS.md", "AGENTS.md does not point at .agents/, which holds this repo's "
+                                     "canonical semantics", rule="discovery")
+
+    for dirpath, dirnames, files in os.walk("."):
+        dirnames[:] = [d for d in dirnames if d not in SKIP and not nested_checkout(dirpath, d)]
+        if "AGENTS.md" in files and os.path.relpath(dirpath) != ".":
+            rep.checked += 1
+            check_agents_md(os.path.join(dirpath, "AGENTS.md"), rep, NESTED_LIMIT, "nested")
+
+    if os.path.isdir(".agents"):
+        skills = os.path.join(".agents", "skills")
+        if os.path.isdir(skills):
+            for name in sorted(os.listdir(skills)):
+                d = os.path.join(skills, name)
+                if os.path.isdir(d):
+                    rep.checked += 1
+                    check_skill(d, rep)
+        for dirpath, _, files in os.walk(".agents"):
+            if os.path.relpath(dirpath).startswith(VENDOR):
+                continue
+            for f in files:
+                if f == "SKILL.md":
+                    p = os.path.join(dirpath, f)
+                    parent = os.path.dirname(os.path.dirname(p))
+                    if os.path.normpath(parent) != os.path.normpath(skills):
+                        rep.error(os.path.relpath(p),
+                                  "a skill lives at .agents/skills/<name>/SKILL.md", rule="skill-path")
+        manifest_path = os.path.join(".agents", "manifest.yaml")
+        declared_v2 = False
+        if os.path.exists(manifest_path):
+            import yaml
+            try:
+                declared_v2 = str((yaml.safe_load(open(manifest_path, encoding="utf-8")) or {})
+                                  .get("version")) == "2"
+            except Exception:
+                pass
+
+        profiles = os.path.join(".agents", "agents")
+        profile_names: set[str] = set()
+        if os.path.isdir(profiles):
+            for name in sorted(os.listdir(profiles)):
+                d = os.path.join(profiles, name)
+                if os.path.isdir(d):
+                    rep.checked += 1
+                    profile_names.add(name)
+                    check_profile(d, rep, declared_v2)
+        check_no_lowercase_agent_md(rep, declared_v2)
+
+        skill_names = {n for n in (os.listdir(skills) if os.path.isdir(skills) else [])
+                       if os.path.isdir(os.path.join(skills, n))}
+        check_workflows(rep, profile_names, skill_names)
+        check_schemas(rep)
+
+        manifest: dict = {}
+        if os.path.exists(manifest_path):
+            rep.checked += 1
+            manifest = check_manifest(manifest_path, rep) or {}
+        else:
+            rep.error(manifest_path, ".agents/ has no manifest.yaml — it records composition and the "
+                                     "version-pinned bundles the repo imports (rules 5, 8)",
+                      rule="manifest")
+        if manifest:
+            check_pinned_bundle(rep, manifest, os.getcwd())
+            check_hooks(rep, manifest)
+            if declared_v2:
+                check_manifest_agreement(rep, manifest)
+            else:
+                rep.warning(manifest_path,
+                            "manifest is version 1 — the v2 rules (10-13) are reported as warnings "
+                            "here. Migrating means moving profiles to agents/<name>/AGENT.md, "
+                            "replacing `tools:` with `capabilities:`, and setting version: 2 "
+                            "(agents-md-schema.md, Migration)", rule="schema-version")
+
+    # Portability sweep over the files a human authors. Generated adapters are skipped on purpose:
+    # check_adapters already ties them to their source, so reporting the same path twice would
+    # double a worklist whose only actionable copy is the one under .agents/.
+    authored = []
+    if os.path.exists("AGENTS.md"):
+        authored.append("AGENTS.md")
+    for dirpath, dirnames, files in os.walk("."):
+        dirnames[:] = [d for d in dirnames if d not in SKIP and not nested_checkout(dirpath, d)]
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            rel = os.path.relpath(fp)
+            if rel == "AGENTS.md":
+                continue
+            if rel.startswith(VENDOR + os.sep):
+                continue
+            in_agents = rel == ".agents" or rel.startswith(".agents" + os.sep)
+            if not (in_agents or f == "AGENTS.md" or rel in ADAPTER_FILES):
+                continue
+            if not f.endswith((".md", ".mdc", ".yaml", ".yml")):
+                continue
+            if GENERATED.search(open(fp, encoding="utf-8", errors="replace").read(600)):
+                continue
+            authored.append(rel)
+    for fp in sorted(set(authored)):
+        check_machine_paths(fp, rep)
+
+    provider_owned = set()
+    if os.path.isdir(".agents") and os.path.exists(os.path.join(".agents", "manifest.yaml")):
+        import yaml
+        try:
+            provider_owned = set(
+                (yaml.safe_load(open(os.path.join(".agents", "manifest.yaml"), encoding="utf-8"))
+                 or {}).get("provider-owned") or [])
+        except Exception:
+            pass
+    check_adapters(rep, a.strict_adapters, provider_owned)
+    sys.exit(rep.emit())
+
+
+if __name__ == "__main__":
+    main()

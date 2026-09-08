@@ -1,0 +1,54 @@
+# Claude Code mapping for agents_render.py — agents-md-schema.md rule 11.
+#
+# This file is the only vendor-aware part of the Claude adapter. Adding a runtime means adding one
+# of these, not editing the renderer; that is what keeps six discovery conventions from leaking
+# into the canonical model.
+#
+# Verified against https://code.claude.com/docs/en/sub-agents and .../skills on 2026-09-08.
+vendor: claude
+
+# Canonical capability -> the runtime's tool names. A capability the runtime cannot express is
+# listed under `unsupported` so the renderer can record a degradation instead of dropping it.
+capabilities:
+  read:      [Read]
+  search:    [Grep, Glob]
+  edit:      [Edit, Write]
+  shell:     [Bash]
+  web:       [WebFetch, WebSearch]
+  subagents: [Task]
+# `mcp:<server>` expands through this template.
+mcp-template: "mcp__{server}__*"
+
+# Canonical tier -> the runtime's model selector. `inherit` is Claude's own word for "whatever the
+# parent session is running", which is why the canonical vocabulary borrowed it.
+models:
+  inherit:  inherit
+  fast:     haiku
+  balanced: sonnet
+  strong:   opus
+
+# Frontmatter keys the runtime actually reads, in the order they are written. Anything else in the
+# canonical file is composition metadata and becomes a generated body section instead.
+frontmatter: [name, description, tools, model]
+
+targets:
+  agents:    ".claude/agents/{name}.md"
+  # A workflow renders as a skill that only the user can invoke, which is the same /name behaviour
+  # the legacy commands/ flat file gave and one adapter kind fewer.
+  workflows: ".claude/skills/{name}/SKILL.md"
+  skills:    symlink            # five runtimes read .agents/skills natively; Claude does not
+  skills-link: ".claude/skills"
+  hooks:     ".claude/settings.json"
+
+# Hook wiring. The rendered config carries no patterns: it invokes the canonical dispatcher, which
+# reads .agents/hooks/hooks.yaml at runtime.
+hooks:
+  events:
+    pre-tool:  PreToolUse
+    post-tool: PostToolUse
+    stop:      Stop
+  matchers:
+    shell: Bash
+    edit:  "Edit|Write|MultiEdit"
+    read:  Read
+  can-block-stop: true

@@ -1,0 +1,59 @@
+# The bundle's own gate. It proves two things a green run on an empty tree would not: that the
+# tools parse, and that they still work against a real consuming repository.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyyaml jsonschema
+      - name: Tools import and parse
+        run: |
+          python -m compileall -q tools bundle/hooks/bin bundle/evals
+          python tools/agents_render.py --help > /dev/null
+          python tools/agents_file_check.py --help > /dev/null
+          python tools/agents_bundle.py --help > /dev/null
+      - name: Base schemas are valid JSON Schema
+        run: |
+          python - <<'PY'
+          import json, glob, sys
+          from jsonschema import Draft202012Validator as V
+          bad = 0
+          for f in sorted(glob.glob("bundle/schemas/*.json")):
+              try:
+                  V.check_schema(json.load(open(f))); print("valid:", f)
+              except Exception as e:
+                  print(f"::error file={f}::{e}"); bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+      - name: This repository conforms to the schema it implements
+        run: python tools/agents_file_check.py --root .
+      - name: Digest is reproducible
+        run: |
+          a=$(python tools/agents_bundle.py digest --from .)
+          b=$(python tools/agents_bundle.py digest --from .)
+          echo "$a"; [ "$a" = "$b" ] || { echo "::error::digest is not reproducible"; exit 1; }
+
+  # A renderer that is green against nothing has proved nothing. exeris-docs is the pilot consumer,
+  # so the tools are exercised against its real tree on every change to them.
+  against-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with: { repository: exeris-systems/exeris-docs, path: consumer }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyyaml jsonschema
+      - name: agent-file check against exeris-docs
+        run: python tools/agents_file_check.py --root consumer
+      - name: adapters in exeris-docs match their source
+        run: python tools/agents_render.py --root consumer --check
