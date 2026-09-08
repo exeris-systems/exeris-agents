@@ -64,21 +64,28 @@ def hooks_yaml() -> str:
     return os.path.join(HERE, "..", "hooks.yaml")
 
 
+class ConfigUnavailable(RuntimeError):
+    """The L0 rules could not be read. For a deny hook this is fatal, not permissive."""
+
+
 def load_config() -> dict:
     try:
         import yaml
-    except ImportError:
-        # A hook that cannot parse its own definitions must not silently allow everything. Say so
-        # and fail open, because failing closed here would brick every session on a machine
-        # without pyyaml — the tripwire is not worth that.
-        print("exeris-hook: pyyaml is not installed; hooks are inactive", file=sys.stderr)
-        return {}
+    except ImportError as exc:
+        # Previously this returned {} and the dispatcher answered "allow" — so the layer ADR-085
+        # calls "runtime, hard" switched itself off on any machine without pyyaml, silently.
+        # A deny hook now refuses instead; a recorder still yields, because recording nothing is
+        # not a safety failure.
+        raise ConfigUnavailable("pyyaml is not installed, so the L0 rules cannot be read "
+                                "(pip install pyyaml)") from exc
     path = hooks_yaml()
     if not os.path.exists(path):
-        print(f"exeris-hook: no hooks.yaml at {path}; hooks are inactive", file=sys.stderr)
-        return {}
-    with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+        raise ConfigUnavailable(f"no hooks.yaml at {path}")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    except Exception as exc:
+        raise ConfigUnavailable(f"hooks.yaml is unreadable: {type(exc).__name__}: {exc}") from exc
 
 
 def find_hook(cfg: dict, hook_id: str) -> dict | None:
@@ -148,16 +155,36 @@ def emit(vendor: str, event_kind: str, decision: str, reason: str) -> int:
     return 2 if decision in ("deny", "block") and vendor in ("claude", "codex", "copilot") else 0
 
 
-def state_path(cfg: dict, name: str) -> str:
-    d = os.path.join(repo_root(), cfg.get("state-dir") or ".agents-state")
+def session_key(event: dict) -> str:
+    """Which session this state belongs to.
+
+    Without this the state directory is per *checkout*: `guardrails-run` is append-only and
+    nothing clears it, so the first check ever run in a clone discharges the stop gate for every
+    session afterwards — the gate fires exactly once and then never again. Every runtime in scope
+    puts a session identifier on the event; where one is absent the parent process id is a
+    serviceable proxy for "this agent run", and a missing key is treated as a fresh session rather
+    than as a shared one.
+    """
+    for k in ("session_id", "sessionId", "conversation_id", "conversationId"):
+        v = event.get(k)
+        if v:
+            return re.sub(r"[^A-Za-z0-9_.-]", "_", str(v))[:64]
+    env = os.environ.get("EXERIS_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    if env:
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", env)[:64]
+    return f"ppid-{os.getppid()}"
+
+
+def state_path(cfg: dict, name: str, session: str) -> str:
+    d = os.path.join(repo_root(), cfg.get("state-dir") or ".agents-state", session)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, name)
 
 
-def append_state(cfg: dict, name: str, value: str) -> None:
+def append_state(cfg: dict, name: str, value: str, session: str) -> None:
     if not value:
         return
-    p = state_path(cfg, name)
+    p = state_path(cfg, name, session)
     existing = set()
     if os.path.exists(p):
         existing = {l.strip() for l in open(p, encoding="utf-8") if l.strip()}
@@ -166,11 +193,23 @@ def append_state(cfg: dict, name: str, value: str) -> None:
             fh.write(value + "\n")
 
 
-def read_state(cfg: dict, name: str) -> list[str]:
-    p = state_path(cfg, name)
+def read_state(cfg: dict, name: str, session: str) -> list[str]:
+    p = state_path(cfg, name, session)
     if not os.path.exists(p):
         return []
     return [l.strip() for l in open(p, encoding="utf-8") if l.strip()]
+
+
+def tool_failed(event: dict) -> bool:
+    """True when the runtime reported the tool call as failed. Absent information is not failure."""
+    resp = _first(event, "tool_response", "toolResponse", "response") or {}
+    if not isinstance(resp, dict):
+        return False
+    for key in ("is_error", "isError", "error"):
+        if resp.get(key):
+            return True
+    code = resp.get("exit_code", resp.get("exitCode"))
+    return isinstance(code, int) and code != 0
 
 
 def matches_any(patterns, text: str) -> bool:
@@ -191,11 +230,29 @@ def path_matches(globs, path: str) -> bool:
     return False
 
 
+# A hook id that denies must fail CLOSED when the rules are unreadable; a recorder may yield.
+DENYING_HOOKS = ("deny",)
+
+
 def run(hook_id: str, vendor: str) -> int:
-    cfg = load_config()
-    spec = find_hook(cfg, hook_id)
     event = read_event()
+    session = session_key(event)
+    try:
+        cfg = load_config()
+    except ConfigUnavailable as exc:
+        if hook_id.startswith(DENYING_HOOKS):
+            return emit(vendor, "pre-tool", "deny",
+                        f"L0 unavailable and this is a deny hook, so it refuses rather than "
+                        f"waving the action through: {exc}")
+        print(f"exeris-hook: {exc}; recorder inactive", file=sys.stderr)
+        return emit(vendor, "post-tool", "allow", "")
+
+    spec = find_hook(cfg, hook_id)
     if not spec:
+        if hook_id.startswith(DENYING_HOOKS):
+            return emit(vendor, "pre-tool", "deny",
+                        f"L0: no hook '{hook_id}' in hooks.yaml, and a deny hook that cannot find "
+                        f"its own rule refuses rather than allowing")
         return emit(vendor, "pre-tool", "allow", "")
 
     kind = spec.get("event", "pre-tool")
@@ -207,6 +264,11 @@ def run(hook_id: str, vendor: str) -> int:
         return emit(vendor, kind, "allow", "")
 
     if spec.get("record"):
+        # A check that ran and FAILED has not discharged anything. Where the runtime reports the
+        # result (Claude and Codex put it on the PostToolUse event) a failure is not recorded;
+        # where it does not, the recorder says so by recording anyway rather than pretending.
+        if spec.get("tool") == "shell" and tool_failed(event):
+            return emit(vendor, kind, "allow", "")
         subject = command if spec.get("tool") == "shell" else path
         if spec.get("tool") == "shell":
             if matches_any(spec.get("match"), subject):
@@ -215,15 +277,16 @@ def run(hook_id: str, vendor: str) -> int:
                 for pat in spec.get("match") or []:
                     m = re.search(pat, subject)
                     if m:
-                        append_state(cfg, spec["record"], m.group(0).replace("\\", ""))
+                        append_state(cfg, spec["record"],
+                                     m.group(0).replace("\\", ""), session)
         elif subject and path_matches(spec.get("paths"), subject):
             rel = os.path.relpath(subject, repo_root()) if os.path.isabs(subject) else subject
-            append_state(cfg, spec["record"], rel.replace(os.sep, "/"))
+            append_state(cfg, spec["record"], rel.replace(os.sep, "/"), session)
         return emit(vendor, kind, "allow", "")
 
     if kind == "stop":
-        edited = read_state(cfg, "docs-edited")
-        ran = read_state(cfg, "guardrails-run")
+        edited = read_state(cfg, "docs-edited", session)
+        ran = read_state(cfg, "guardrails-run", session)
         blocked = []
         for rule in spec.get("rules") or []:
             hits = [f for f in edited if path_matches(rule.get("when-edited"), f)]
@@ -260,8 +323,16 @@ def main() -> int:
     a = ap.parse_args()
     try:
         return run(a.hook, a.vendor)
-    except Exception as exc:  # a broken hook must not brick a session
+    except ConfigUnavailable:
+        raise
+    except Exception as exc:
+        # A recorder that crashes should not brick a session; a DENY hook that crashes must not
+        # become an allow, which is what returning {} silently did.
         print(f"exeris-hook: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if a.hook.startswith(DENYING_HOOKS):
+            return emit(a.vendor, "pre-tool", "deny",
+                        f"L0 deny hook failed ({type(exc).__name__}), refusing rather than "
+                        f"allowing: {exc}")
         print(json.dumps({}))
         return 0
 

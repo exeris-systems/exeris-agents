@@ -72,7 +72,7 @@ def split_frontmatter(path: str) -> tuple[dict, str]:
 
 def marker(source: str) -> str:
     return (f"<!-- DO NOT EDIT. Generated from {source} by agents_render.py\n"
-            f"     (exeris-systems/.github; agents-md-schema.md rule 7). Edit the source. -->")
+            f"     (exeris-systems/exeris-agents; agents-md-schema.md rule 7). Edit the source. -->")
 
 
 def tools_for(fm: dict, mapping: dict, path: str) -> list[str]:
