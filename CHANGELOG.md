@@ -18,6 +18,65 @@ above, decides the number.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-09
+
+Seven findings from an xhigh review of `exeris-kernel`'s v2 migration, all in the executable layer.
+Each was reproduced before it was changed, and each has a regression test.
+
+### Breaking
+
+- **`.claude/settings.json` changes on the next render**, because the command it carries changes
+  again — the dispatcher is now anchored to the checkout root. Re-vendor, then re-render.
+
+### Fixed
+
+- **The rendered hook command depended on the working directory.** It named
+  `.agents/hooks/bin/dispatch.py` relative, and a hook runs with whatever working directory the
+  tool call had. From a subdirectory or a worktree `python3` cannot open it and **exits 2** — and
+  exit 2 from a `PreToolUse` hook is a *block*, on every shell call, whatever `--on-error` says.
+  The same shape as the version-in-the-path defect 1.3.0 removed, one level up: the interpreter
+  answers before the layer can. The command is now `"${VAR:-.}/…"`, where `VAR` is the vendor
+  mapping's new `project-dir-var` (`CLAUDE_PROJECT_DIR` for Claude). A vendor that publishes no
+  such variable falls back to the relative form and is no worse off than before.
+- **`tool_result()` read `interrupted` before `exit_code`.** Claude Code sends
+  `interrupted: false` on every Bash event, successful or not, so the first loop returned "the
+  runtime said it succeeded" for a script that exited 1 — the exact collapse the function's own
+  docstring promises not to make, and it discharged the stop gate. `exit_code` is read first as
+  the only field that states an outcome; `error` and `interrupted` are read **only** as failure
+  signals, because falsy there says nothing.
+- **The recorder credited one gate per command.** It `break`s no longer: `a.sh && b.sh` is one
+  tool event running two gates, and stopping at the first left the second armed, so a session that
+  ran both was blocked on the one it had run.
+- **A stop already blocked could be blocked again.** `stop_hook_active` was never read, so the
+  gate re-fired on the turn the operator was using to satisfy it. It now reports once and yields.
+- **`sanitised()` checked argument shape but not vocabulary.** A well-formed `--nope x` passed and
+  reached argparse inside the delegated hook, which answers an unrecognised argument by exiting 2
+  — a deny on every shell call, which is the class of failure the shim exists to remove. The flag
+  vocabulary is checked where a refusal can still carry a reason, and a repeated flag is refused
+  too.
+- **`validate()`'s no-jsonschema fallback was a silent no-op** for every schema written the way
+  rule 13 prescribes. An `allOf` of a `$ref` plus enums carries no top-level `required`, so the
+  shallow path validated **zero fields** and returned "valid" — a grader silently weakening to
+  nothing, which its own docstring calls worse than one that is missing. It now says it cannot
+  validate.
+- A dead recomputation of `on_error` in `run()`, assigned after the last reader.
+
+### Not fixed, and why
+
+- **Three `repo_root()` implementations.** Real, and deliberate: `dispatch.py`'s docstring states
+  that its rule is smaller and does not have to agree with `hook.py`'s, because it only locates
+  the manifest before handing off. The other half of that finding — "the stop gate re-walks the
+  filesystem once per path test" — **does not reproduce**: `path_matches` reaches `repo_root()`
+  only for an absolute path, and the gate's recorded entries are repository-relative, so a stop
+  invocation walks once, in `state_dir`. Caching it was tried and reverted: it broke a suite that
+  varies the root within one process, which is a real hazard and a worse trade than one walk.
+
+### Added
+
+- Regressions for each fix: `interrupted: false` beside a non-zero exit, its paired positive, one
+  command running two gates, a second stop after a block, an unknown and a repeated flag, and the
+  rendered command's anchoring.
+
 ## [1.3.0] - 2026-09-09
 
 ### Breaking

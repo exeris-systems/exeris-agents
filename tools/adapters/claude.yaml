@@ -54,3 +54,9 @@ hooks:
     edit:  "Edit|Write|MultiEdit"
     read:  Read
   can-block-stop: true
+  # The runtime's own name for the checkout root. The rendered command anchors the dispatcher to it,
+  # because a hook is invoked with whatever working directory the tool call had: from a subdirectory
+  # or a worktree a repo-relative path is not found, `python3` exits 2, and exit 2 from a PreToolUse
+  # hook is a DENY on every shell call. A vendor that publishes no such variable falls back to the
+  # relative form and is no worse off than before.
+  project-dir-var: CLAUDE_PROJECT_DIR

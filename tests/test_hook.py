@@ -118,6 +118,56 @@ def stop(repo, session, vendor="claude"):
     return out
 
 
+# ── the review findings this file is the kept version of ──────────────────────────────────────
+
+def test_interrupted_false_is_not_a_success_claim():
+    """`interrupted: false` accompanies every successful Claude Code Bash event — and every failing
+    one. Reading it before `exit_code` made a script that exited 1 discharge the gate."""
+    r = fresh_repo()
+    edit(r, "s", "adr/ADR-086-x.md")
+    ran(r, "s", "adr-filename-check.sh", {"interrupted": False, "exit_code": 1})
+    check("a failing check reported with interrupted:false does not discharge",
+          stop(r, "s").get("decision"), "block")
+    shutil.rmtree(r)
+
+
+def test_exit_code_zero_with_interrupted_false_does_discharge():
+    """The paired positive: the fix must not make every result unreadable."""
+    r = fresh_repo()
+    edit(r, "s", "adr/ADR-086-x.md")
+    # The fixture rule requires BOTH checks, so both are run — otherwise this asserts the
+    # every-check rule rather than the result-reading it is here for.
+    ran(r, "s", "adr-filename-check.sh", {"interrupted": False, "exit_code": 0})
+    ran(r, "s", "taxonomy-check.sh", {"interrupted": False, "exit_code": 0})
+    check("passing checks still discharge", stop(r, "s").get("decision", "allow"), "allow")
+    shutil.rmtree(r)
+
+
+def test_one_command_running_two_gates_discharges_both():
+    """`a.sh && b.sh` is one tool event running two gates. Stopping at the first match left the
+    second armed, so a session that ran both was blocked on the one it had run."""
+    r = fresh_repo()
+    edit(r, "s", "adr/ADR-086-x.md")
+    edit(r, "s", "high-level-architecture.md")
+    ran(r, "s", "adr-filename-check.sh && taxonomy-check.sh", {"exit_code": 0})
+    out = stop(r, "s")
+    check("both gates discharged by one command", out.get("decision", "allow"), "allow")
+    shutil.rmtree(r)
+
+
+def test_a_stop_already_blocked_is_not_blocked_again():
+    """A runtime sets `stop_hook_active` after it blocked once. Blocking again re-fires the gate on
+    the turn the operator is using to satisfy it, which is how a session becomes unable to end."""
+    r = fresh_repo()
+    edit(r, "s", "adr/ADR-086-x.md")
+    check("first stop blocks", stop(r, "s").get("decision"), "block")
+    out, _ = call(r, "guardrails-gate-on-stop",
+                  {"session_id": "s", "stop_hook_active": True},
+                  on_error="deny", event="stop")
+    check("the second does not", out.get("decision", "allow"), "allow")
+    shutil.rmtree(r)
+
+
 # ── the gate ──────────────────────────────────────────────────────────────────────────────────
 
 def test_gate_requires_every_check_not_merely_one():
