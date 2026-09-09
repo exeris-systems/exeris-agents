@@ -94,7 +94,12 @@ def errors(d: str) -> list[str]:
     crashed and emitted nothing — the report-success-while-doing-nothing shape this repository has
     now fixed three times. A crash is a failure of the test, not a clean result.
     """
-    proc = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True)
+    # GITHUB_STEP_SUMMARY is removed deliberately: under Actions the report goes to that file
+    # instead of stdout, so the "did it actually run" guard below would fire on every clean case
+    # in CI and nowhere else. The test wants one deterministic channel.
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
+    proc = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True,
+                          env=env)
     if proc.returncode not in (0, 1) or "Traceback" in proc.stderr:
         raise AssertionError(f"checker did not run: rc={proc.returncode}\n{proc.stderr[-500:]}")
     if "agents_file_check" not in proc.stdout:
@@ -211,7 +216,8 @@ def test_a_pinned_but_unvendored_bundle_is_one_finding():
 def test_evals_accepts_the_dot_agents_spelling():
     d = repo("evals: .agents/evals\n")
     os.makedirs(os.path.join(d, ".agents", "evals"), exist_ok=True)
-    p = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True)
+    p = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"})
     check("`.agents/`-prefixed evals is accepted, as `output` is",
           "evals directory" in p.stdout, False)
     shutil.rmtree(d)
@@ -226,7 +232,8 @@ def test_a_role_directory_without_an_agent_md_is_not_a_role():
 
 def test_skills_does_not_silently_accept_the_bundle_prefix():
     d = repo("skills: [bundle:some-skill]\n")
-    p = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True)
+    p = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"})
     check("the message says the prefix is unsupported rather than 'not a skill'",
           "only policies and references support" in p.stdout, True)
     shutil.rmtree(d)
