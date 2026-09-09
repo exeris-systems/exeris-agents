@@ -252,6 +252,27 @@ def test_the_working_directory_wins_over_the_shims_own_location():
     shutil.rmtree(a); shutil.rmtree(b)
 
 
+def test_a_command_that_is_not_flag_value_pairs_is_not_forwarded():
+    """What reaches `execv` is rebuilt from strings that each matched a pattern.
+
+    The vector comes from a provider config, and this file is the boundary between that config and
+    the dispatcher. It does not own the flag vocabulary — hook.py does — so it checks the shape:
+    `--flag` then a plain value, nothing positional. A hand-edited command is refused here with a
+    reason, rather than reaching an argument parser the reader never associated with the config.
+    """
+    d = repo()
+    render(d)
+    odd = fire(d, "--hook", "deny-irreversible", "--on-error")
+    meta = fire(d, "--hook", "deny-irreversible; rm -rf /", "--on-error", "deny")
+    positional = fire(d, "deny-irreversible", "claude")
+    check("an unpaired vector is refused", odd.returncode, 2)
+    check("a value carrying shell punctuation is refused", meta.returncode, 2)
+    check("nothing ran for it", meta.stdout, "")
+    check("a positional vector is refused", positional.returncode, 2)
+    check("and each says why", "--flag value pairs" in meta.stderr, True)
+    shutil.rmtree(d)
+
+
 def test_a_pin_that_leaves_the_vendored_tree_is_not_run():
     """The pin is repository content and its value becomes an argument to `execv`.
 

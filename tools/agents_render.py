@@ -56,6 +56,9 @@ CAPABILITIES = {"read", "search", "edit", "shell", "web", "subagents"}
 DISPATCHER_MARKS = ("hooks/bin/hook.py", "hooks/bin/dispatch.py")
 # The version-free path the rendered config names, and the file the renderer copies there.
 DISPATCH_REL = ".agents/hooks/bin/dispatch.py"
+# The canonical hook declarations. Named once: three call sites tested for it separately, and a
+# path spelled three times is a path that can be corrected in two of them.
+HOOKS_YAML = os.path.join(".agents", "hooks", "hooks.yaml")
 
 
 def die(msg: str):
@@ -264,7 +267,7 @@ def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: lis
 
 def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> str:
     """The vendor's hook config. It carries no patterns: hook.py reads hooks.yaml at runtime."""
-    spec = load_yaml(os.path.join(root, ".agents", "hooks", "hooks.yaml"))
+    spec = load_yaml(os.path.join(root, HOOKS_YAML))
     dispatcher = dispatcher_path(root, vendor_root)
     hm = mapping["hooks"]
     events: dict[str, list] = {}
@@ -481,7 +484,7 @@ def main() -> int:
 
     changes: list[str] = []
     # Once, not per vendor: the shim is vendor-neutral and every adapter names the same copy.
-    if os.path.exists(os.path.join(root, ".agents", "hooks", "hooks.yaml")):
+    if os.path.exists(os.path.join(root, HOOKS_YAML)):
         write_dispatch(root, vendor_root, a.check, changes)
     for vendor in vendors:
         mpath = os.path.join(ADAPTER_DIR, f"{vendor}.yaml")
@@ -521,7 +524,7 @@ def main() -> int:
                   set(manifest.get("skills") or []) | set(manifest.get("workflows") or []),
                   a.check, changes)
 
-        if t.get("hooks") and os.path.exists(os.path.join(root, ".agents", "hooks", "hooks.yaml")):
+        if t.get("hooks") and os.path.exists(os.path.join(root, HOOKS_YAML)):
             write(os.path.join(root, t["hooks"]), render_hooks(root, mapping, vendor_root), a.check, changes, root)
 
     if a.check:

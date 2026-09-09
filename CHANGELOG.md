@@ -61,6 +61,12 @@ above, decides the number.
   tool call anyway. Fail-closed is again a property of the rule, which is what `--on-error` was
   introduced to make true.
 
+- **The rendered command is validated before it becomes an argument vector.** The shim is the
+  boundary between a provider's config and the dispatcher, and it forwarded whatever the config
+  contained. It now requires `--flag value` pairs and rebuilds the vector from strings that each
+  matched a pattern, so a hand-edited command is refused there, with a reason, instead of reaching
+  an argument parser the reader never associated with the config. The flag *vocabulary* stays
+  hook.py's — this checks shape, not names, so a new flag needs no change here.
 - **The pin is validated before it becomes a path.** `bundle` and `version` are joined into a
   path under `.agents/vendor/` which is read, written and — through the shim — executed, and
   neither was checked. An absolute `bundle` is the sharp case: `os.path.join` swallows the base it
@@ -73,10 +79,10 @@ above, decides the number.
 
 ### Added
 
-- `tests/test_dispatch.py` — 36 assertions over the renderer's output and the shim's behaviour,
+- `tests/test_dispatch.py` — 41 assertions over the renderer's output and the shim's behaviour,
   including the bump-without-re-render state that produced this, the case where recognising only
-  the new command shape would leave a repository with every hook rendered twice, and two escapes
-  from the vendored tree that fail without the containment check.
+  the new command shape would leave a repository with every hook rendered twice, two escapes from
+  the vendored tree that fail without the containment check, and a hand-edited command vector.
 
 
 ## [1.2.0] - 2026-09-09

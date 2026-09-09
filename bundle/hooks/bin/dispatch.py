@@ -28,13 +28,21 @@ import os
 import re
 import sys
 
-MANIFEST = os.path.join(".agents", "manifest.yaml")
-FALLBACK = os.path.join(".agents", "hooks", "bin", "hook.py")
-VENDOR = os.path.join(".agents", "vendor")
+AGENTS = ".agents"
+MANIFEST = os.path.join(AGENTS, "manifest.yaml")
+FALLBACK = os.path.join(AGENTS, "hooks", "bin", "hook.py")
+VENDOR = os.path.join(AGENTS, "vendor")
 # A pin component is a plain name. Leading `.` is excluded, so `..` never reaches a path join, and
 # no separator can appear in one — the two ways repository content could aim this file's exec at
 # something the digest in rule 8 does not vouch for.
 SAFE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# What a rendered hook command may contain. This file does not own the flag vocabulary — hook.py
+# does, and duplicating it here would put the argument contract in two places — so it checks the
+# SHAPE of the vector instead: `--flag` followed by a plain value, nothing positional, nothing
+# starting with a dash where a value belongs. A vector it cannot recognise is not forwarded, which
+# is what "validate before passing to an OS command" means when the command is chosen elsewhere.
+FLAG = re.compile(r"\A--[a-z][a-z0-9-]*\Z")
+VALUE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
 
 
 def repo_root() -> str:
@@ -140,17 +148,39 @@ def refuse(argv: list[str], reason: str) -> int:
     return 2 if on_error == "deny" else 0
 
 
+def sanitised(argv: list[str]) -> list[str] | None:
+    """The argument vector, rebuilt from matched pairs, or None if it is not `--flag value` pairs.
+
+    Rebuilt rather than passed through: what reaches `execv` is assembled from strings that each
+    matched a pattern, so there is no path by which an unexamined element arrives at the call.
+    """
+    if len(argv) % 2:
+        return None
+    out: list[str] = []
+    for flag, value in zip(argv[0::2], argv[1::2]):
+        if not FLAG.match(flag) or not VALUE.match(value):
+            return None
+        out.append(FLAG.match(flag).group(0))
+        out.append(VALUE.match(value).group(0))
+    return out
+
+
 def main(argv: list[str]) -> int:
     root = repo_root()
     hook = target(root)
     if not hook:
         return refuse(argv, f"no hook.py under {root} — the manifest pins no vendored bundle and "
                             f"{FALLBACK} is absent (run tools/agents_bundle.py vendor)")
+    args = sanitised(argv)
+    if args is None:
+        return refuse(argv, "the rendered hook command is not a sequence of --flag value pairs; "
+                            "re-render it rather than hand-editing the provider config")
     try:
-        # execv, not a shell: the argument vector is passed through as a vector, so nothing in it
-        # is re-parsed. `hook` is the only element this file chose, and `target()` has already
-        # confined it to the vendored tree; the rest belong to hook.py, which parses them itself.
-        os.execv(sys.executable, [sys.executable, hook] + argv)
+        # execv, not a shell: the vector is passed as a vector, so nothing in it is re-parsed by a
+        # shell, and the arguments sit after the script path, where the interpreter treats them as
+        # the script's. Every element was chosen here: `hook` by target(), confined to the vendored
+        # tree, and the rest rebuilt by sanitised() from strings that each matched a pattern.
+        os.execv(sys.executable, [sys.executable, hook] + args)
     except OSError as exc:                    # exec failed; the process is still this one
         return refuse(argv, f"cannot run {hook}: {type(exc).__name__}: {exc}")
     return 0                                  # unreachable after a successful execv
