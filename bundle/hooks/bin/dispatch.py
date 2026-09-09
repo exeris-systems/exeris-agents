@@ -250,12 +250,25 @@ def refuse(argv: list[str], reason: str) -> int:
 
 
 def sanitised(argv: list[str]) -> list[str] | None:
-    """The argument vector if it is `--flag value` pairs and nothing else, otherwise None."""
+    """The argument vector if it is `--flag value` pairs and nothing else, otherwise None.
+
+    Shape only, and deliberately. The vocabulary — which flags exist and which values each accepts
+    — belongs to `hook.py`, which defines it; checking it here would put one list in two artifacts
+    on two different pins (this file comes from the MANIFEST-pinned vendored tree, the command that
+    invokes it from the renderer at the ref CI pins), which is the "one string, two owners" defect
+    this file's own docstring says it exists to remove — moved from the path to the vocabulary.
+
+    The failure that motivated checking it here — argparse answering an unknown flag or an
+    out-of-`choices` value by exiting 2, which from a pre-tool hook is a deny on every shell call —
+    is fixed in `hook.py`, where a parse error now becomes a refusal in the vendor's shape.
+    """
     if len(argv) % 2:
         return None
+    seen: set[str] = set()
     for flag, value in zip(argv[0::2], argv[1::2]):
-        if not FLAG.match(flag) or not VALUE.match(value):
+        if not FLAG.match(flag) or not VALUE.match(value) or flag in seen:
             return None
+        seen.add(flag)
     return list(argv)
 
 

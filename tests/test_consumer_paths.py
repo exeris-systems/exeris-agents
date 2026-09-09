@@ -294,5 +294,98 @@ def test_a_missing_fixture_does_not_abort_the_run():
         shutil.rmtree(r)
 
 
+def test_the_no_jsonschema_fallback_says_when_it_cannot_validate():
+    """A composed schema — an `allOf` of a `$ref` plus enums — carries no top-level `required`, so
+    the shallow path validated ZERO fields and returned "valid": a grader silently weakening to
+    nothing, which its own docstring calls worse than one that is missing. It now reads the
+    `required` that IS reachable, and says so when there is none."""
+    import importlib.util, types
+    spec = importlib.util.spec_from_file_location("evalrun", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    d = tempfile.mkdtemp(prefix="val-")
+    try:
+        opaque = os.path.join(d, "opaque.json")
+        write(opaque, json.dumps({"allOf": [{"$ref": "base.json"}]}))
+        reachable = os.path.join(d, "reachable.json")
+        write(reachable, json.dumps({"allOf": [{"$ref": "base.json"},
+                                               {"required": ["decision"]}]}))
+        real = dict(sys.modules)
+        sys.modules["jsonschema"] = None            # force the ImportError branch
+        try:
+            out = mod.validate({}, opaque)
+            check("nothing reachable -> says it cannot validate",
+                  bool(out) and "cannot validate" in out[0], True)
+            out2 = mod.validate({}, reachable)
+            check("a reachable `required` is checked rather than given up on",
+                  bool(out2) and "decision" in out2[0], True)
+            check("and a conforming instance passes it",
+                  mod.validate({"decision": "PASS"}, reachable), [])
+        finally:
+            sys.modules.clear(); sys.modules.update(real)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_policy_nothing_composes_is_reported():
+    """rule 5's unchecked direction. The forward one — a profile naming a policy that does not
+    resolve — is an error. The reverse was invisible: on disk, in the manifest, composed by nobody.
+
+    The manifest must NOT count as a mention. It is where the declaration lives, so counting it
+    makes every declared file trivially referenced — measured, with it included an orphan planted
+    in a real tree was not reported at all."""
+    def tree(compose: bool) -> str:
+        d = tempfile.mkdtemp(prefix="orphan-")
+        write(os.path.join(d, "AGENTS.md"), "# x\n\nPoints at `.agents/` for the semantics.\n")
+        write(os.path.join(d, ".agents", "manifest.yaml"),
+              "version: 2\nrepository: t\nimports: []\n"
+              "agents: [r]\nskills: []\nworkflows: []\n"
+              "policies: [used, orphan]\nreferences: []\n")
+        for name in ("used", "orphan"):
+            write(os.path.join(d, ".agents", "policies", f"{name}.md"), f"# {name}\n\nbody\n")
+        listed = "[used, orphan]" if compose else "[used]"
+        write(os.path.join(d, ".agents", "agents", "r", "AGENT.md"),
+              "---\nname: r\ndescription: a role that exists so the tree is well-formed and this "
+              "case is about composition and nothing else\nrole: reviewer\nmode: read-only\n"
+              f"capabilities: [read]\npolicies: {listed}\n---\n\nbody\n")
+        return d
+
+    d = tree(compose=False)
+    try:
+        p = subprocess.run([sys.executable, CHECK, "--root", d], capture_output=True, text=True)
+        check("an uncomposed policy is reported", "orphan" in p.stdout, True)
+        check("and the one that IS composed is not", p.stdout.count("'used'"), 0)
+    finally:
+        shutil.rmtree(d)
+
+    d = tree(compose=True)
+    try:
+        p = subprocess.run([sys.executable, CHECK, "--root", d], capture_output=True, text=True)
+        check("composing it clears the finding", "orphan" in p.stdout, False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_tooling_checked_out_into_the_workspace_is_not_the_consumers():
+    """docs-lint fetches this bundle into `.agents-tools/` and the organisation guardrails into
+    `.guardrails/`, inside the very tree the checker walks. Without them skipped, THIS repository's
+    `AGENTS.md` — 4 KB and change — is read as a nested file of whichever consumer is being checked
+    and fails the 4 KB nested cap: a finding about a file that is not theirs and that they cannot
+    edit. `nested_checkout` does not save it, because the organisation repository's own run rsyncs
+    the tree with `--exclude .git` and the marker is gone."""
+    d = tempfile.mkdtemp(prefix="tooling-")
+    try:
+        write(os.path.join(d, "AGENTS.md"), "# x\n\nPoints at `.agents/` for the semantics.\n")
+        write(os.path.join(d, ".agents", "manifest.yaml"), "version: 1\nrepository: t\nimports: []\n")
+        for tooling in (".agents-tools", ".guardrails"):
+            write(os.path.join(d, tooling, "AGENTS.md"), "# not the consumer's\n\n" + ("x " * 3000))
+        p = subprocess.run([sys.executable, CHECK, "--root", d], capture_output=True, text=True)
+        check("tooling checked out into the workspace is not read as the consumer's",
+              (p.returncode, "agents-tools" in p.stdout, "guardrails" in p.stdout),
+              (0, False, False))
+    finally:
+        shutil.rmtree(d)
+
+
 if __name__ == "__main__":
     main(globals())

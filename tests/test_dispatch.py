@@ -133,6 +133,11 @@ def test_the_rendered_command_names_no_version():
     check("both hooks rendered", len(commands(d)), 2)
     for c in commands(d):
         check("command names the version-free shim", ".agents/hooks/bin/dispatch.py" in c, True)
+        # …and anchors it, because a hook runs with whatever working directory the tool call
+        # had. A repo-relative path is not found from a subdirectory, python3 exits 2, and
+        # exit 2 from a pre-tool hook is a deny on every shell call.
+        check("command is anchored to the checkout root",
+              "${CLAUDE_PROJECT_DIR:-.}/.agents/hooks/bin/dispatch.py" in c, True)
         check(f"command carries no pin: {c[:60]}", "exeris-agents-1.3.0" in c, False)
     shutil.rmtree(d)
 
@@ -616,6 +621,24 @@ def test_the_pin_survives_key_order_and_quoting():
     check("the first import that names both",
           m.pinned("imports:\n  - bundle: other\n  - bundle: exeris-agents\n    version: 2.0.0\n"),
           ("exeris-agents", "2.0.0"))
+
+
+def test_an_unknown_flag_is_refused_here_not_by_argparse():
+    """Shape was checked and vocabulary was not, so a well-formed `--nope x` reached argparse inside
+    the delegated hook — and argparse answers an unrecognised argument by exiting 2, which from a
+    pre-tool hook is a deny on every shell call. That is the class of failure this file removes."""
+    mod = shim_module()
+    check("a known vector survives",
+          mod.sanitised(["--hook", "x", "--vendor", "claude"]),
+          ["--hook", "x", "--vendor", "claude"])
+    # Shape only: `--nope` is well-formed, so the shim passes it through. The vocabulary
+    # belongs to hook.py, which answers a flag it does not accept with a refusal in the
+    # vendor's shape rather than argparse's exit 2.
+    check("an unrecognised but well-formed flag is shape-valid",
+          mod.sanitised(["--nope", "x"]), ["--nope", "x"])
+    check("a repeated flag is refused",
+          mod.sanitised(["--hook", "a", "--hook", "b"]), None)
+    check("an odd-length vector is still refused", mod.sanitised(["--hook"]), None)
 
 
 if __name__ == "__main__":

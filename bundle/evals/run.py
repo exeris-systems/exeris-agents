@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,11 +47,32 @@ def repo_root(start: str) -> str:
 
 REPO = repo_root(HERE)
 
-# Each runtime returns schema-validated JSON on stdout, which is why the schemas of rule 13 are the
-# grader's input rather than a parsing problem.
+# How each runtime is driven, and the two things that were wrong about it.
+#
+# `--json-schema` takes a schema INLINE — its own `--help` example is a literal
+# `{"type":"object",...}` — and it was handed `schema_path`, a filesystem path. The CLI was being
+# given the name of a file where it documents a document.
+#
+# The deeper problem is that passing it at all makes the eval test a shape the profile never emits.
+# Rule 13 says a role answers with its human-readable response and reproduces the decision as a
+# fenced `json` block AFTER it; `--json-schema` puts the CLI into structured-output mode, so the
+# turn the eval graded would not be the turn the role performs in review or in a session. An eval
+# that exercises a different output than production is not evidence about production.
+#
+# So the schema is NOT pushed onto the CLI here. The runner drives the role the way it actually
+# runs, `extract_json` takes the fenced block out of the answer, and `validate()` checks it against
+# the same schema — which is where rule 13 says validation belongs ("validation happens in evals
+# and in the CI review"). The schema argument stays in the signature because codex's
+# `--output-schema` genuinely does take a path.
+#
+# NOT VERIFIED against a live CLI: the flag names and their argument kinds are read from
+# `claude --help` on 2026-09-09 (`--agent <agent>`, `--json-schema <schema>` with an inline
+# example) and from codex's documented `exec --output-schema`. Whether `--agent <name>` resolves a
+# rendered `.claude/agents/<name>.md` profile is untested here, and `--dry-run` deliberately prints
+# what would run so the vector can be inspected without spending a turn.
 RUNTIMES = {
     "claude": lambda agent, schema, prompt: (
-        ["claude", "-p", prompt, "--agent", agent, "--json-schema", schema], None),
+        ["claude", "-p", prompt, "--agent", agent], None),
     "codex": lambda agent, schema, prompt: (
         ["codex", "exec", "--output-schema", schema, prompt], None),
 }
@@ -95,7 +117,23 @@ def validate(instance, schema_path: str) -> list[str]:
         import jsonschema
     except ImportError:
         schema = json.load(open(schema_path, encoding="utf-8"))
-        missing = [k for k in schema.get("required", []) if k not in (instance or {})]
+        # A composed schema declares its `required` inside the `allOf` branches, not at the top
+        # level — the base's branch is a `$ref` this fallback cannot follow, but a repository's own
+        # branch is inline and readable. Collect what IS reachable before giving up.
+        required = list(schema.get("required") or [])
+        for branch in schema.get("allOf") or []:
+            if isinstance(branch, dict):
+                required += list(branch.get("required") or [])
+        if not required:
+            # The shallow check has nothing to check. Every schema written the way rule 13's
+            # composition prescribes — an `allOf` of a `$ref` into the vendored base plus the
+            # repository's enums — carries no top-level `required`, so this branch validated ZERO
+            # fields and returned "valid". That is a grader silently weakening to nothing, which
+            # this function's own docstring says is worse than one that is missing. Say so instead.
+            return [f"cannot validate {os.path.basename(schema_path)}: jsonschema is not installed "
+                    f"and the schema declares no top-level `required` to fall back on "
+                    f"(pip install jsonschema)"]
+        missing = [k for k in required if k not in (instance or {})]
         return [f"missing required key '{k}' (shallow check: jsonschema not installed)"
                 for k in missing]
     schema = json.load(open(schema_path, encoding="utf-8"))
@@ -206,6 +244,9 @@ def main() -> int:
     ap.add_argument("--report", default=os.path.join(REPO, "working-notes", "eval-report.json"))
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--show-command", action="store_true",
+                    help="with --dry-run, print the argument vector each case would run. "
+                         "The only way to inspect it without spending a turn.")
     a = ap.parse_args()
 
     # Guard FIRST. This used to sit seven lines lower, after load_yaml() had already opened and
@@ -272,6 +313,9 @@ def main() -> int:
             entry["status"] = "resolved"
             results.append(entry)
             print(f"ok    {case['id']} -> {case.get('agent')} / {os.path.basename(schema_path)}")
+            if a.show_command:
+                cmd, _ = RUNTIMES[runtime or "claude"](case["agent"], schema_path, prompt)
+                print("      " + " ".join(shlex.quote(c) for c in cmd[:4]) + " …")
             continue
 
         cmd, _ = RUNTIMES[runtime](case["agent"], schema_path, prompt)

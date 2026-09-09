@@ -304,6 +304,22 @@ def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: lis
     write(dest, body, check, changes, root)
 
 
+def anchored(dispatcher: str, hook_map: dict) -> str:
+    """The dispatcher path as the rendered command should name it.
+
+    A hook runs with whatever working directory the tool call had — a subdirectory, a worktree —
+    so a repo-relative path is not found there, `python3` exits 2, and exit 2 from a pre-tool hook
+    is a DENY on every shell call, whatever the hook's own `--on-error` says. The interpreter
+    answers before the layer can, which is the same shape as the version-in-the-path defect this
+    indirection was introduced to remove, one level up.
+
+    `${VAR:-.}` degrades to today's behaviour when the variable is unset, so a runtime that
+    publishes no checkout-root variable is no worse off than before.
+    """
+    var = (hook_map or {}).get("project-dir-var")
+    return f'"${{{var}:-.}}/{dispatcher}"' if var else dispatcher
+
+
 def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> str:
     """The vendor's hook config. It carries no patterns: hook.py reads hooks.yaml at runtime."""
     spec = load_yaml(os.path.join(root, HOOKS_YAML))
@@ -333,7 +349,7 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
                 "type": "command",
                 # --on-error is rendered from the hook's own `decision`, so whether it fails
                 # closed is a property of the rule rather than of the hook's name.
-                "command": f"python3 {dispatcher} --hook {h['id']} "
+                "command": f"python3 {anchored(dispatcher, hm)} --hook {h['id']} "
                            f"--vendor {mapping['vendor']} "
                            f"--event {h.get('event', 'pre-tool')} "
                            f"--on-error {'deny' if h.get('decision') in ('deny', 'block-or-allow') else 'allow'}",
