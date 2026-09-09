@@ -116,9 +116,19 @@ above, decides the number.
   the pull request that introduced the shim; the same shape was reachable through the renderer
   before it.
 
+### Changed
+
+- The shim's line reader for the pin uses string operations rather than regular expressions, one
+  of which had super-linear backtracking on a line it would never match; `emit` is split so the
+  vendor shape table and the exit-code rule are separate functions; and `SystemExit` from the hook
+  is no longer caught. Catching it to read `.code` and return the same number was a longer way of
+  writing what the interpreter already does, and it dropped the message a non-integer exit
+  carries — `sys.exit("hooks.yaml is unreadable")` became a bare 1. `.agents` is a constant in the
+  renderer. All four raised by the quality analysis, all four real.
+
 ### Added
 
-- `tests/test_dispatch.py` — 75 assertions over the renderer's output and the shim's behaviour,
+- `tests/test_dispatch.py` — 77 assertions over the renderer's output and the shim's behaviour,
   including the bump-without-re-render state that produced this, the case where recognising only
   the new command shape would leave a repository with every hook rendered twice, two escapes from
   the vendored tree, a hand-edited command vector, a module planted beside the shim, a manifest
