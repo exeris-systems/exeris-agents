@@ -294,5 +294,38 @@ def test_a_missing_fixture_does_not_abort_the_run():
         shutil.rmtree(r)
 
 
+def test_the_no_jsonschema_fallback_says_when_it_cannot_validate():
+    """A composed schema — an `allOf` of a `$ref` plus enums — carries no top-level `required`, so
+    the shallow path validated ZERO fields and returned "valid": a grader silently weakening to
+    nothing, which its own docstring calls worse than one that is missing. It now reads the
+    `required` that IS reachable, and says so when there is none."""
+    import importlib.util, types
+    spec = importlib.util.spec_from_file_location("evalrun", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    d = tempfile.mkdtemp(prefix="val-")
+    try:
+        opaque = os.path.join(d, "opaque.json")
+        write(opaque, json.dumps({"allOf": [{"$ref": "base.json"}]}))
+        reachable = os.path.join(d, "reachable.json")
+        write(reachable, json.dumps({"allOf": [{"$ref": "base.json"},
+                                               {"required": ["decision"]}]}))
+        real = dict(sys.modules)
+        sys.modules["jsonschema"] = None            # force the ImportError branch
+        try:
+            out = mod.validate({}, opaque)
+            check("nothing reachable -> says it cannot validate",
+                  bool(out) and "cannot validate" in out[0], True)
+            out2 = mod.validate({}, reachable)
+            check("a reachable `required` is checked rather than given up on",
+                  bool(out2) and "decision" in out2[0], True)
+            check("and a conforming instance passes it",
+                  mod.validate({"decision": "PASS"}, reachable), [])
+        finally:
+            sys.modules.clear(); sys.modules.update(real)
+    finally:
+        shutil.rmtree(d)
+
+
 if __name__ == "__main__":
     main(globals())

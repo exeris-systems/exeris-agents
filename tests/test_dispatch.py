@@ -627,14 +627,15 @@ def test_an_unknown_flag_is_refused_here_not_by_argparse():
     """Shape was checked and vocabulary was not, so a well-formed `--nope x` reached argparse inside
     the delegated hook — and argparse answers an unrecognised argument by exiting 2, which from a
     pre-tool hook is a deny on every shell call. That is the class of failure this file removes."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("dsp", SHIM)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = shim_module()
     check("a known vector survives",
           mod.sanitised(["--hook", "x", "--vendor", "claude"]),
           ["--hook", "x", "--vendor", "claude"])
-    check("an unknown flag is refused", mod.sanitised(["--nope", "x"]), None)
+    # Shape only: `--nope` is well-formed, so the shim passes it through. The vocabulary
+    # belongs to hook.py, which answers a flag it does not accept with a refusal in the
+    # vendor's shape rather than argparse's exit 2.
+    check("an unrecognised but well-formed flag is shape-valid",
+          mod.sanitised(["--nope", "x"]), ["--nope", "x"])
     check("a repeated flag is refused",
           mod.sanitised(["--hook", "a", "--hook", "b"]), None)
     check("an odd-length vector is still refused", mod.sanitised(["--hook"]), None)

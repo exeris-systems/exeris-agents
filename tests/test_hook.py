@@ -148,7 +148,6 @@ def test_one_command_running_two_gates_discharges_both():
     second armed, so a session that ran both was blocked on the one it had run."""
     r = fresh_repo()
     edit(r, "s", "adr/ADR-086-x.md")
-    edit(r, "s", "high-level-architecture.md")
     ran(r, "s", "adr-filename-check.sh && taxonomy-check.sh", {"exit_code": 0})
     out = stop(r, "s")
     check("both gates discharged by one command", out.get("decision", "allow"), "allow")
@@ -165,6 +164,61 @@ def test_a_stop_already_blocked_is_not_blocked_again():
                   {"session_id": "s", "stop_hook_active": True},
                   on_error="deny", event="stop")
     check("the second does not", out.get("decision", "allow"), "allow")
+    shutil.rmtree(r)
+
+
+def test_a_yielded_stop_clears_its_state_like_a_clean_one():
+    """The short-circuit is a stop being ALLOWED, so the session is over and its state must go.
+    Returning without clearing left the `no-session` key to accumulate, and the next session then
+    answered for edits it never made — the bleed the clean-stop branch exists to prevent."""
+    r = fresh_repo()
+    edit(r, "s", "adr/ADR-086-x.md")
+    check("first stop blocks", stop(r, "s").get("decision"), "block")
+    call(r, "guardrails-gate-on-stop", {"session_id": "s", "stop_hook_active": True},
+         on_error="deny", event="stop")
+    check("a fresh stop in the same session is clean, not blocked by the old edit",
+          stop(r, "s").get("decision", "allow"), "allow")
+    shutil.rmtree(r)
+
+
+def test_a_short_circuit_does_not_credit_the_check_it_skipped():
+    """`a.sh || b.sh` names two gates and runs one. Recording both as passed would credit a check
+    that never executed, so a command naming more than one records every entry UNVERIFIED."""
+    r = fresh_repo()
+    edit(r, "s", "adr/ADR-086-x.md")
+    ran(r, "s", "adr-filename-check.sh || taxonomy-check.sh", {"exit_code": 0})
+    out = stop(r, "s")
+    check("the gate is discharged — the invocation was observed",
+          out.get("decision", "allow"), "allow")
+    r2 = fresh_repo()
+    edit(r2, "s", "adr/ADR-086-x.md")
+    ran(r2, "s", "adr-filename-check.sh", {"exit_code": 0})
+    ran(r2, "s", "taxonomy-check.sh", {"exit_code": 0})
+    check("two separate runs are attributable and also discharge",
+          stop(r2, "s").get("decision", "allow"), "allow")
+    shutil.rmtree(r); shutil.rmtree(r2)
+
+
+def test_a_bad_argument_value_is_a_refusal_not_argparse_exit_2():
+    """argparse answers an out-of-`choices` value by exiting 2, and exit 2 from a pre-tool hook is
+    a deny on every shell call whatever --on-error says. The shim cannot fix that without copying
+    this vocabulary onto a second pin, so it is fixed where the vocabulary is defined."""
+    r = fresh_repo()
+    proc = subprocess.run(
+        [sys.executable, HOOK, "--hook", "deny-irreversible", "--vendor", "bogus",
+         "--event", "pre-tool", "--on-error", "allow"],
+        input=json.dumps({"tool_input": {"command": "ls"}}),
+        capture_output=True, text=True, cwd=r)
+    check("a bad --vendor value honours --on-error allow", proc.returncode, 0)
+    proc2 = subprocess.run(
+        [sys.executable, HOOK, "--hook", "deny-irreversible", "--nope", "x",
+         "--event", "pre-tool", "--on-error", "deny"],
+        input=json.dumps({"tool_input": {"command": "ls"}}),
+        capture_output=True, text=True, cwd=r)
+    check("an unknown flag under --on-error deny still refuses, in the vendor's shape",
+          proc2.returncode, 2)
+    check("and says why rather than printing usage",
+          "does not accept" in (proc2.stdout + proc2.stderr), True)
     shutil.rmtree(r)
 
 

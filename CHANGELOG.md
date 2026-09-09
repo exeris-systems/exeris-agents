@@ -18,10 +18,16 @@ above, decides the number.
 
 ## [Unreleased]
 
-## [1.3.1] - 2026-09-09
+## [1.4.0] - 2026-09-09
 
-Seven findings from an xhigh review of `exeris-kernel`'s v2 migration, all in the executable layer.
-Each was reproduced before it was changed, and each has a regression test.
+Seven findings from an xhigh review of `exeris-kernel`'s v2 migration, all in the executable layer,
+and six more from a review of the fixes themselves — three of which were regressions introduced by
+them. Each was reproduced before it was changed, and each has a regression test.
+
+**MINOR, not the patch this was first cut as.** It adds refusals the previous version accepted: a
+hook invoked with arguments this dispatcher does not accept, and an eval schema the grader cannot
+validate. By this file's own rule that is not wording, and a repository can be passing on 1.3.0 and
+refused here.
 
 ### Breaking
 
@@ -60,6 +66,41 @@ Each was reproduced before it was changed, and each has a regression test.
   nothing, which its own docstring calls worse than one that is missing. It now says it cannot
   validate.
 - A dead recomputation of `on_error` in `run()`, assigned after the last reader.
+
+### Fixed — regressions in the fixes above, caught by review
+
+- **The `stop_hook_active` short-circuit returned before the clean-stop cleanup**, so a session that
+  was blocked once never cleared its state — reintroducing the cross-session bleed the `rmtree`
+  exists to prevent, via the `no-session` key a runtime naming none falls back to. It clears now,
+  and says on stderr that it is yielding, which is the "report" half an empty `allow` never
+  delivered.
+- **Dropping the recorder's `break` credited every pattern in the command TEXT.** `a.sh || b.sh`
+  names two gates and runs one, and both were recorded — without the `?`, i.e. as verified-passed.
+  A command naming more than one now records every entry UNVERIFIED whatever the runtime reported:
+  the invocation was observed, the result cannot be attributed to one of them.
+- **`resp.get("exit_code", resp.get("exitCode"))` read the camelCase spelling as a DEFAULT**, so a
+  present-but-null `exit_code` shadowed a valid `exitCode` and the outcome was lost. Each spelling
+  is now tried in turn.
+- **`sanitised()` checked flag names and still not values**, so the identical failure survived: an
+  out-of-`choices` `--vendor`/`--event`/`--on-error` reached argparse, which exits 2 — a deny on
+  every shell call, even under `--on-error allow`. It cannot be fixed in the shim without copying
+  the vocabulary onto a second pin, which is the "one string, two owners" defect that file exists
+  to remove. `hook.py` now turns its own parse errors into a refusal in the vendor's shape, and the
+  shim is back to checking shape alone.
+- **`validate()`'s fallback gave up rather than reading the `required` a composed schema does
+  declare**, one level down in `allOf`; and it shipped with no test. Both fixed.
+- The redundant `seen` set (`append_state` already de-duplicates), a duplicated importlib loader in
+  the dispatch suite, a no-op `edit()` implying a fixture rule that does not exist, and two blank
+  lines a revert left in a docstring.
+
+### Changed
+
+- `against-consumer`'s adapter check is **report-only**, and the eval step runs before the render
+  rather than after it. `--check` alone compares this branch's renderer against adapters the
+  consumer committed from the version IT pins, so it fails on any renderer change and the consumer
+  cannot re-render first — it blocked the anchored-command fix, which repairs a defect that denied
+  every shell call. What is enforced is what this repository owns: the renderer runs against a real
+  tree and settles.
 
 ### Not fixed, and why
 
