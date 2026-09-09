@@ -160,29 +160,52 @@ def cmd_vendor(a) -> int:
     return 0
 
 
-def retarget_refs(root: str, version: str) -> None:
-    """Point the repository's composing schemas at the version just vendored.
+# Files outside the vendored tree that may point into it. Schemas reference it by `$ref` and
+# hand-authored Markdown by link; both carry the version in the path, so both go stale on a bump.
+RETARGET = (
+    (os.path.join(".agents", "schemas"), (".json",)),
+    ("", (".md",)),                       # repository root: AGENTS.md and its siblings
+    (".agents", (".md", ".yaml")),
+)
 
-    The vendored path carries the version, so every `$ref` into it goes stale on a bump. The
-    agent-file check catches that immediately — but leaving it to be caught means every consuming
-    repository hand-edits every composing schema on every bump, forever. Vendoring owns it
-    instead, and prints what it moved so the change is visible in review rather than silent.
+
+def retarget_refs(root: str, version: str) -> None:
+    """Point everything outside the vendored tree at the version just vendored.
+
+    The vendored path carries the version, so every reference into it goes stale on a bump — a
+    schema `$ref`, and equally a Markdown link in AGENTS.md. Both have now broken a build once.
+    Leaving them to be caught means every consuming repository hand-edits every referring file on
+    every bump, forever; this rewrites the *path* of a file that moved, which is not the same as
+    rewriting what an author wrote, and prints each change so it is visible in review.
     """
     import re
-    d = os.path.join(root, ".agents", "schemas")
-    if not os.path.isdir(d):
-        return
-    pattern = re.compile(rf"(\.\./vendor/{re.escape(BUNDLE_NAME)}-)[^/\"]+(/)")
-    for name in sorted(os.listdir(d)):
-        if not name.endswith(".json"):
+    # The version segment ends at a path separator or at whatever quotes/closes the
+    # reference — a JSON string, a Markdown link, a backtick span.
+    stop = r"""[^/\s"'`)\]]+"""
+    pattern = re.compile(r"((?:\.\./|\.agents/)vendor/" + re.escape(BUNDLE_NAME) + r"-)"
+                         + stop + r"(/)")
+    seen = set()
+    for sub, suffixes in RETARGET:
+        d = os.path.join(root, sub) if sub else root
+        if not os.path.isdir(d):
             continue
-        path = os.path.join(d, name)
-        before = open(path, encoding="utf-8").read()
-        after = pattern.sub(rf"\g<1>{version}\g<2>", before)
-        if after != before:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(after)
-            print(f"retargeted {os.path.join('.agents/schemas', name)} -> {version}")
+        for dirpath, dirnames, files in os.walk(d):
+            dirnames[:] = [x for x in dirnames if x not in ("vendor", ".git", "node_modules")]
+            for name in sorted(files):
+                if not name.endswith(suffixes):
+                    continue
+                path = os.path.join(dirpath, name)
+                if path in seen:
+                    continue
+                seen.add(path)
+                before = open(path, encoding="utf-8", errors="replace").read()
+                after = pattern.sub(r"\g<1>" + version + r"\g<2>", before)
+                if after != before:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(after)
+                    print(f"retargeted {os.path.relpath(path, root)} -> {version}")
+            if not sub:
+                break        # repository root only, not the whole tree
 
 
 def cmd_verify(a) -> int:

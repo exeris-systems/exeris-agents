@@ -56,10 +56,13 @@ Findings from a review of the 1.0.0 dispatcher, each with a regression test that
 
 ### Added
 
-- `agents_bundle.py vendor` retargets the composing schemas' `$ref` paths to the version it just
-  vendored, and prints what it moved. The vendored path carries the version, so every `$ref` into
-  it goes stale on a bump; the agent-file check caught that on this very bump, but leaving it to
-  be caught means every consuming repository hand-edits every composing schema forever.
+- `agents_bundle.py vendor` retargets **every reference into the vendored tree** — a schema
+  `$ref`, a Markdown link in `AGENTS.md`, a backtick span in a policy — to the version it just
+  wrote, and prints each file it moved. The vendored path carries the version, so all of them go
+  stale on a bump. Both halves of this broke a build once: the schema `$ref`s failed the
+  agent-file check, and a link in `AGENTS.md` failed the link check afterwards, because the first
+  fix covered only the schemas. Leaving it to be caught means every consuming repository
+  hand-edits every referring file on every bump, forever.
 - `tests/test_hook.py` — 41 assertions over the gate, the failure modes, the session key, the
   envelope and the deny matcher in both directions, run in CI. Its absence is why the same layer
   needed three rounds of fixing.
