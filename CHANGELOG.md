@@ -61,6 +61,34 @@ above, decides the number.
   tool call anyway. Fail-closed is again a property of the rule, which is what `--on-error` was
   introduced to make true.
 
+- **The shim's own directory no longer leads `sys.path`.** Running the hook in-process left the
+  interpreter's `sys.path[0]` pointing at `.agents/hooks/bin/` — a generated adapter's home, and
+  not part of the tree the pin's digest covers — so a file dropped beside the shim satisfied an
+  import made by the shim or by the gate it starts, and L0 could be switched off by *adding* a
+  file rather than editing one. Exec'ing hid this: the path then led with the vendored directory.
+  That directory is put back in front for the hook, and the shim's own is removed before anything
+  is imported.
+- **Every escape returns a decision, not a traceback.** The manifest read caught `OSError` only,
+  so a file that is not valid UTF-8 raised through `main` and exited 1 — the code every runtime
+  reads as "the hook errored", which is *allow*. There is a guard at the read and one around the
+  whole call, and both route to the same refusal.
+- **A refusal now speaks the vendor's wire format.** It answered with an exit code alone, and exit
+  2 is the block channel only on Claude, Codex and Copilot. On cursor, gemini and antigravity a
+  missing dispatcher under `--on-error deny` therefore failed **open** — the opposite of what the
+  flag promises and of what this file's own docstring claimed.
+- **The pin is read only from `imports:`, and through pyyaml when it is importable.** The line
+  reader took the first `- bundle:` in any block sequence, so a manifest could resolve a different
+  bundle here than in the renderer and the checker; and it could not see a flow-style `imports:`
+  that the renderer accepts, returning None and denying instead. It is scoped to the key and is
+  now the fallback rather than the mechanism.
+- **The renderer cannot emit a command the shim would refuse.** A hook id, a vendor and an event
+  become words in a command string, and nothing constrained them to the alphabet the shim checks.
+  The renderer validates them where the string is built, and both patterns name each other.
+- **One resolver for the shim source.** `dispatcher_path` used `os.path.exists`, which follows a
+  symlink out of the tree, while `write_dispatch` required containment — so a symlinked vendor
+  directory rendered a command naming a shim that was never written, which is the failure this
+  release exists to remove. A stale shim is also removed when a re-pinned bundle ships none;
+  nothing did that before, and `--check` stayed clean over the orphan.
 - **The shim runs the hook in its own process.** It exec'd a second interpreter, which made an
   OS-command sink out of a call that never needed one and paid a Python startup on every tool
   event — the hook fires on all of them. `runpy` runs the confined path here instead; the hook's
@@ -85,10 +113,14 @@ above, decides the number.
 
 ### Added
 
-- `tests/test_dispatch.py` — 46 assertions over the renderer's output and the shim's behaviour,
+- `tests/test_dispatch.py` — 72 assertions over the renderer's output and the shim's behaviour,
   including the bump-without-re-render state that produced this, the case where recognising only
   the new command shape would leave a repository with every hook rendered twice, two escapes from
-  the vendored tree that fail without the containment check, and a hand-edited command vector.
+  the vendored tree, a hand-edited command vector, a module planted beside the shim, a manifest
+  that is not UTF-8, and a refusal read back in each vendor's own shape. The suite scrubs
+  `CLAUDE_PROJECT_DIR` from the environment it runs fixtures in: inheriting it pointed the shim at
+  the checkout the suite was being run from, so it passed in CI and failed on a developer's
+  machine.
 
 
 ## [1.2.0] - 2026-09-09

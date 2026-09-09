@@ -59,6 +59,11 @@ DISPATCH_REL = ".agents/hooks/bin/dispatch.py"
 # The canonical hook declarations. Named once: three call sites tested for it separately, and a
 # path spelled three times is a path that can be corrected in two of them.
 HOOKS_YAML = os.path.join(".agents", "hooks", "hooks.yaml")
+# A hook id, a vendor and an event become words in a command string that a runtime hands to a
+# shell, and the shim then checks the vector it receives against this same alphabet. Validating
+# here is what keeps the two from disagreeing: the renderer cannot emit a command the shim would
+# refuse. `bundle/hooks/bin/dispatch.py` carries the matching copy and names this one.
+COMMAND_WORD = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:@+-]*\Z")
 
 
 def die(msg: str):
@@ -213,6 +218,21 @@ def render_workflow(src: str, mapping: dict, rel: str) -> str:
     return f"{head}\n{marker(rel)}\n{body.rstrip()}\n"
 
 
+def dispatch_source(root: str, vendor_root: str | None) -> str | None:
+    """The shim to copy, confined to the vendored tree, or None if this bundle ships none.
+
+    One resolver, because two were a way for the renderer to name a file it had declined to write:
+    `dispatcher_path` asked `os.path.exists` (which follows a symlink out of the tree) while
+    `write_dispatch` asked for containment, so a symlinked vendor directory produced a rendered
+    command pointing at a shim that was never written — the exact "names a file that is not there"
+    state this whole change exists to remove.
+    """
+    if not vendor_root:
+        return None
+    src = _compose.contained(root, os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py"))
+    return src if src and os.path.isfile(src) else None
+
+
 def dispatcher_path(root: str, vendor_root: str | None) -> str:
     """What the rendered config invokes — and it carries no version.
 
@@ -228,7 +248,7 @@ def dispatcher_path(root: str, vendor_root: str | None) -> str:
     must not rewrite a repository's adapters into a file its pinned bundle does not ship.
     """
     if vendor_root:
-        if os.path.exists(os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py")):
+        if dispatch_source(root, vendor_root):
             return DISPATCH_REL
         vendored = os.path.join(vendor_root, "hooks", "bin", "hook.py")
         if os.path.exists(os.path.join(root, vendored)):
@@ -244,12 +264,18 @@ def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: lis
     is why it is not under `.claude/`. The v2 layout already reserves `.agents/plugins/` for
     rendered output on the same reasoning.
     """
-    if not vendor_root:
-        return
-    # Confined here as well as at the manifest read: this path is built from repository content
-    # and its bytes are copied into the tree the adapters execute from.
-    src = _compose.contained(root, os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py"))
-    if not src or not os.path.exists(src):
+    dest = os.path.join(root, DISPATCH_REL)
+    src = dispatch_source(root, vendor_root)
+    if not src:
+        # No shim to write, so a shim left over from a bundle that had one is stale: the adapters
+        # no longer name it and nothing else would ever remove it. Same rule as a renamed profile's
+        # adapter, and it is `prune`'s reason for existing.
+        if os.path.isfile(dest) and "DO NOT EDIT" in open(dest, encoding="utf-8").read(400):
+            if check:
+                changes.append(f"{DISPATCH_REL} is generated but no pinned bundle ships one")
+            else:
+                os.remove(dest)
+                changes.append(f"removed stale {DISPATCH_REL}")
         return
     body = open(src, encoding="utf-8").read()
     # The marker names the bundle path, not the vendored one. A version in this header would make
@@ -262,7 +288,11 @@ def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: lis
         body = f"{shebang}\n{line}{rest}"
     else:
         body = line + body
-    write(os.path.join(root, DISPATCH_REL), body, check, changes, root)
+    # Not covered by the pin's digest, and it does not need to be: it is a generated adapter, not
+    # a vendored file, and `--check` compares it against its source byte for byte the way it does
+    # every other adapter. A hand-edit is a CI failure there, which is the same guarantee rule 8
+    # gives the vendored tree, arrived at by the mechanism that owns generated files.
+    write(dest, body, check, changes, root)
 
 
 def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> str:
@@ -282,6 +312,12 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
                 f"dropped hook is an unrecorded degradation.")
         if h.get("event") == "stop" and not hm.get("can-block-stop"):
             continue
+        for label, word in (("hook id", h["id"]), ("vendor", mapping["vendor"]),
+                            ("event", h.get("event", "pre-tool"))):
+            if not COMMAND_WORD.match(str(word)):
+                die(f"{label} {word!r} is not a plain word — it becomes part of a command string a "
+                    f"runtime hands to a shell, and the dispatcher refuses a vector it cannot "
+                    f"recognise, so a command built from it would be rendered and never run")
         entry = {
             "matcher": hm["matchers"].get(h.get("tool"), "") if h.get("tool") else "",
             "hooks": [{

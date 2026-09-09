@@ -95,9 +95,22 @@ def vendor(d: str, version: str, *, with_shim: bool = True) -> str:
     return binder
 
 
+def clean_env() -> dict:
+    """The caller's environment minus the variables that name ANOTHER repository.
+
+    `CLAUDE_PROJECT_DIR` is set in every Claude Code session and the shim reads it first, exactly
+    as hook.py does. Inheriting it points `repo_root()` at the checkout the suite is being run
+    from rather than at the fixture, so the suite passes in CI and fails on a developer's machine —
+    the worst of the two orders to discover in.
+    """
+    env = dict(os.environ)
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    return env
+
+
 def render(d: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, RENDERER, "--root", d, "--vendor", "claude", *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=clean_env())
 
 
 def commands(d: str) -> list[str]:
@@ -109,7 +122,7 @@ def commands(d: str) -> list[str]:
 def fire(d: str, *args: str, cwd: str | None = None) -> subprocess.CompletedProcess:
     """Run the rendered command the way the runtime would: from the repository root."""
     return subprocess.run([sys.executable, os.path.join(d, ".agents", "hooks", "bin", "dispatch.py"),
-                           *args], capture_output=True, text=True, cwd=cwd or d)
+                           *args], capture_output=True, text=True, cwd=cwd or d, env=clean_env())
 
 
 # ── what the renderer writes ─────────────────────────────────────────────────────────────────────
@@ -117,6 +130,7 @@ def fire(d: str, *args: str, cwd: str | None = None) -> subprocess.CompletedProc
 def test_the_rendered_command_names_no_version():
     d = repo("1.3.0")
     render(d)
+    check("both hooks rendered", len(commands(d)), 2)
     for c in commands(d):
         check("command names the version-free shim", ".agents/hooks/bin/dispatch.py" in c, True)
         check(f"command carries no pin: {c[:60]}", "exeris-agents-1.3.0" in c, False)
@@ -137,6 +151,7 @@ def test_a_bundle_without_the_shim_still_renders_the_old_path():
     """Upgrading the renderer must not point a repository at a file its pinned bundle lacks."""
     d = repo("1.2.0", with_shim=False)
     render(d)
+    check("both hooks rendered", len(commands(d)), 2)
     for c in commands(d):
         check("falls back to the vendored hook.py",
               ".agents/vendor/exeris-agents-1.2.0/hooks/bin/hook.py" in c, True)
@@ -185,6 +200,72 @@ def test_render_check_is_clean_on_a_second_run():
     d = repo()
     render(d)
     check("--check agrees with what was just written", render(d, "--check").returncode, 0)
+    shutil.rmtree(d)
+
+
+def test_a_shim_the_renderer_would_not_write_is_not_named_either():
+    """One resolver, or the renderer names a file it declined to write.
+
+    `dispatcher_path` asked `os.path.exists`, which follows a symlink out of the tree, while
+    `write_dispatch` asked for containment — so a symlinked vendor directory rendered a command
+    pointing at a shim that was never copied. That is the "names a file that is not there" state
+    this whole change exists to remove, reintroduced by the change itself.
+    """
+    d = repo("1.3.0")
+    outside = tempfile.mkdtemp(prefix="dispatch-outside-")
+    os.makedirs(os.path.join(outside, "hooks", "bin"))
+    shutil.copyfile(SHIM, os.path.join(outside, "hooks", "bin", "dispatch.py"))
+    open(os.path.join(outside, "hooks", "bin", "hook.py"), "w").write(STUB_HOOK)
+    pinned_dir = os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0")
+    shutil.rmtree(pinned_dir)
+    os.symlink(outside, pinned_dir)
+    render(d)
+    named = commands(d)
+    wrote = os.path.exists(os.path.join(d, ".agents", "hooks", "bin", "dispatch.py"))
+    check("the shim was not written", wrote, False)
+    check("so it is not named either",
+          any(".agents/hooks/bin/dispatch.py" in c for c in named), False)
+    shutil.rmtree(d, ignore_errors=True); shutil.rmtree(outside)
+
+
+def test_a_stale_shim_is_removed_when_no_bundle_ships_one():
+    """A repository that re-pins to a bundle without the shim keeps an orphan otherwise, and
+    `--check` stays clean over it — the drift `prune` exists to catch, in a file `prune` never
+    looked at."""
+    d = repo("1.3.0")
+    render(d)
+    dest = os.path.join(d, ".agents", "hooks", "bin", "dispatch.py")
+    check("the shim is there to begin with", os.path.exists(dest), True)
+    shutil.rmtree(os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0"))
+    vendor(d, "1.2.0", with_shim=False)
+    open(os.path.join(d, ".agents", "manifest.yaml"), "w").write(MANIFEST.format(version="1.2.0"))
+    check("--check reports the orphan", render(d, "--check").returncode, 1)
+    render(d)
+    check("and the render removes it", os.path.exists(dest), False)
+    shutil.rmtree(d)
+
+
+def test_a_hand_edited_shim_is_a_check_failure():
+    """It sits outside the pin's digest, so `agents_bundle.py verify` cannot see it — but it is a
+    generated adapter, and `--check` compares every one of those against its source byte for
+    byte. The guarantee is the same; the mechanism is the one that owns generated files."""
+    d = repo()
+    render(d)
+    dest = os.path.join(d, ".agents", "hooks", "bin", "dispatch.py")
+    with open(dest, "a", encoding="utf-8") as fh:
+        fh.write("\n# a hand-edit\n")
+    check("--check catches it", render(d, "--check").returncode, 1)
+    shutil.rmtree(d)
+
+
+def test_a_hook_id_that_is_not_a_plain_word_is_refused():
+    """The renderer must not be able to emit a command the shim would then refuse to run."""
+    d = repo()
+    hooks = os.path.join(d, ".agents", "hooks", "hooks.yaml")
+    open(hooks, "w").write(HOOKS.replace("id: deny-irreversible", "id: 'deny irreversible; x'"))
+    out = render(d)
+    check("the render fails", out.returncode, 2)
+    check("and says why", "not a plain word" in out.stderr, True)
     shutil.rmtree(d)
 
 
@@ -295,7 +376,9 @@ def test_a_command_that_is_not_flag_value_pairs_is_not_forwarded():
     positional = fire(d, "deny-irreversible", "claude")
     check("an unpaired vector is refused", odd.returncode, 2)
     check("a value carrying shell punctuation is refused", meta.returncode, 2)
-    check("nothing ran for it", meta.stdout, "")
+    check("the hook did not run", "HOOK-REACHED" in meta.stdout, False)
+    check("and the refusal is in the vendor's shape",
+          json.loads(meta.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
     check("a positional vector is refused", positional.returncode, 2)
     check("and each says why", "--flag value pairs" in meta.stderr, True)
     shutil.rmtree(d)
@@ -354,6 +437,81 @@ def test_a_symlinked_vendor_entry_is_not_run():
     shutil.rmtree(d, ignore_errors=True); shutil.rmtree(outside)
 
 
+# ── what the shim refuses to let happen ─────────────────────────────────────────────────────────
+
+def test_a_module_dropped_beside_the_shim_cannot_hijack_it():
+    """`.agents/hooks/bin/` is a generated adapter's home, not part of the digest-covered tree.
+
+    The interpreter puts the running script's directory first on `sys.path`, so before this was
+    handled a file dropped there satisfied an import made by the shim or by the gate it starts —
+    and the L0 layer could be switched off by adding a file next to it rather than by editing it.
+    Exec'ing a second interpreter used to hide this: the path then led with the VENDORED
+    directory, which the pin's digest does cover.
+    """
+    d = repo()
+    render(d)
+    beside = os.path.join(d, ".agents", "hooks", "bin")
+    for name in ("json.py", "re.py", "runpy.py"):
+        open(os.path.join(beside, name), "w").write("print('HIJACKED')\n")
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    check("no planted module was imported", "HIJACKED" in (out.stdout + out.stderr), False)
+    check("and the real hook still ran", out.stdout.startswith("HOOK-REACHED"), True)
+    shutil.rmtree(d)
+
+
+def test_the_hook_still_sees_its_own_directory_first():
+    """What exec'ing hook.py did implicitly, kept: a hook may import from beside itself."""
+    d = repo()
+    render(d)
+    binder = os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0", "hooks", "bin")
+    open(os.path.join(binder, "sidecar.py"), "w").write("TOKEN = 'SIDECAR'\n")
+    open(os.path.join(binder, "hook.py"), "w").write(
+        "import sidecar\nprint('HOOK-REACHED ' + sidecar.TOKEN)\n")
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude")
+    check("the vendored directory leads the path", "SIDECAR" in out.stdout, True)
+    shutil.rmtree(d)
+
+
+def test_a_manifest_that_is_not_utf8_denies_rather_than_erroring():
+    """A traceback exits 1, and 1 is the code every runtime reads as a hook that errored — allow.
+
+    The read caught OSError only, and a file that is not valid UTF-8 raises ValueError.
+    """
+    d = repo()
+    render(d)
+    with open(os.path.join(d, ".agents", "manifest.yaml"), "wb") as fh:
+        fh.write(b"imports:\n  - bundle: exeris-agents\n    version: \xff\xfe\n")
+    shutil.rmtree(os.path.join(d, ".agents", "vendor"))
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    check("it refuses", out.returncode, 2)
+    check("without a traceback", "Traceback" in out.stderr, False)
+    shutil.rmtree(d)
+
+
+def test_a_refusal_speaks_the_vendors_own_shape():
+    """Exit 2 is the block channel on Claude, Codex and Copilot and is ignored on the rest.
+
+    Without the JSON, `--on-error deny` failed OPEN on cursor, gemini and antigravity — the
+    opposite of what the flag promises, on half the runtimes in scope.
+    """
+    d = repo()
+    render(d)
+    shutil.rmtree(os.path.join(d, ".agents", "vendor"))
+    cursor = fire(d, "--hook", "deny-irreversible", "--vendor", "cursor", "--on-error", "deny")
+    gemini = fire(d, "--hook", "deny-irreversible", "--vendor", "gemini", "--on-error", "deny")
+    stop = fire(d, "--hook", "guardrails-gate", "--vendor", "claude", "--event", "stop",
+                "--on-error", "deny")
+    check("cursor is told in its own shape", json.loads(cursor.stdout)["permission"], "deny")
+    check("gemini too", json.loads(gemini.stdout)["decision"], "deny")
+    check("a stop refusal blocks the stop", json.loads(stop.stdout)["decision"], "block")
+    yields = fire(d, "--hook", "record-guardrail-run", "--vendor", "gemini",
+                  "--event", "post-tool", "--on-error", "allow")
+    check("and a recorder still yields, in that shape too",
+          json.loads(yields.stdout), {"decision": "allow"})
+    check("without blocking", yields.returncode, 0)
+    shutil.rmtree(d)
+
+
 # ── the pin parser ───────────────────────────────────────────────────────────────────────────────
 
 def shim_module():
@@ -378,6 +536,42 @@ def test_an_import_naming_no_version_is_not_a_pin():
     check("an unpinned import yields nothing",
           m.pinned("imports:\n  - bundle: exeris-agents\nagents: []\n"), None)
     check("no imports at all yields nothing", m.pinned("version: 2\nimports: []\n"), None)
+
+
+def test_a_flow_style_imports_block_is_read():
+    """Valid YAML the renderer accepts. A line reader cannot see it, and the None it returned put
+    the shim straight into the deny path — a disagreement about which bundle runs, decided by
+    which parser happened to be in use."""
+    m = shim_module()
+    check("flow style resolves",
+          m.pinned("version: 2\nimports: [{bundle: exeris-agents, version: 1.3.0}]\n"),
+          ("exeris-agents", "1.3.0"))
+
+
+def test_the_pin_comes_only_from_imports():
+    """A `- bundle:` under any other key must not resolve. The renderer and the checker read
+    `imports:`; a parser that reads the first one anywhere can pick a different bundle than they
+    do, silently, and this file decides which code runs."""
+    text = ("version: 2\n"
+            "provider-owned:\n"
+            "  - bundle: not-this-one\n"
+            "    version: 6.6.6\n"
+            "imports:\n"
+            "  - bundle: exeris-agents\n"
+            "    version: 1.3.0\n")
+    m = shim_module()
+    check("through pyyaml", m.pinned(text), ("exeris-agents", "1.3.0"))
+    check("and through the line reader", m.pinned_by_line(text), ("exeris-agents", "1.3.0"))
+
+
+def test_the_line_reader_agrees_with_pyyaml_on_the_real_manifest():
+    """The fallback is only worth having if it answers the same question the same way."""
+    m = shim_module()
+    text = ("version: 2\nimports:\n  - bundle: exeris-agents\n    version: 1.3.0\n"
+            "    ref: deadbeef\n    sha256: 'sha256:00'\nagents: []\n")
+    check("both readers agree", m.pinned_by_line(text), m.pinned(text))
+    check("and on an item whose version comes first",
+          m.pinned_by_line("imports:\n  - version: 2.0.0\n    bundle: b\n"), ("b", "2.0.0"))
 
 
 def test_the_pin_survives_key_order_and_quoting():

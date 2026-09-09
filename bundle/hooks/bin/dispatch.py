@@ -7,10 +7,10 @@ the adapter, written when the renderer last ran, and the vendored tree, replaced
 checkout holding one of them at a version the other does not have a command pointing at a file that
 is not there.
 
-That failure is not a warning. `python3` exits 2 on a file it cannot open, and exit 2 from a
-`PreToolUse` hook means *blocked*, so a recorder that declares `--on-error allow` blocks the tool
-call anyway: the interpreter answers before the layer can. Every shell call in the session is
-denied, and the reason is a path, not a rule.
+That failure is not a warning. The interpreter exits non-zero on a file it cannot open, and a
+non-zero exit from a `PreToolUse` hook is read as a block, so a recorder that declares
+`--on-error allow` blocks the tool call anyway: the interpreter answers before the layer can. Every
+shell call in the session is denied, and the reason is a path, not a rule.
 
 It is also not hypothetical. The review environment for a pull request pairs the base branch's
 protected `.claude/` with the branch's own tree, so the first review of every bundle bump ran with
@@ -21,29 +21,53 @@ The renderer copies this file to `.agents/hooks/bin/dispatch.py` and the rendere
 instead. It carries no version: it reads the pin from `.agents/manifest.yaml` when the hook fires,
 so a stale adapter and a fresh tree still meet. `manifest.yaml` remains the single authority for
 which bundle runs — it is simply read later, at a moment when both halves are on disk together.
+
+The hook then runs in THIS process, which is why two things here look defensive rather than
+convenient. `sys.path[0]` is repointed at the vendored directory, because the interpreter set it to
+*this* file's directory and that directory is not covered by the pin's digest — leaving it would
+let a file dropped beside this one satisfy an import inside the gate. And every escape returns
+through `emit`, because a traceback exits 1, and 1 is the code every runtime reads as a hook that
+errored rather than a hook that refused.
 """
 from __future__ import annotations
 
-import os
-import re
-import runpy
 import sys
+
+# BEFORE anything else is imported. The interpreter puts this file's own directory first on
+# `sys.path`, and that directory is a generated adapter's home, not part of the tree the pin's
+# digest covers — so a file dropped beside this one would satisfy an import made here or inside the
+# gate this file starts. It is removed first and put back only if it turns out not to be the script
+# directory after all (`-P` and PYTHONSAFEPATH mean the interpreter did not add one), which is a
+# comparison that needs `os` — imported while the directory is already off the path.
+_dropped = sys.path.pop(0) if sys.path else None
+
+import os                                                           # noqa: E402
+
+if _dropped is not None and os.path.realpath(_dropped) != os.path.dirname(
+        os.path.realpath(__file__)):
+    sys.path.insert(0, _dropped)
+
+import json                                                         # noqa: E402
+import re                                                           # noqa: E402
+import runpy                                                        # noqa: E402
 
 AGENTS = ".agents"
 MANIFEST = os.path.join(AGENTS, "manifest.yaml")
 FALLBACK = os.path.join(AGENTS, "hooks", "bin", "hook.py")
 VENDOR = os.path.join(AGENTS, "vendor")
 # A pin component is a plain name. Leading `.` is excluded, so `..` never reaches a path join, and
-# no separator can appear in one — the two ways repository content could aim this file's exec at
-# something the digest in rule 8 does not vouch for.
+# no separator can appear in one — the two ways repository content could aim this file at code the
+# digest in rule 8 does not vouch for.
 SAFE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # What a rendered hook command may contain. This file does not own the flag vocabulary — hook.py
 # does, and duplicating it here would put the argument contract in two places — so it checks the
-# SHAPE of the vector instead: `--flag` followed by a plain value, nothing positional, nothing
-# starting with a dash where a value belongs. A vector it cannot recognise is not forwarded, which
-# is what "validate before passing to an OS command" means when the command is chosen elsewhere.
+# SHAPE of the vector: `--flag` followed by a plain value, nothing positional. The value alphabet
+# is the same one `agents_render.py` requires of a hook id, a vendor and an event before it will
+# build a command from them, so the renderer cannot emit a command this file then refuses; the
+# renderer's copy of the pattern names this one.
 FLAG = re.compile(r"\A--[a-z][a-z0-9-]*\Z")
-VALUE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
+VALUE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:@+-]*\Z")
+BLOCK_BY_EXIT = ("claude", "codex", "copilot")
 
 
 def repo_root() -> str:
@@ -51,7 +75,7 @@ def repo_root() -> str:
 
     Deliberately smaller than hook.py's rule, and it does not have to agree with it: this answer
     only locates the manifest and the vendored file. Which repository's *rules* apply is decided by
-    hook.py, from its own working directory, after this file has execed it.
+    hook.py, from its own working directory, after this file has handed off to it.
     """
     for start in (os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd(),
                   os.path.dirname(os.path.abspath(__file__))):
@@ -71,29 +95,55 @@ def repo_root() -> str:
 def pinned(text: str) -> tuple[str, str] | None:
     """`(bundle, version)` from the first import naming both, or None.
 
-    A regex rather than `yaml.safe_load`, for one reason: pyyaml may not be installed, and that is
-    a condition the layer already handles well — hook.py reports it in the vendor's own wire format
-    and applies the caller's `--on-error`. Failing here for a missing parser would replace a
-    decision the layer knows how to make with a bare exit code.
-
-    The manifest's own `version: 2` is not a candidate: only a `version:` following a `bundle:`
-    inside the same list item is read, and the item ends at the next `- ` or the next unindented
-    key.
+    pyyaml when it is importable, because the manifest is YAML and a line reader cannot see a
+    flow-style `imports: [{bundle: …, version: …}]` that the renderer accepts — a disagreement
+    about which bundle runs is worse than a dependency. The line reader below is the fallback for a
+    checkout without pyyaml, where hook.py could not read its own rules either.
     """
-    bundle = None
+    try:
+        import yaml
+    except Exception:
+        yaml = None
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            data = None                       # malformed; the line reader may still find the pin
+        if isinstance(data, dict):
+            for imp in data.get("imports") or []:
+                if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
+                    return str(imp["bundle"]), str(imp["version"])
+            return None
+    return pinned_by_line(text)
+
+
+def pinned_by_line(text: str) -> tuple[str, str] | None:
+    """The block-style `imports:` list, read a line at a time.
+
+    Scoped to that key. Scanning the whole file for the first `- bundle:` would let a sequence
+    under any other key resolve a bundle the renderer and the checker do not — which is a
+    disagreement about which code runs, arrived at silently.
+    """
+    inside = False
+    item: dict[str, str] = {}
     for line in text.splitlines():
-        found = re.match(r"\s*-\s*bundle:\s*(\S+)", line) or (
-            re.match(r"\s+bundle:\s*(\S+)", line) if bundle is None else None)
-        if found:
-            bundle = found.group(1).strip("'\"")
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if bundle is None:
+        if not line[0].isspace():                             # a top-level key
+            inside = re.match(r"imports\s*:", line) is not None
+            item = {}
             continue
-        version = re.match(r"\s+version:\s*(\S+)", line)
-        if version:
-            return bundle, version.group(1).strip("'\"")
-        if re.match(r"\s*-\s", line) or (line.strip() and not line[0].isspace()):
-            bundle = None                     # that import ended without naming a version
+        if not inside:
+            continue
+        start = re.match(r"\s*-\s*(.*)$", line)               # a new list item
+        if start:
+            item = {}
+            line = start.group(1)
+        pair = re.match(r"\s*(bundle|version)\s*:\s*(\S+)", line)
+        if pair:
+            item[pair.group(1)] = pair.group(2).strip("'\"")
+        if "bundle" in item and "version" in item:
+            return item["bundle"], item["version"]
     return None
 
 
@@ -101,8 +151,8 @@ def under(base: str, path: str) -> str | None:
     """`path` resolved, or None if it does not stay inside `base`.
 
     Both ends are realpath'd, so a symlink pointing out of the checkout is caught as well as a
-    `..` that survived the component check. This file execs what it returns; a path that left the
-    tree would be code the pin cannot vouch for, running with the session's permissions.
+    `..` that survived the component check. This file runs what it returns; a path that left the
+    tree would be code the pin cannot vouch for, executing with the session's permissions.
     """
     root = os.path.realpath(base)
     full = os.path.realpath(path)
@@ -112,15 +162,19 @@ def under(base: str, path: str) -> str | None:
 def target(root: str) -> str | None:
     """The hook.py this call should run: the pinned vendored copy, else a repository-owned one.
 
-    The pin is repository content and its value becomes an argument to `execv`, so it is checked
-    rather than trusted: components must be plain names and the result must stay under
+    The pin is repository content and its value becomes a path this file executes, so it is
+    checked rather than trusted: components must be plain names and the result must stay under
     `.agents/vendor/`. Rule 8's digest vouches for what is inside that tree, and for nothing else.
     """
     manifest = os.path.join(root, MANIFEST)
     if os.path.exists(manifest):
         try:
-            pin = pinned(open(manifest, encoding="utf-8").read())
-        except OSError:
+            with open(manifest, encoding="utf-8") as fh:
+                pin = pinned(fh.read())
+        except Exception:
+            # A manifest that is unreadable for ANY reason — not only OSError; a file that is not
+            # valid UTF-8 raises ValueError — must not escape as a traceback. A traceback exits 1,
+            # and 1 is the code every runtime reads as "the hook errored", which is allow.
             pin = None
         if pin and SAFE.match(pin[0]) and SAFE.match(pin[1]):
             base = os.path.join(root, VENDOR)
@@ -132,54 +186,88 @@ def target(root: str) -> str | None:
     return local if local and os.path.exists(local) else None
 
 
-def refuse(argv: list[str], reason: str) -> int:
-    """No hook.py to run. Honour the caller's own `--on-error`, not the interpreter's.
-
-    This is the one decision this file makes on its own, and it makes it the way hook.py makes the
-    same one for an unreadable config: fail closed where the *rule* says to, open where it does
-    not. Exit 2 is the block channel on the runtimes that document one; the JSON channel belongs to
-    hook.py, and reaching this line means hook.py is what could not be found.
-    """
-    on_error = "deny"
-    if "--on-error" in argv:
-        i = argv.index("--on-error")
+def flag_value(argv: list[str], name: str, default: str) -> str:
+    """One `--name value` out of the vector, without assuming the vector is well formed."""
+    if name in argv:
+        i = argv.index(name)
         if i + 1 < len(argv):
-            on_error = argv[i + 1]
-    print(f"exeris hook dispatch: {reason}", file=sys.stderr)
-    return 2 if on_error == "deny" else 0
+            return argv[i + 1]
+    return default
+
+
+def emit(vendor: str, event: str, decision: str, reason: str) -> int:
+    """The vendor's decision shape, for the cases this file has to answer alone.
+
+    A wire format written twice can drift, and this is the one place that cost is worth paying:
+    the file that owns the formats is the file that could not be found. Exit 2 is the documented
+    block on Claude, Codex and Copilot and is ignored on the others, so without the JSON an
+    `--on-error deny` would fail OPEN on cursor, gemini and antigravity — the opposite of what the
+    flag promises, and the opposite of what this file's docstring used to claim.
+    """
+    if vendor == "cursor":
+        payload: dict = {"permission": "allow" if decision == "allow" else "deny"}
+        if reason:
+            payload["userMessage"] = payload["agentMessage"] = reason
+    elif vendor in ("gemini", "antigravity"):
+        payload = {"decision": decision, "reason": reason} if reason else {"decision": decision}
+    elif event == "stop":
+        payload = {"decision": "block", "reason": reason} if decision != "allow" else {}
+    elif event == "pre-tool":
+        out = {"permissionDecision": "allow" if decision == "allow" else "deny"}
+        if reason:
+            out["permissionDecisionReason"] = reason
+        payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", **out}}
+    else:
+        payload = {}                          # post-tool and session-start permit nothing
+    print(json.dumps(payload))
+    if decision != "allow" and reason:
+        print(reason, file=sys.stderr)
+    return 2 if decision != "allow" and vendor in BLOCK_BY_EXIT else 0
+
+
+def refuse(argv: list[str], reason: str) -> int:
+    """No hook.py to run, or a command this file cannot recognise.
+
+    It applies the caller's own `--on-error` the way hook.py applies it to an unreadable config:
+    fail closed where the *rule* says to, open where it does not. It was the interpreter's exit
+    code that decided before, which meant a recorder blocked too.
+    """
+    vendor = flag_value(argv, "--vendor", "claude")
+    event = flag_value(argv, "--event", "pre-tool")
+    if flag_value(argv, "--on-error", "deny") == "allow":
+        print(f"exeris hook dispatch: {reason}; this hook only records, so it yields",
+              file=sys.stderr)
+        return emit(vendor, event, "allow", "")
+    return emit(vendor, event, "block" if event == "stop" else "deny",
+                f"L0 cannot reach its dispatcher and this hook enforces a rule, so it refuses "
+                f"rather than waving the action through: {reason}")
 
 
 def sanitised(argv: list[str]) -> list[str] | None:
-    """The argument vector, rebuilt from matched pairs, or None if it is not `--flag value` pairs.
-
-    Rebuilt rather than passed through: what reaches `execv` is assembled from strings that each
-    matched a pattern, so there is no path by which an unexamined element arrives at the call.
-    """
+    """The argument vector if it is `--flag value` pairs and nothing else, otherwise None."""
     if len(argv) % 2:
         return None
-    out: list[str] = []
     for flag, value in zip(argv[0::2], argv[1::2]):
         if not FLAG.match(flag) or not VALUE.match(value):
             return None
-        out.append(FLAG.match(flag).group(0))
-        out.append(VALUE.match(value).group(0))
-    return out
+    return list(argv)
 
 
 def main(argv: list[str]) -> int:
     root = repo_root()
     hook = target(root)
     if not hook:
-        return refuse(argv, f"no hook.py under {root} — the manifest pins no vendored bundle and "
-                            f"{FALLBACK} is absent (run tools/agents_bundle.py vendor)")
+        return refuse(argv, f"no hook.py under {root} — the manifest pins no vendored bundle, or "
+                            f"the pinned tree is missing; re-vendor the bundle and re-render")
     args = sanitised(argv)
     if args is None:
         return refuse(argv, "the rendered hook command is not a sequence of --flag value pairs; "
                             "re-render it rather than hand-editing the provider config")
-    # Run it here rather than exec a second interpreter. Nothing in this file is an OS command:
-    # `hook` was confined to the vendored tree by target(), the vector was rebuilt by sanitised(),
-    # and neither is handed to a shell or a process launcher. The hook fires on every tool call, so
-    # the interpreter startup this removes is paid back on each of them.
+    # The hook runs here rather than in a second interpreter: no OS command, no process launch, and
+    # no interpreter startup charged to every tool event. Its own directory goes first on the path,
+    # which is what exec'ing it used to do implicitly — and that directory, unlike this file's, is
+    # inside the tree the pin's digest covers.
+    sys.path.insert(0, os.path.dirname(hook))
     sys.argv = [hook] + args
     try:
         runpy.run_path(hook, run_name="__main__")
@@ -193,4 +281,12 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Nothing reaches a runtime as a traceback. Exit 1 is "the hook errored", which every
+        # runtime in scope treats as allow, so an unexpected failure here would silently disable
+        # the layer — the single outcome this file exists to prevent.
+        sys.exit(refuse(sys.argv[1:], f"{type(exc).__name__}: {exc}"))
