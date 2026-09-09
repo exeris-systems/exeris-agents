@@ -55,7 +55,14 @@ MACHINE_PATH = re.compile(
     r"|(?<![\w/])/Users/[A-Za-z][\w .-]*/"                   # macOS
     r"|(?<![\w])[A-Za-z]:\\Users\\[^\\\s]+")               # Windows, which has no trailing-slash rule
 
-SKIP = (".git", "node_modules", "target", "build", "dist")
+# `.agents-tools` and `.guardrails` are TOOLING CHECKED OUT INTO THE WORKSPACE this checker walks:
+# docs-lint.yml fetches this bundle into the first and the organisation guardrails into the second.
+# Without them here, the bundle's OWN `AGENTS.md` is read as a nested file of whatever repository
+# is being checked and measured against the 4 KB nested cap — which it exceeds, so every consumer
+# failed on a file that is not theirs and that they cannot edit. `nested_checkout` does not save
+# it: `actions/checkout` leaves a `.git`, but the organisation repository's own run rsyncs the tree
+# with `--exclude .git` and the marker is gone.
+SKIP = (".git", "node_modules", "target", "build", "dist", ".agents-tools", ".guardrails")
 # .agents/vendor/ holds a pinned copy of the shared bundle. Its portability and its
 # contents are the bundle repository's to check; here it is verified by digest, and
 # re-reporting its findings would put them on a worklist nobody can act on locally.

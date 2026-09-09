@@ -366,5 +366,26 @@ def test_a_policy_nothing_composes_is_reported():
         shutil.rmtree(d)
 
 
+def test_tooling_checked_out_into_the_workspace_is_not_the_consumers():
+    """docs-lint fetches this bundle into `.agents-tools/` and the organisation guardrails into
+    `.guardrails/`, inside the very tree the checker walks. Without them skipped, THIS repository's
+    `AGENTS.md` — 4 KB and change — is read as a nested file of whichever consumer is being checked
+    and fails the 4 KB nested cap: a finding about a file that is not theirs and that they cannot
+    edit. `nested_checkout` does not save it, because the organisation repository's own run rsyncs
+    the tree with `--exclude .git` and the marker is gone."""
+    d = tempfile.mkdtemp(prefix="tooling-")
+    try:
+        write(os.path.join(d, "AGENTS.md"), "# x\n\nPoints at `.agents/` for the semantics.\n")
+        write(os.path.join(d, ".agents", "manifest.yaml"), "version: 1\nrepository: t\nimports: []\n")
+        for tooling in (".agents-tools", ".guardrails"):
+            write(os.path.join(d, tooling, "AGENTS.md"), "# not the consumer's\n\n" + ("x " * 3000))
+        p = subprocess.run([sys.executable, CHECK, "--root", d], capture_output=True, text=True)
+        check("tooling checked out into the workspace is not read as the consumer's",
+              (p.returncode, "agents-tools" in p.stdout, "guardrails" in p.stdout),
+              (0, False, False))
+    finally:
+        shutil.rmtree(d)
+
+
 if __name__ == "__main__":
     main(globals())

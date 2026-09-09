@@ -124,6 +124,14 @@ refused here.
   declaration lives, so counting it makes every declared file trivially referenced. Measured — with
   it included, an orphan planted in a real consumer tree was not reported at all.
 
+- **Tooling checked out into the workspace is no longer read as the consumer's.** `docs-lint.yml`
+  fetches this bundle into `.agents-tools/` and the organisation guardrails into `.guardrails/`,
+  inside the very tree the checker walks — so THIS repository's `AGENTS.md`, at 4.4 KB, was read as
+  a nested file of whichever consumer was being checked and failed the 4 KB nested cap. A finding
+  about a file that is not theirs and that they cannot edit. `nested_checkout` did not save it: the
+  organisation repository's own run rsyncs with `--exclude .git`, so the marker is gone. Caught by
+  CI on exeris-systems/.github#27, not by reading.
+
 ### Changed
 
 - `against-consumer`'s adapter check is **report-only**, and the eval step runs before the render
