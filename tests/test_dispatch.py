@@ -245,6 +245,23 @@ def test_a_stale_shim_is_removed_when_no_bundle_ships_one():
     shutil.rmtree(d)
 
 
+def test_a_shim_symlinked_out_of_the_checkout_stops_the_render():
+    """The destination is read to decide whether to delete it, and `os.path.isfile` follows a
+    link. A generated adapter that leads out of the tree is tampering, and a renderer that
+    quietly wrote through it would be the sink the containment checks exist to close."""
+    d = repo()
+    outside = tempfile.mkdtemp(prefix="dispatch-outside-")
+    planted = os.path.join(outside, "dispatch.py")
+    open(planted, "w").write("# DO NOT EDIT\n")
+    os.makedirs(os.path.join(d, ".agents", "hooks", "bin"), exist_ok=True)
+    os.symlink(planted, os.path.join(d, ".agents", "hooks", "bin", "dispatch.py"))
+    out = render(d)
+    check("the render stops", out.returncode, 2)
+    check("and says what it found", "outside the repository" in out.stderr, True)
+    check("the file outside is untouched", os.path.exists(planted), True)
+    shutil.rmtree(d); shutil.rmtree(outside)
+
+
 def test_a_hand_edited_shim_is_a_check_failure():
     """It sits outside the pin's digest, so `agents_bundle.py verify` cannot see it — but it is a
     generated adapter, and `--check` compares every one of those against its source byte for

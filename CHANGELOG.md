@@ -84,6 +84,11 @@ above, decides the number.
 - **The renderer cannot emit a command the shim would refuse.** A hook id, a vendor and an event
   become words in a command string, and nothing constrained them to the alphabet the shim checks.
   The renderer validates them where the string is built, and both patterns name each other.
+- **The shim's destination is confined too.** It is read to decide whether a stale copy should be
+  deleted, and `os.path.isfile` follows a link — so a generated adapter symlinked out of the
+  checkout would have had the renderer read a file elsewhere to decide about deleting a link to
+  it. A link leading out of the tree stops the render; it is tampering, not a state to write
+  through.
 - **One resolver for the shim source.** `dispatcher_path` used `os.path.exists`, which follows a
   symlink out of the tree, while `write_dispatch` required containment — so a symlinked vendor
   directory rendered a command naming a shim that was never written, which is the failure this
@@ -113,7 +118,7 @@ above, decides the number.
 
 ### Added
 
-- `tests/test_dispatch.py` — 72 assertions over the renderer's output and the shim's behaviour,
+- `tests/test_dispatch.py` — 75 assertions over the renderer's output and the shim's behaviour,
   including the bump-without-re-render state that produced this, the case where recognising only
   the new command shape would leave a repository with every hook rendered twice, two escapes from
   the vendored tree, a hand-edited command vector, a module planted beside the shim, a manifest

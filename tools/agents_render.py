@@ -264,7 +264,15 @@ def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: lis
     is why it is not under `.claude/`. The v2 layout already reserves `.agents/plugins/` for
     rendered output on the same reasoning.
     """
-    dest = os.path.join(root, DISPATCH_REL)
+    # The destination is read and, when stale, deleted. It is a fixed path under `--root`, but
+    # `--root` is an argument and the entry itself may be a symlink: `os.path.isfile` follows one,
+    # so without this the renderer could read a file outside the checkout to decide whether to
+    # delete a link to it. A generated adapter that is a link out of the tree is tampering, not a
+    # state to write through, so it stops the render rather than being skipped quietly.
+    dest = _compose.contained(root, os.path.join(root, DISPATCH_REL))
+    if not dest:
+        die(f"{DISPATCH_REL} resolves outside the repository — that is a generated file, and a "
+            f"link leading out of the checkout is not something this renderer writes through")
     src = dispatch_source(root, vendor_root)
     if not src:
         # No shim to write, so a shim left over from a bundle that had one is stale: the adapters
