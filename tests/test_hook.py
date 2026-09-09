@@ -60,7 +60,7 @@ hooks:
 """
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import FAILURES, check, main  # noqa: E402  (after the sys.path line it needs)
+from _harness import check, main  # noqa: E402  (after the sys.path line it needs)
 
 
 def call(repo: str, hook: str, payload: dict, *, on_error="deny", vendor="claude", env=None,

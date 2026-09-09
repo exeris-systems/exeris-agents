@@ -11,7 +11,6 @@ Run: python3 tests/test_composition.py
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -36,12 +35,15 @@ policies: [house-rule]
 references: []
 schemas: []
 nested: []
+# The renderer reads this to know which vendors to render for: without it the
+# missing-required-field test renders nothing and asserts against an empty run.
 adapters:
   claude:
     target: .claude
     agents: ".claude/agents/{name}.md"
     workflows: ".claude/skills/{name}/SKILL.md"
     skills: symlink
+    skills-link: ".claude/skills"
 degradations: {}
 provider-owned: []
 """
@@ -86,7 +88,22 @@ def repo(extra: str = "", *, pin: bool = False, vendored_policy: bool = False) -
 
 
 def errors(d: str) -> list[str]:
-    proc = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True)
+    """Annotations, after asserting the checker actually ran.
+
+    Ignoring the return code and stderr let every "expect 0 hits" assertion pass when the checker
+    crashed and emitted nothing — the report-success-while-doing-nothing shape this repository has
+    now fixed three times. A crash is a failure of the test, not a clean result.
+    """
+    # GITHUB_STEP_SUMMARY is removed deliberately: under Actions the report goes to that file
+    # instead of stdout, so the "did it actually run" guard below would fire on every clean case
+    # in CI and nowhere else. The test wants one deterministic channel.
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
+    proc = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True,
+                          env=env)
+    if proc.returncode not in (0, 1) or "Traceback" in proc.stderr:
+        raise AssertionError(f"checker did not run: rc={proc.returncode}\n{proc.stderr[-500:]}")
+    if "agents_file_check" not in proc.stdout:
+        raise AssertionError(f"checker produced no report:\n{proc.stdout[-500:]}")
     return [l for l in proc.stdout.splitlines() if l.startswith("::error")]
 
 
@@ -175,6 +192,73 @@ def test_renderer_names_a_missing_required_field():
           "KeyError" in proc.stderr, False)
     check("and the message says which file and which field",
           "no 'description'" in proc.stderr and "alpha" in proc.stderr, True)
+    shutil.rmtree(d)
+
+
+
+# ── shapes that used to produce one finding per character, or none at all ─────────────────────
+
+def test_a_scalar_where_a_list_belongs_is_one_finding():
+    d = repo("policies: house\n")
+    check("a scalar `policies:` is one finding, not one per character",
+          rule_hits(d, "composition"), 1)
+    shutil.rmtree(d)
+
+
+def test_a_pinned_but_unvendored_bundle_is_one_finding():
+    d = repo("policies: [bundle:a, bundle:b, bundle:c]\n", pin=True)
+    shutil.rmtree(os.path.join(d, ".agents", "vendor"))
+    check("a bundle pinned but not vendored names the one cause, not N missing files",
+          rule_hits(d, "composition"), 1)
+    shutil.rmtree(d)
+
+
+def test_evals_accepts_the_dot_agents_spelling():
+    d = repo("evals: .agents/evals\n")
+    os.makedirs(os.path.join(d, ".agents", "evals"), exist_ok=True)
+    p = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"})
+    check("`.agents/`-prefixed evals is accepted, as `output` is",
+          "evals directory" in p.stdout, False)
+    shutil.rmtree(d)
+
+
+def test_a_role_directory_without_an_agent_md_is_not_a_role():
+    d = repo("handoffs:\n  - {agent: hollow, when: x, blocking: false}\n")
+    os.makedirs(os.path.join(d, ".agents", "agents", "hollow"))
+    check("an empty directory does not satisfy 'is a role'", rule_hits(d, "composition"), 1)
+    shutil.rmtree(d)
+
+
+def test_skills_does_not_silently_accept_the_bundle_prefix():
+    d = repo("skills: [bundle:some-skill]\n")
+    p = subprocess.run([sys.executable, CHECKER, "--root", d], capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"})
+    check("the message says the prefix is unsupported rather than 'not a skill'",
+          "only policies and references support" in p.stdout, True)
+    shutil.rmtree(d)
+
+
+def test_a_default_workflow_is_validated():
+    d = repo("workflow: no-such-workflow\n")
+    check("rule 5's fourth reference kind", rule_hits(d, "composition"), 1)
+    shutil.rmtree(d)
+
+
+def test_renderer_names_a_missing_field_in_a_workflow_too():
+    d = repo()
+    os.makedirs(os.path.join(d, ".agents", "workflows"), exist_ok=True)
+    open(os.path.join(d, ".agents", "workflows", "w.md"), "w").write(
+        "---\nname: w\n---\n\nBody.\n")
+    m = os.path.join(d, ".agents", "manifest.yaml")
+    # Read fully, THEN write: `open(m, "w")` truncates before the read on the same line would run.
+    body = open(m, encoding="utf-8").read().replace("workflows: []", "workflows: [w]")
+    open(m, "w", encoding="utf-8").write(body)
+    proc = subprocess.run([sys.executable, RENDERER, "--root", d,
+                           "--adapters", os.path.join(ROOT, "tools", "adapters")],
+                          capture_output=True, text=True)
+    check("a workflow without `description` is named, not a KeyError",
+          ("KeyError" in proc.stderr, "no 'description'" in proc.stderr), (False, True))
     shutil.rmtree(d)
 
 

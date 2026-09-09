@@ -28,8 +28,9 @@ jobs:
         run: python tests/test_hook.py
       # The consumer-facing half. Both cases here were invisible to every check above, because this
       # repository is not a consumer of its own bundle: it vendors nothing and declares no
-      # generated region. `against-consumer` below runs the tools over a real tree, which is how
-      # they were found in the first place.
+      # generated region. These suites are the gate for them — `against-consumer` below runs the
+      # CHECKER and the RENDERER over a real tree, and until now ran the eval runner over nothing,
+      # so the eval half had no consumer-level gate at all. It does now, below.
       - name: Consumer path and manifest regression suite
         run: python tests/test_consumer_paths.py
       - name: Composition regression suite
@@ -70,3 +71,21 @@ jobs:
         run: python tools/agents_file_check.py --root consumer
       - name: adapters in exeris-docs match their source
         run: python tools/agents_render.py --root consumer --check
+      # The eval half, against the same real tree. Its runner resolves paths relative to the
+      # scenarios file it is handed, and every one of those resolutions is a consumer-side
+      # assumption this repository cannot test on itself. `|| true` is deliberately absent: a
+      # consumer whose scenarios do not resolve is the defect this step exists to catch.
+      - name: eval scenarios in exeris-docs resolve
+        run: |
+          # THIS branch's runner, placed where vendoring would place it — not the consumer's own
+          # vendored copy. The two steps above run this branch's checker and renderer against the
+          # consumer for the same reason: the job exists to test the tools in the pull request,
+          # and running the consumer's pinned copy would only re-report whichever bundle it
+          # happens to be behind on.
+          dest=$(ls -d consumer/.agents/vendor/exeris-agents-*/evals 2>/dev/null | head -1)
+          if [ -z "$dest" ]; then
+            echo "consumer vendors no bundle — nothing to resolve"; exit 0
+          fi
+          cp bundle/evals/run.py "$dest/run.py"
+          cd consumer && python "${dest#consumer/}/run.py" \
+            --scenarios .agents/evals/scenarios.yaml --dry-run

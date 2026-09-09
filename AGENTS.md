@@ -30,8 +30,11 @@ is the defect.
 checkouts through a version pin. So —
 
 - **A change to `bundle/` is a version change.** SemVer over the schema contract: a change that
-  makes a conforming repository stop conforming is MAJOR, an ignorable addition MINOR, wording
-  PATCH. `CHANGELOG.md` moves in the same pull request (ADR-085 §H.27).
+  moves the contract under a repository that was following it is MAJOR — a new required field, a
+  removed or renamed manifest key, a changed vendored layout. A new check is MINOR even when it
+  turns a build red, because it does that only where the repository was already not conforming.
+  Wording is PATCH. A `### Breaking` section is mandatory per release (ADR-085 §H.27); its
+  content decides the number, never its presence. `CHANGELOG.md` moves in the same pull request (ADR-085 §H.27).
 - **A change to `bundle/policies/` may only restrict.** A consuming repository may restrict
   further and may never relax, so a relaxation here silently relaxes every repository at once.
 - **A change to `bundle/schemas/` that adds a required property is MAJOR**, because a repository's

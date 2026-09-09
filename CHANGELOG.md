@@ -2,9 +2,19 @@
 
 All notable changes to the Exeris agent bundle. Keep a Changelog 1.1, SemVer, ADR-085 §H.27.
 
-The version is the **schema contract**, not the file count: a change that makes a conforming
-repository stop conforming is MAJOR, a new policy or schema field a repository can ignore is MINOR,
-and wording is PATCH.
+Versioning, stated precisely because the earlier wording licensed a wrong reading:
+
+- **MAJOR** — the contract moves under a repository that was following it: a new required field, a
+  removed or renamed manifest key, a changed vendored layout, a removed or renamed CLI flag.
+- **MINOR** — a new check, policy or schema field. A new check *can* turn a green build red, but
+  only where the repository was already not conforming: that is the check catching up with a rule
+  that already bound, not the contract moving. This is how check tooling is versioned everywhere,
+  and it is what "a conforming repository stops conforming" was always meant to say.
+- **PATCH** — wording, and fixes that only make a previously-failing case pass.
+
+A `### Breaking` section is **mandatory in every release** (ADR-085 §H.27), so "Breaking: nothing"
+is an answer and the section's presence never implies MAJOR. Its content, against the three rules
+above, decides the number.
 
 ## [Unreleased]
 
@@ -12,7 +22,20 @@ and wording is PATCH.
 
 ### Breaking
 
-- **A profile whose composition does not resolve now fails the check.** Rule 5 always required a
+- **Nothing moves the contract.** `bundle/schemas/` is unchanged, no manifest key is added,
+  removed or renamed, no CLI flag is removed, and the vendored layout is the same. A repository
+  that conforms to the schema on 1.1.1 conforms on this version.
+- **A profile whose composition does not resolve now fails the check** — the one change that can
+  turn a green build red. Rule 5 has required a reference to resolve since schema v2; nothing
+  verified it, so a repository could carry a broken one and report `0 errors`. That is the check
+  catching up with a rule that already bound, which is MINOR by the rule above and by how check
+  tooling is versioned generally. **A repository carrying such a reference must fix it.**
+- A case with no `expect.schema` is an error rather than `ok`, and `--report` outside the checkout
+  is refused. Both were never correct; the second is a path-safety fix.
+- *Not new here, recorded for accuracy:* refusing a `schemas` or `fixtures` directory symlinked
+  out of the checkout shipped in **1.1.1**, filed there under *Changed*. It is a behaviour
+  restriction released as a patch. Left as published — renumbering breaks the pin that names it —
+  and noted so the history is not read as if it happened in this release. Rule 5 always required a
   reference to point at something; nothing verified it, so a repository could carry a policy, a
   skill or a handoff target that does not exist and report `0 errors`. Repositories with such a
   reference go from green to red on this version — correctly, and visibly for the first time.
@@ -30,11 +53,48 @@ and wording is PATCH.
 - **The renderer answered a missing `name` or `description` with a `KeyError` traceback**, which
   says which key but not which file — while every other missing thing in it is reported by name.
 
+### Fixed — the eval runner's path guards, which guarded the wrong things
+
+- **`--scenarios` was read before it was guarded.** `load_yaml()` ran seven lines above
+  `within_repo()`, so the one CLI-controlled read the guard exists for still happened: a path
+  outside the checkout produced a YAML parse error or a raw `FileNotFoundError` rather than a
+  refusal. A guard that runs after its sink is a comment.
+- **`--report` was never guarded at all** — the only *write* sink, while three read sinks were
+  tightened. Confirmed creating a directory tree and a file outside the repository.
+- **`$ref` resolution was a fourth unguarded `open()`**, taking a path fragment out of schema JSON,
+  which is the same class of input as the three that were guarded.
+- **A case naming no `expect.schema` resolved to the schema *directory* and was reported `ok`** —
+  the "resolves to something rather than to the right thing" failure, one level below the one
+  1.1.1 fixed.
+- **A missing fixture aborted the whole run with a traceback** while a missing schema four lines
+  later was recorded and skipped, so one typo hid every later result.
+
+### Fixed — the checker
+
+- `provider_owned_paths()` re-read and re-parsed `manifest.yaml` a third time inside its own
+  `except: pass`, so an unparseable manifest produced an empty list and the same false findings
+  the entry was added to remove. It takes the parsed manifest and an explicit reporter now.
+- `generated-region` was read by nothing: the entry contributed only its `path`, exempting a
+  partially generated file as if it were wholly provider-owned. The named region must now be
+  present in the file.
+
 ### Added
 
 - `tests/test_composition.py` — 12 assertions over composition resolution, the `bundle:` prefix in
   its three states, forward handoffs and the renderer's missing-field message. Eight of them fail
   against 1.1.1.
+- Four more assertions in `tests/test_consumer_paths.py`, one per sink: `--scenarios` refused
+  *before* the read, `--report` refused with nothing created, a case with no schema reported as an
+  error rather than `ok`, and a missing fixture recorded without aborting the run.
+- `against-consumer` runs **this branch's** eval runner over the real consumer tree, placed where
+  vendoring would place it. Its comment claimed that job covered these cases; it never invoked the
+  runner at all, so the eval half had no consumer-level gate. The first attempt at the step ran the
+  *consumer's own vendored* runner, which only re-reports whichever bundle that repository is
+  behind on — it went red against a consumer still pinning 1.1.0, correctly for the consumer and
+  uselessly for the bundle. The two sibling steps had it right: the job exists to test the tools in
+  the pull request.
+- `_harness.reset()`, because extracting the shared harness replaced a duplicated counter with a
+  single un-resettable one: two suites in one process reported each other's numbers.
 
 ## [1.1.1] - 2026-09-09
 

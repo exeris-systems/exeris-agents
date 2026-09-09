@@ -71,9 +71,11 @@ been read.
 
 ## Versioning
 
-SemVer over the **schema contract**, not the file count. A change that makes a conforming
-repository stop conforming is MAJOR; a policy or schema field a repository can ignore is MINOR;
-wording is PATCH. See [`CHANGELOG.md`](CHANGELOG.md).
+SemVer over the **contract**. MAJOR is the contract moving under a repository that was following
+it — a new required field, a removed or renamed manifest key, a changed vendored layout. A new
+check is MINOR even when it turns a build red, because it does that only where the repository was
+already not conforming. Wording is PATCH. A `### Breaking` section is mandatory in every release
+(ADR-085 §H.27), so its presence never implies MAJOR — its content does. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Licence
 

@@ -23,8 +23,22 @@ def check(name: str, got, want) -> None:
         FAILURES.append(f"{name}\n      expected {want!r}\n      got      {got!r}")
 
 
+def reset() -> None:
+    """Clear the shared counters.
+
+    Extracting the harness removed a duplicated counter and left a single un-resettable one: two
+    suites imported in one process shared `PASSES` and `FAILURES`, so the second reported the
+    first's numbers on top of its own. `run()` resets before it starts, which is the only place
+    that can know a suite is beginning.
+    """
+    global PASSES
+    FAILURES.clear()
+    PASSES = 0
+
+
 def run(namespace: dict) -> int:
     """Run every `test_*` in `namespace`, in name order, and report."""
+    reset()
     for name, fn in sorted(namespace.items()):
         if not name.startswith("test_") or not callable(fn):
             continue
