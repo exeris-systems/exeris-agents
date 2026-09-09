@@ -77,9 +77,15 @@ jobs:
       # consumer whose scenarios do not resolve is the defect this step exists to catch.
       - name: eval scenarios in exeris-docs resolve
         run: |
-          runner=$(ls -d consumer/.agents/vendor/exeris-agents-*/evals/run.py 2>/dev/null | head -1)
-          if [ -z "$runner" ]; then
+          # THIS branch's runner, placed where vendoring would place it — not the consumer's own
+          # vendored copy. The two steps above run this branch's checker and renderer against the
+          # consumer for the same reason: the job exists to test the tools in the pull request,
+          # and running the consumer's pinned copy would only re-report whichever bundle it
+          # happens to be behind on.
+          dest=$(ls -d consumer/.agents/vendor/exeris-agents-*/evals 2>/dev/null | head -1)
+          if [ -z "$dest" ]; then
             echo "consumer vendors no bundle — nothing to resolve"; exit 0
           fi
-          cd consumer && python "${runner#consumer/}" \
+          cp bundle/evals/run.py "$dest/run.py"
+          cd consumer && python "${dest#consumer/}/run.py" \
             --scenarios .agents/evals/scenarios.yaml --dry-run

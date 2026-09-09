@@ -67,9 +67,13 @@ and wording is PATCH.
 - Four more assertions in `tests/test_consumer_paths.py`, one per sink: `--scenarios` refused
   *before* the read, `--report` refused with nothing created, a case with no schema reported as an
   error rather than `ok`, and a missing fixture recorded without aborting the run.
-- `against-consumer` runs the eval runner over the real consumer tree. Its comment claimed that
-  job covered these cases; it never invoked the runner, so the eval half had no consumer-level
-  gate — the claim and the gap are both fixed here.
+- `against-consumer` runs **this branch's** eval runner over the real consumer tree, placed where
+  vendoring would place it. Its comment claimed that job covered these cases; it never invoked the
+  runner at all, so the eval half had no consumer-level gate. The first attempt at the step ran the
+  *consumer's own vendored* runner, which only re-reports whichever bundle that repository is
+  behind on — it went red against a consumer still pinning 1.1.0, correctly for the consumer and
+  uselessly for the bundle. The two sibling steps had it right: the job exists to test the tools in
+  the pull request.
 - `_harness.reset()`, because extracting the shared harness replaced a duplicated counter with a
   single un-resettable one: two suites in one process reported each other's numbers.
 
