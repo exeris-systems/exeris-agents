@@ -19,8 +19,9 @@ What is rendered, per vendor mapping file in `agents/adapters/<vendor>.yaml`:
   .agents/workflows/<n>.md      -> the vendor's user-invoked prompt.
   .agents/skills/               -> a symlink where the runtime cannot read .agents/skills natively.
   .agents/hooks/hooks.yaml      -> the vendor's hook config, which carries no patterns of its own:
-                                   it invokes .agents/hooks/bin/hook.py, which reads the canonical
-                                   definitions at runtime.
+                                   it invokes .agents/hooks/bin/dispatch.py — a version-free copy
+                                   of the shim, written here too — which finds the pinned hook.py
+                                   and lets it read the canonical definitions at runtime.
 
 Vendors other than Claude need one mapping file each and no change here. They are deliberately not
 shipped with a guessed tool vocabulary: a mapping written from memory would silently grant or
@@ -47,8 +48,23 @@ MARK_BEGIN = "<!-- BEGIN GENERATED: composition (agents-md-schema.md rule 5) -->
 MARK_END = "<!-- END GENERATED -->"
 
 CAPABILITIES = {"read", "search", "edit", "shell", "web", "subagents"}
-# How a rendered hook entry is recognised as this renderer's on the next run.
-DISPATCHER_MARK = "hooks/bin/hook.py"
+# How a rendered hook entry is recognised as this renderer's on the next run. BOTH spellings, and
+# the old one stays for good: entries rendered before the shim existed name the vendored hook.py
+# directly, and an entry this function does not recognise is treated as hand-authored and kept. A
+# repository upgrading from <=1.2.0 would otherwise get every hook twice — the second copy pointing
+# into a vendored tree the same bump has just removed.
+DISPATCHER_MARKS = ("hooks/bin/hook.py", "hooks/bin/dispatch.py")
+# The canonical tree, and the declarations inside it. Named once: a path spelled at each call site
+# is a path that can be corrected at some of them.
+AGENTS = ".agents"
+# The version-free path the rendered config names, and the file the renderer copies there.
+DISPATCH_REL = f"{AGENTS}/hooks/bin/dispatch.py"   # posix: it is written into a command string
+HOOKS_YAML = os.path.join(AGENTS, "hooks", "hooks.yaml")
+# A hook id, a vendor and an event become words in a command string that a runtime hands to a
+# shell, and the shim then checks the vector it receives against this same alphabet. Validating
+# here is what keeps the two from disagreeing: the renderer cannot emit a command the shim would
+# refuse. `bundle/hooks/bin/dispatch.py` carries the matching copy and names this one.
+COMMAND_WORD = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:@+-]*\Z")
 
 
 def die(msg: str):
@@ -203,19 +219,94 @@ def render_workflow(src: str, mapping: dict, rel: str) -> str:
     return f"{head}\n{marker(rel)}\n{body.rstrip()}\n"
 
 
+def dispatch_source(root: str, vendor_root: str | None) -> str | None:
+    """The shim to copy, confined to the vendored tree, or None if this bundle ships none.
+
+    One resolver, because two were a way for the renderer to name a file it had declined to write:
+    `dispatcher_path` asked `os.path.exists` (which follows a symlink out of the tree) while
+    `write_dispatch` asked for containment, so a symlinked vendor directory produced a rendered
+    command pointing at a shim that was never written — the exact "names a file that is not there"
+    state this whole change exists to remove.
+    """
+    if not vendor_root:
+        return None
+    src = _compose.contained(root, os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py"))
+    return src if src and os.path.isfile(src) else None
+
+
 def dispatcher_path(root: str, vendor_root: str | None) -> str:
-    """Where hook.py lives. Vendored is the normal case; a repository that pins no bundle keeps
-    its own copy, and either way the rendered config names one path and no patterns."""
+    """What the rendered config invokes — and it carries no version.
+
+    It used to name the vendored hook.py, whose path contains the pin. That put the version in two
+    places with different lifetimes: the adapter, written when the renderer last ran, and the
+    vendored tree, replaced at every bump. Wherever the two are not in step the command points at a
+    file that is not there, `python3` exits 2, and exit 2 from a PreToolUse hook is a block — so
+    every tool call is denied by a stale string rather than by a rule.
+
+    The shim at DISPATCH_REL is the same dispatcher reached by a path that never moves; it reads
+    the pin from the manifest when the hook fires. A bundle vendored before the shim existed has
+    none to copy, so the old stamped path is still rendered for it: upgrading the renderer alone
+    must not rewrite a repository's adapters into a file its pinned bundle does not ship.
+    """
     if vendor_root:
+        if dispatch_source(root, vendor_root):
+            return DISPATCH_REL
         vendored = os.path.join(vendor_root, "hooks", "bin", "hook.py")
         if os.path.exists(os.path.join(root, vendored)):
             return vendored.replace(os.sep, "/")
     return ".agents/hooks/bin/hook.py"
 
 
+def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: list[str]) -> None:
+    """Copy the version-free shim out of the vendored tree to DISPATCH_REL.
+
+    Generated, and inside the canonical tree on purpose. The path the adapters name must not move
+    when the pin moves, which rules out the vendored tree; and one copy serves every vendor, which
+    is why it is not under `.claude/`. The v2 layout already reserves `.agents/plugins/` for
+    rendered output on the same reasoning.
+    """
+    # The destination is read and, when stale, deleted. It is a fixed path under `--root`, but
+    # `--root` is an argument and the entry itself may be a symlink: `os.path.isfile` follows one,
+    # so without this the renderer could read a file outside the checkout to decide whether to
+    # delete a link to it. A generated adapter that is a link out of the tree is tampering, not a
+    # state to write through, so it stops the render rather than being skipped quietly.
+    dest = _compose.contained(root, os.path.join(root, DISPATCH_REL))
+    if not dest:
+        die(f"{DISPATCH_REL} resolves outside the repository — that is a generated file, and a "
+            f"link leading out of the checkout is not something this renderer writes through")
+    src = dispatch_source(root, vendor_root)
+    if not src:
+        # No shim to write, so a shim left over from a bundle that had one is stale: the adapters
+        # no longer name it and nothing else would ever remove it. Same rule as a renamed profile's
+        # adapter, and it is `prune`'s reason for existing.
+        if os.path.isfile(dest) and "DO NOT EDIT" in open(dest, encoding="utf-8").read(400):
+            if check:
+                changes.append(f"{DISPATCH_REL} is generated but no pinned bundle ships one")
+            else:
+                os.remove(dest)
+                changes.append(f"removed stale {DISPATCH_REL}")
+        return
+    body = open(src, encoding="utf-8").read()
+    # The marker names the bundle path, not the vendored one. A version in this header would make
+    # the one file whose whole purpose is not to move change on every bump, and a copy left behind
+    # by an older render would differ from a fresh one for no reason a reader could act on.
+    line = ("# DO NOT EDIT. Generated from bundle/hooks/bin/dispatch.py by agents_render.py\n"
+            "# (exeris-systems/exeris-agents; agents-md-schema.md rule 7). Edit the source.\n")
+    if body.startswith("#!"):
+        shebang, rest = body.split("\n", 1)
+        body = f"{shebang}\n{line}{rest}"
+    else:
+        body = line + body
+    # Not covered by the pin's digest, and it does not need to be: it is a generated adapter, not
+    # a vendored file, and `--check` compares it against its source byte for byte the way it does
+    # every other adapter. A hand-edit is a CI failure there, which is the same guarantee rule 8
+    # gives the vendored tree, arrived at by the mechanism that owns generated files.
+    write(dest, body, check, changes, root)
+
+
 def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> str:
     """The vendor's hook config. It carries no patterns: hook.py reads hooks.yaml at runtime."""
-    spec = load_yaml(os.path.join(root, ".agents", "hooks", "hooks.yaml"))
+    spec = load_yaml(os.path.join(root, HOOKS_YAML))
     dispatcher = dispatcher_path(root, vendor_root)
     hm = mapping["hooks"]
     events: dict[str, list] = {}
@@ -230,6 +321,12 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
                 f"dropped hook is an unrecorded degradation.")
         if h.get("event") == "stop" and not hm.get("can-block-stop"):
             continue
+        for label, word in (("hook id", h["id"]), ("vendor", mapping["vendor"]),
+                            ("event", h.get("event", "pre-tool"))):
+            if not COMMAND_WORD.match(str(word)):
+                die(f"{label} {word!r} is not a plain word — it becomes part of a command string a "
+                    f"runtime hands to a shell, and the dispatcher refuses a vector it cannot "
+                    f"recognise, so a command built from it would be rendered and never run")
         entry = {
             "matcher": hm["matchers"].get(h.get("tool"), "") if h.get("tool") else "",
             "hooks": [{
@@ -256,7 +353,7 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
     # key deletes every hand-authored hook, silently and irreversibly. Ours are identifiable by the
     # dispatcher they invoke, so they can be swapped out without touching anything else.
     def ours(entry) -> bool:
-        return any(DISPATCHER_MARK in (h or {}).get("command", "")
+        return any(any(m in (h or {}).get("command", "") for m in DISPATCHER_MARKS)
                    for h in (entry or {}).get("hooks") or [])
 
     existing = settings.get("hooks") or {}
@@ -307,7 +404,7 @@ def link_skills(root: str, skills_dir: str, names: list[str], check: bool, copy:
     dest_root = os.path.join(root, skills_dir)
     os.makedirs(dest_root, exist_ok=True)
     for name in names:
-        src = os.path.join(root, ".agents", "skills", name)
+        src = os.path.join(root, AGENTS, "skills", name)
         dest = os.path.join(dest_root, name)
         rel = os.path.relpath(os.path.join(skills_dir, name))
         if copy:
@@ -403,7 +500,7 @@ def main() -> int:
     if a.adapters:
         ADAPTER_DIR = os.path.abspath(a.adapters)
     root = os.path.abspath(a.root)
-    manifest_path = os.path.join(root, ".agents", "manifest.yaml")
+    manifest_path = os.path.join(root, AGENTS, "manifest.yaml")
     if not os.path.exists(manifest_path):
         print("agents_render: no .agents/manifest.yaml — nothing to render")
         return 0
@@ -415,6 +512,11 @@ def main() -> int:
     vendor_root = None
     for imp in manifest.get("imports") or []:
         if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
+            bad = _compose.unsafe_pin(imp)
+            if bad:
+                die(f"manifest import has {bad}: {imp[bad]!r}, which is not a plain name — the pin "
+                    f"becomes a path under .agents/vendor/, so a separator, an absolute value or a "
+                    f"leading dot names a tree the digest in rule 8 does not cover")
             vendor_root = f".agents/vendor/{imp['bundle']}-{imp['version']}"
             if not os.path.isdir(os.path.join(root, vendor_root)):
                 die(f"manifest pins {imp['bundle']} {imp['version']} but {vendor_root} is not "
@@ -426,6 +528,9 @@ def main() -> int:
                            if (c or {}).get("status") != "deferred"]
 
     changes: list[str] = []
+    # Once, not per vendor: the shim is vendor-neutral and every adapter names the same copy.
+    if os.path.exists(os.path.join(root, HOOKS_YAML)):
+        write_dispatch(root, vendor_root, a.check, changes)
     for vendor in vendors:
         mpath = os.path.join(ADAPTER_DIR, f"{vendor}.yaml")
         if not os.path.exists(mpath):
@@ -439,14 +544,14 @@ def main() -> int:
         t = mapping["targets"]
 
         for name in manifest.get("agents") or []:
-            src = os.path.join(root, ".agents", "agents", name, "AGENT.md")
+            src = os.path.join(root, AGENTS, "agents", name, "AGENT.md")
             if not os.path.exists(src):
                 die(f"manifest lists agent '{name}' but {os.path.relpath(src, root)} does not exist")
             write(os.path.join(root, t["agents"].format(name=name)),
                   render_agent(src, mapping, os.path.relpath(src, root), vendor_root), a.check, changes, root)
 
         for name in manifest.get("workflows") or []:
-            src = os.path.join(root, ".agents", "workflows", f"{name}.md")
+            src = os.path.join(root, AGENTS, "workflows", f"{name}.md")
             if not os.path.exists(src):
                 die(f"manifest lists workflow '{name}' but {name}.md does not exist")
             write(os.path.join(root, t["workflows"].format(name=name)),
@@ -464,7 +569,7 @@ def main() -> int:
                   set(manifest.get("skills") or []) | set(manifest.get("workflows") or []),
                   a.check, changes)
 
-        if t.get("hooks") and os.path.exists(os.path.join(root, ".agents", "hooks", "hooks.yaml")):
+        if t.get("hooks") and os.path.exists(os.path.join(root, HOOKS_YAML)):
             write(os.path.join(root, t["hooks"]), render_hooks(root, mapping, vendor_root), a.check, changes, root)
 
     if a.check:

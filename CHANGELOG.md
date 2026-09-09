@@ -18,6 +18,126 @@ above, decides the number.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-09
+
+### Breaking
+
+- **Nothing moves the contract.** No manifest key is added, removed or renamed; no CLI flag
+  changes; `bundle/schemas/` is untouched; the vendored layout gains a file and loses none. A
+  repository conforming on 1.2.0 conforms on this version.
+- **`.claude/settings.json` changes on the next render**, because the command it carries changes.
+  That is a generated file the renderer owns, and `--check` reports it the way it reports any
+  adapter whose source moved: re-render and commit. A repository that upgrades without re-rendering
+  keeps working — the old command is still valid until its vendored tree is replaced, which is the
+  same bump that rewrites it.
+- **A new generated file appears in the canonical tree**: `.agents/hooks/bin/dispatch.py`. It is
+  written by the renderer, carries the do-not-edit marker, and belongs in `.agents/` rather than
+  under a provider directory because one copy serves every vendor and its path must not move when
+  the pin does.
+
+### Fixed
+
+- **The rendered hook command no longer carries the pinned version.** It named
+  `.agents/vendor/<bundle>-<version>/hooks/bin/hook.py`, putting the version in two files with
+  different lifetimes: the adapter, written when the renderer last ran, and the vendored tree,
+  replaced at every bump. A checkout holding one at a version the other does not ran a command
+  pointing at a missing file — and the failure was not a warning. `python3` exits 2 on a file it
+  cannot open, and exit 2 from a `PreToolUse` hook is a *block*, so every shell call was denied
+  whatever each hook's own `--on-error` said: the interpreter answered before the layer could.
+
+  The state is routine, not exotic. A pull request's review environment pairs the base branch's
+  protected `.claude/` with the branch's own tree, so the first review of every bundle bump ran
+  with no shell at all — twice on exeris-docs #106, reporting ten checks as `not-run`, before
+  anyone asked why. A contributor whose editor holds the old settings while the checkout moves
+  hits the same wall.
+
+  The rendered config now names `.agents/hooks/bin/dispatch.py`, a version-free copy of a shim the
+  bundle ships. It reads the pin from `.agents/manifest.yaml` when the hook fires and hands off to
+  the vendored `hook.py`. `manifest.yaml` stays the single authority for which bundle runs; it is
+  read at a moment when both halves are on disk together.
+
+- **A missing dispatcher now honours the caller's `--on-error`.** It could not before: the
+  interpreter's exit code arrived first, so a recorder declaring `--on-error allow` blocked the
+  tool call anyway. Fail-closed is again a property of the rule, which is what `--on-error` was
+  introduced to make true.
+
+- **The shim's own directory no longer leads `sys.path`.** Running the hook in-process left the
+  interpreter's `sys.path[0]` pointing at `.agents/hooks/bin/` — a generated adapter's home, and
+  not part of the tree the pin's digest covers — so a file dropped beside the shim satisfied an
+  import made by the shim or by the gate it starts, and L0 could be switched off by *adding* a
+  file rather than editing one. Exec'ing hid this: the path then led with the vendored directory.
+  That directory is put back in front for the hook, and the shim's own is removed before anything
+  is imported.
+- **Every escape returns a decision, not a traceback.** The manifest read caught `OSError` only,
+  so a file that is not valid UTF-8 raised through `main` and exited 1 — the code every runtime
+  reads as "the hook errored", which is *allow*. There is a guard at the read and one around the
+  whole call, and both route to the same refusal.
+- **A refusal now speaks the vendor's wire format.** It answered with an exit code alone, and exit
+  2 is the block channel only on Claude, Codex and Copilot. On cursor, gemini and antigravity a
+  missing dispatcher under `--on-error deny` therefore failed **open** — the opposite of what the
+  flag promises and of what this file's own docstring claimed.
+- **The pin is read only from `imports:`, and through pyyaml when it is importable.** The line
+  reader took the first `- bundle:` in any block sequence, so a manifest could resolve a different
+  bundle here than in the renderer and the checker; and it could not see a flow-style `imports:`
+  that the renderer accepts, returning None and denying instead. It is scoped to the key and is
+  now the fallback rather than the mechanism.
+- **The renderer cannot emit a command the shim would refuse.** A hook id, a vendor and an event
+  become words in a command string, and nothing constrained them to the alphabet the shim checks.
+  The renderer validates them where the string is built, and both patterns name each other.
+- **The shim's destination is confined too.** It is read to decide whether a stale copy should be
+  deleted, and `os.path.isfile` follows a link — so a generated adapter symlinked out of the
+  checkout would have had the renderer read a file elsewhere to decide about deleting a link to
+  it. A link leading out of the tree stops the render; it is tampering, not a state to write
+  through.
+- **One resolver for the shim source.** `dispatcher_path` used `os.path.exists`, which follows a
+  symlink out of the tree, while `write_dispatch` required containment — so a symlinked vendor
+  directory rendered a command naming a shim that was never written, which is the failure this
+  release exists to remove. A stale shim is also removed when a re-pinned bundle ships none;
+  nothing did that before, and `--check` stayed clean over the orphan.
+- **The shim runs the hook in its own process.** It exec'd a second interpreter, which made an
+  OS-command sink out of a call that never needed one and paid a Python startup on every tool
+  event — the hook fires on all of them. `runpy` runs the confined path here instead; the hook's
+  own exit code travels back through `SystemExit`, which is the decision channel on the runtimes
+  that document one, and a hook that cannot start now falls to the caller's `--on-error` rather
+  than to whatever the child process happened to return.
+- **The rendered command is validated before it becomes an argument vector.** The shim is the
+  boundary between a provider's config and the dispatcher, and it forwarded whatever the config
+  contained. It now requires `--flag value` pairs and rebuilds the vector from strings that each
+  matched a pattern, so a hand-edited command is refused there, with a reason, instead of reaching
+  an argument parser the reader never associated with the config. The flag *vocabulary* stays
+  hook.py's — this checks shape, not names, so a new flag needs no change here.
+- **The pin is validated before it becomes a path.** `bundle` and `version` are joined into a
+  path under `.agents/vendor/` which is read, written and — through the shim — executed, and
+  neither was checked. An absolute `bundle` is the sharp case: `os.path.join` swallows the base it
+  was joined to, so the pin could name any directory on the machine, and the shim would have run
+  code the digest in rule 8 does not cover. Components must now be plain names, the resolved path
+  must stay inside the vendored tree (realpath, so a symlink out is caught too), and the renderer
+  refuses such a manifest outright rather than building adapters from it. Raised by SonarCloud on
+  the pull request that introduced the shim; the same shape was reachable through the renderer
+  before it.
+
+### Changed
+
+- The shim's line reader for the pin uses string operations rather than regular expressions, one
+  of which had super-linear backtracking on a line it would never match; `emit` is split so the
+  vendor shape table and the exit-code rule are separate functions; and `SystemExit` from the hook
+  is no longer caught. Catching it to read `.code` and return the same number was a longer way of
+  writing what the interpreter already does, and it dropped the message a non-integer exit
+  carries — `sys.exit("hooks.yaml is unreadable")` became a bare 1. `.agents` is a constant in the
+  renderer. All four raised by the quality analysis, all four real.
+
+### Added
+
+- `tests/test_dispatch.py` — 77 assertions over the renderer's output and the shim's behaviour,
+  including the bump-without-re-render state that produced this, the case where recognising only
+  the new command shape would leave a repository with every hook rendered twice, two escapes from
+  the vendored tree, a hand-edited command vector, a module planted beside the shim, a manifest
+  that is not UTF-8, and a refusal read back in each vendor's own shape. The suite scrubs
+  `CLAUDE_PROJECT_DIR` from the environment it runs fixtures in: inheriting it pointed the shim at
+  the checkout the suite was being run from, so it passed in CI and failed on a developer's
+  machine.
+
+
 ## [1.2.0] - 2026-09-09
 
 ### Breaking

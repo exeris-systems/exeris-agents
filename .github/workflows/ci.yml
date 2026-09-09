@@ -35,6 +35,11 @@ jobs:
         run: python tests/test_consumer_paths.py
       - name: Composition regression suite
         run: python tests/test_composition.py
+      # The rendered hook command used to carry the pin, so a checkout whose adapter and vendored
+      # tree were a version apart denied every shell call — which is the state a pull request's
+      # review environment is in on every bump.
+      - name: Hook dispatcher regression suite
+        run: python tests/test_dispatch.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'

@@ -3,3 +3,6 @@ dist/
 *.tgz
 .agents-state/
 __pycache__/
+
+# IDE project files. Untracked and easy to sweep in with `git add -A`, which nearly happened.
+.idea/

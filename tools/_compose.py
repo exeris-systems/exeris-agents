@@ -9,9 +9,34 @@ imported by both.
 from __future__ import annotations
 
 import os
+import re
 
 VENDOR = os.path.join(".agents", "vendor")
 BUNDLE_PREFIX = "bundle:"
+# A pin component is a plain name. `bundle` and `version` are joined into a path under `.agents/`
+# and the result is read, written and — through the hook shim — executed, so a component carrying
+# a separator, an absolute path or a leading dot would name a tree the pin's digest cannot vouch
+# for. An absolute `bundle` is the sharp one: os.path.join swallows the base it was joined to.
+SAFE_COMPONENT = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def unsafe_pin(imp: dict) -> str | None:
+    """The first pin component that is not a plain name, or None."""
+    for key in ("bundle", "version"):
+        value = imp.get(key)
+        if value is not None and not SAFE_COMPONENT.match(str(value)):
+            return key
+    return None
+
+
+def contained(base: str, path: str) -> str | None:
+    """`path` resolved, or None if it does not stay inside `base`.
+
+    Both ends are realpath'd, so a symlink out of the checkout is caught as well as a `..`.
+    """
+    root = os.path.realpath(base)
+    full = os.path.realpath(path)
+    return full if full == root or full.startswith(root + os.sep) else None
 
 
 def pinned_import(manifest: dict) -> dict | None:
