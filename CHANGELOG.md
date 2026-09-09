@@ -93,6 +93,37 @@ refused here.
   the dispatch suite, a no-op `edit()` implying a fixture rule that does not exist, and two blank
   lines a revert left in a docstring.
 
+### Added — three items that had been parked as "report upstream"
+
+- **The eval runner stops handing Claude Code a file path where it documents a document.**
+  `--json-schema` takes a schema INLINE — its own `--help` example is a literal
+  `{"type":"object",…}` — and it was given `schema_path`. Both flags do exist, so the parked note
+  that the runner "cannot drive Claude Code" was imprecise; the defect is narrower and sharper.
+
+  It is fixed by **not passing the schema to that CLI at all**, which also resolves the tension
+  with rule 13 that was parked beside it. Rule 13 has a role answer in Markdown and reproduce the
+  decision as a fenced `json` block *after* it; `--json-schema` puts the CLI in structured-output
+  mode, so the turn the eval graded would not be the turn the role performs in review or in a
+  session — an eval exercising a different output than production is not evidence about production.
+  `extract_json` takes the block out and `validate()` checks it, which is where rule 13 puts
+  validation. codex keeps `--output-schema`, whose flag genuinely takes a path.
+
+  `--show-command` prints the argument vector a case would run, so it can be inspected without
+  spending a turn. **Not verified against a live CLI**: the flags and their argument kinds are read
+  from `claude --help` on 2026-09-09, and whether `--agent <name>` resolves a rendered profile is
+  untested.
+
+- **The checker reports a policy or reference that nothing composes.** The forward direction — a
+  profile naming one that does not resolve — became an error in 1.2.0; the reverse stayed
+  invisible: on disk, in the manifest, composed by no profile and named by no other agent file.
+  Both halves of rule 5's "agree in both directions" were about EXISTENCE; this is about USE. A
+  **warning**, because an unreferenced policy is not a broken contract — but a policy no role loads
+  is a rule nobody reads, which is how a rule quietly stops applying while still looking enforced.
+
+  The manifest is excluded from the mention scan, and that is the whole check: it is where the
+  declaration lives, so counting it makes every declared file trivially referenced. Measured — with
+  it included, an orphan planted in a real consumer tree was not reported at all.
+
 ### Changed
 
 - `against-consumer`'s adapter check is **report-only**, and the eval step runs before the render

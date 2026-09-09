@@ -327,5 +327,44 @@ def test_the_no_jsonschema_fallback_says_when_it_cannot_validate():
         shutil.rmtree(d)
 
 
+def test_a_policy_nothing_composes_is_reported():
+    """rule 5's unchecked direction. The forward one — a profile naming a policy that does not
+    resolve — is an error. The reverse was invisible: on disk, in the manifest, composed by nobody.
+
+    The manifest must NOT count as a mention. It is where the declaration lives, so counting it
+    makes every declared file trivially referenced — measured, with it included an orphan planted
+    in a real tree was not reported at all."""
+    def tree(compose: bool) -> str:
+        d = tempfile.mkdtemp(prefix="orphan-")
+        write(os.path.join(d, "AGENTS.md"), "# x\n\nPoints at `.agents/` for the semantics.\n")
+        write(os.path.join(d, ".agents", "manifest.yaml"),
+              "version: 2\nrepository: t\nimports: []\n"
+              "agents: [r]\nskills: []\nworkflows: []\n"
+              "policies: [used, orphan]\nreferences: []\n")
+        for name in ("used", "orphan"):
+            write(os.path.join(d, ".agents", "policies", f"{name}.md"), f"# {name}\n\nbody\n")
+        listed = "[used, orphan]" if compose else "[used]"
+        write(os.path.join(d, ".agents", "agents", "r", "AGENT.md"),
+              "---\nname: r\ndescription: a role that exists so the tree is well-formed and this "
+              "case is about composition and nothing else\nrole: reviewer\nmode: read-only\n"
+              f"capabilities: [read]\npolicies: {listed}\n---\n\nbody\n")
+        return d
+
+    d = tree(compose=False)
+    try:
+        p = subprocess.run([sys.executable, CHECK, "--root", d], capture_output=True, text=True)
+        check("an uncomposed policy is reported", "orphan" in p.stdout, True)
+        check("and the one that IS composed is not", p.stdout.count("'used'"), 0)
+    finally:
+        shutil.rmtree(d)
+
+    d = tree(compose=True)
+    try:
+        p = subprocess.run([sys.executable, CHECK, "--root", d], capture_output=True, text=True)
+        check("composing it clears the finding", "orphan" in p.stdout, False)
+    finally:
+        shutil.rmtree(d)
+
+
 if __name__ == "__main__":
     main(globals())

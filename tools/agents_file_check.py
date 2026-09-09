@@ -718,6 +718,71 @@ def provider_owned_paths(manifest: dict, rep: Report | None = None) -> set[str]:
     return out
 
 
+def check_composition_is_used(rep: Report, manifest: dict, profiles_dir: str):
+    """rule 5, the direction nothing checked: a policy or reference that nothing composes.
+
+    The forward direction — a profile naming a policy that does not resolve — became an error when
+    composition started being checked at all. The reverse stayed invisible: a file on disk, listed
+    in the manifest, and referenced by no profile and no prose. Both halves of "the manifest and
+    the filesystem must agree in both directions" were about EXISTENCE; this is about USE.
+
+    A warning, not an error, and deliberately. An unreferenced policy is not a broken contract — it
+    may be about to be composed, or kept for a role not yet written. But a policy no role loads is
+    a rule nobody reads, which is how a rule quietly stops applying while still looking enforced.
+
+    A mention counts from anywhere a reader would follow it: a profile's `policies:` or
+    `references:` list, or the text of any other agent file or `AGENTS.md`. Only the file's own
+    text is excluded, so a policy that merely names itself is still an orphan.
+    """
+    composed: set[str] = set()
+    for name in sorted(os.listdir(profiles_dir) if os.path.isdir(profiles_dir) else []):
+        fm, _ = read_frontmatter(os.path.join(profiles_dir, name, "AGENT.md"))
+        if not isinstance(fm, dict):
+            continue
+        for key in ("policies", "references"):
+            values, _ = _compose.as_list(fm.get(key))
+            for entry in values or []:
+                composed.add(str(entry).split(":", 1)[-1])
+
+    # The manifest is excluded on purpose: it is where the DECLARATION lives, so counting it as a
+    # mention makes every declared file trivially "referenced" and the check answers yes to
+    # everything. Measured — with it included, an orphan planted in a real tree was not reported.
+    manifest_path = os.path.normpath(os.path.join(".agents", "manifest.yaml"))
+    texts: list[tuple[str, str]] = []
+    for dirpath, dirnames, files in os.walk(".agents"):
+        if os.path.relpath(dirpath).startswith(VENDOR):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP]
+        for f in files:
+            if f.endswith((".md", ".yaml", ".yml", ".json")):
+                fp = os.path.join(dirpath, f)
+                texts.append((os.path.normpath(fp),
+                              open(fp, encoding="utf-8", errors="replace").read()))
+    for dirpath, dirnames, files in os.walk("."):
+        dirnames[:] = [d for d in dirnames if d not in SKIP and not nested_checkout(dirpath, d)]
+        if "AGENTS.md" in files:
+            fp = os.path.join(dirpath, "AGENTS.md")
+            texts.append((os.path.normpath(fp),
+                          open(fp, encoding="utf-8", errors="replace").read()))
+
+    for kind, sub in (("policy", "policies"), ("reference", "references")):
+        for raw in manifest.get(sub) or []:
+            name = str(raw)
+            name = name[len(sub) + 1:] if name.startswith(sub + "/") else name
+            name = name[:-3] if name.endswith(".md") else name
+            own = os.path.normpath(os.path.join(".agents", sub, name + ".md"))
+            if name in composed:
+                continue
+            if any(name in body for path, body in texts
+                   if path != own and path != manifest_path):
+                continue
+            rep.warning(own, f"{kind} '{name}' is declared and on disk, and NOTHING composes or "
+                             f"mentions it — no profile lists it and no other agent file names it. "
+                             f"A rule no role loads is a rule nobody reads (rule 5)",
+                        rule="composition")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -813,6 +878,7 @@ def main():
             check_hooks(rep, manifest)
             if declared_v2:
                 check_manifest_agreement(rep, manifest)
+                check_composition_is_used(rep, manifest, profiles)
             else:
                 rep.warning(manifest_path,
                             "manifest is version 1 — the v2 rules (10-13) are reported as warnings "
