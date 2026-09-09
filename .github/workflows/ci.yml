@@ -74,8 +74,21 @@ jobs:
       - run: pip install pyyaml jsonschema
       - name: agent-file check against exeris-docs
         run: python tools/agents_file_check.py --root consumer
-      - name: adapters in exeris-docs match their source
-        run: python tools/agents_render.py --root consumer --check
+      # Render, then check — NOT check alone. `--check` on its own compares THIS branch's renderer
+      # against adapters the consumer committed from whichever version it pins, so any change to
+      # what the renderer emits fails here until the consumer re-renders. The consumer cannot
+      # re-render before the change ships, so that form is a gate no renderer fix can pass: it
+      # failed on the anchored hook command, which is a fix for a defect that denied every shell
+      # call on a consumer.
+      #
+      # Adapter DRIFT is the consumer's own gate, at the version it pins — exeris-docs runs
+      # `--check` in its docs-lint. What belongs here is what this repository owns: that the
+      # renderer runs cleanly against a real tree, and that it is idempotent, which a second
+      # `--check` establishes and a stale comparison never could.
+      - name: the renderer runs against exeris-docs, and settles
+        run: |
+          python tools/agents_render.py --root consumer
+          python tools/agents_render.py --root consumer --check
       # The eval half, against the same real tree. Its runner resolves paths relative to the
       # scenarios file it is handed, and every one of those resolutions is a consumer-side
       # assumption this repository cannot test on itself. `|| true` is deliberately absent: a
