@@ -26,6 +26,12 @@ jobs:
       # nobody kept — so the next change re-broke what the last one fixed.
       - name: L0 dispatcher regression suite
         run: python tests/test_hook.py
+      # The consumer-facing half. Both cases here were invisible to every check above, because this
+      # repository is not a consumer of its own bundle: it vendors nothing and declares no
+      # generated region. `against-consumer` below runs the tools over a real tree, which is how
+      # they were found in the first place.
+      - name: Consumer path and manifest regression suite
+        run: python tests/test_consumer_paths.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'

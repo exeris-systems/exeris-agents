@@ -8,6 +8,30 @@ and wording is PATCH.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-09
+
+### Fixed
+
+Two defects a consuming repository hits and this one does not, both found by running the 1.1.0
+tools against a second consumer rather than by reading them. Each has a regression test that fails
+on 1.1.0.
+
+- **A `provider-owned` entry in the mapping spelling rule 7 requires discarded the whole list.**
+  `{path: …, generated-region: …}` is how a file with a generated region is declared — a JSON
+  settings file has no comment to carry a marker — and the checker read the list with `set(...)`,
+  which raises `TypeError` on an unhashable dict inside a bare `except: pass`. One mapping entry
+  therefore voided every plain string beside it, and the adapter check reported provider-owned
+  operational files as unmarked semantics. `exeris-docs`, the pilot, has such an entry today.
+- **The eval runner resolved `schema_dir` and `fixture_dir` against itself.** That is correct only
+  while the runner sits at `.agents/evals/`. Vendored — and `evals/` is in the vendored set — it
+  sits at `.agents/vendor/<bundle>-<v>/evals/`, so the defaults this repository documents pointed
+  at the bundle's own base schemas and at a fixtures directory the vendored tree does not have,
+  and **not one scenario resolved in any consumer**. Both are now relative to the scenarios file,
+  and `--scenarios` defaults to the repository's `.agents/evals/scenarios.yaml` when there is one.
+
+Consumers on 1.1.0: re-vendor. The tooling half of the first fix reaches you without one, because
+`tools/` is checked out rather than vendored; the eval half does not.
+
 ## [1.1.0] - 2026-09-08
 
 ### Breaking

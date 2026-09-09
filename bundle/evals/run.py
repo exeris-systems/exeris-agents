@@ -166,9 +166,20 @@ def build_prompt(case: dict, fixture_dir: str) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def default_scenarios() -> str:
+    """The repository's own scenarios, not the vendored copy's.
+
+    `HERE/scenarios.yaml` is right only when this runner sits at `.agents/evals/`. Vendored it does
+    not, and `evals/` carries no scenarios file at all — so the documented invocation exited with a
+    FileNotFoundError against a path inside the vendored tree.
+    """
+    repo_local = os.path.join(REPO, ".agents", "evals", "scenarios.yaml")
+    return repo_local if os.path.exists(repo_local) else os.path.join(HERE, "scenarios.yaml")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenarios", default=os.path.join(HERE, "scenarios.yaml"))
+    ap.add_argument("--scenarios", default=default_scenarios())
     ap.add_argument("--runtime", choices=sorted(RUNTIMES))
     ap.add_argument("--tags", help="comma-separated; run only cases carrying one of them")
     ap.add_argument("--case", help="run a single case by id")
@@ -179,8 +190,14 @@ def main() -> int:
 
     cfg = load_yaml(a.scenarios)
     defaults = cfg.get("defaults") or {}
-    schema_dir = os.path.normpath(os.path.join(HERE, defaults.get("schema_dir", "../schemas")))
-    fixture_dir = os.path.normpath(os.path.join(HERE, defaults.get("fixture_dir", "fixtures")))
+    # Relative to the SCENARIOS FILE, not to this script. The two were the same only while the
+    # runner lived at `.agents/evals/` — vendored, it sits at `.agents/vendor/<bundle>-<v>/evals/`,
+    # so `../schemas` resolved to the bundle's BASE schemas and `fixtures` to a directory the
+    # vendored tree does not have. Every case then failed to resolve, in every consumer, with the
+    # documented defaults. The same trap the dispatcher and repo_root() above were written for.
+    base = os.path.dirname(os.path.abspath(a.scenarios))
+    schema_dir = os.path.normpath(os.path.join(base, defaults.get("schema_dir", "../schemas")))
+    fixture_dir = os.path.normpath(os.path.join(base, defaults.get("fixture_dir", "fixtures")))
 
     cases = cfg.get("cases") or []
     if a.case:

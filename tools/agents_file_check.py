@@ -588,6 +588,36 @@ def check_adapters(rep: Report, strict: bool, provider_owned: set[str] | None = 
                          f"semantic content belongs in .agents/ (first: {authored[0]})", rule="adapter")
 
 
+def provider_owned_paths() -> set[str]:
+    """rule 7's `provider-owned` list, in both spellings the rule gives it.
+
+    A plain string is a file or directory the renderer does not own at all. A mapping —
+    `{path: …, generated-region: …}` — is a file the renderer writes PART of, which rule 7 requires
+    to be declared here because a JSON settings file has no comment to carry a marker.
+
+    That second spelling used to be read by `set(...)` directly, which raises TypeError on an
+    unhashable dict inside a bare `except: pass` — so one mapping entry silently discarded the
+    WHOLE list, including every plain string in it, and the check then reported provider-owned
+    operational files as un-marked semantics. Silent, and in the direction that produces findings
+    nobody can act on.
+    """
+    manifest = os.path.join(".agents", "manifest.yaml")
+    if not os.path.exists(manifest):
+        return set()
+    import yaml
+    try:
+        entries = (yaml.safe_load(open(manifest, encoding="utf-8")) or {}).get("provider-owned") or []
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, str):
+            out.add(entry)
+        elif isinstance(entry, dict) and entry.get("path"):
+            out.add(str(entry["path"]))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -708,15 +738,7 @@ def main():
     for fp in sorted(set(authored)):
         check_machine_paths(fp, rep)
 
-    provider_owned = set()
-    if os.path.isdir(".agents") and os.path.exists(os.path.join(".agents", "manifest.yaml")):
-        import yaml
-        try:
-            provider_owned = set(
-                (yaml.safe_load(open(os.path.join(".agents", "manifest.yaml"), encoding="utf-8"))
-                 or {}).get("provider-owned") or [])
-        except Exception:
-            pass
+    provider_owned = provider_owned_paths()
     check_adapters(rep, a.strict_adapters, provider_owned)
     sys.exit(rep.emit())
 
