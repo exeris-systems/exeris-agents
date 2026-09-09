@@ -364,6 +364,20 @@ def test_the_hooks_own_exit_code_survives():
     shutil.rmtree(d)
 
 
+def test_a_non_integer_exit_keeps_its_message():
+    """`sys.exit("...")` is exit 1 with the string on stderr. Catching SystemExit to return
+    `.code` turned that into a bare 1 and dropped the message; letting it reach the interpreter
+    is both shorter and the only version that keeps what the hook was trying to say."""
+    d = repo()
+    render(d)
+    hook = os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0", "hooks", "bin", "hook.py")
+    open(hook, "w").write("import sys\nsys.exit('hooks.yaml is unreadable')\n")
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    check("the exit code is 1", out.returncode, 1)
+    check("and the message survives", "hooks.yaml is unreadable" in out.stderr, True)
+    shutil.rmtree(d)
+
+
 def test_a_hook_that_cannot_start_falls_back_to_on_error():
     """A hook.py that raises on import is not a hook that allows."""
     d = repo()

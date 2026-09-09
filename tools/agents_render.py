@@ -54,11 +54,12 @@ CAPABILITIES = {"read", "search", "edit", "shell", "web", "subagents"}
 # repository upgrading from <=1.2.0 would otherwise get every hook twice — the second copy pointing
 # into a vendored tree the same bump has just removed.
 DISPATCHER_MARKS = ("hooks/bin/hook.py", "hooks/bin/dispatch.py")
+# The canonical tree, and the declarations inside it. Named once: a path spelled at each call site
+# is a path that can be corrected at some of them.
+AGENTS = ".agents"
 # The version-free path the rendered config names, and the file the renderer copies there.
-DISPATCH_REL = ".agents/hooks/bin/dispatch.py"
-# The canonical hook declarations. Named once: three call sites tested for it separately, and a
-# path spelled three times is a path that can be corrected in two of them.
-HOOKS_YAML = os.path.join(".agents", "hooks", "hooks.yaml")
+DISPATCH_REL = f"{AGENTS}/hooks/bin/dispatch.py"   # posix: it is written into a command string
+HOOKS_YAML = os.path.join(AGENTS, "hooks", "hooks.yaml")
 # A hook id, a vendor and an event become words in a command string that a runtime hands to a
 # shell, and the shim then checks the vector it receives against this same alphabet. Validating
 # here is what keeps the two from disagreeing: the renderer cannot emit a command the shim would
@@ -403,7 +404,7 @@ def link_skills(root: str, skills_dir: str, names: list[str], check: bool, copy:
     dest_root = os.path.join(root, skills_dir)
     os.makedirs(dest_root, exist_ok=True)
     for name in names:
-        src = os.path.join(root, ".agents", "skills", name)
+        src = os.path.join(root, AGENTS, "skills", name)
         dest = os.path.join(dest_root, name)
         rel = os.path.relpath(os.path.join(skills_dir, name))
         if copy:
@@ -499,7 +500,7 @@ def main() -> int:
     if a.adapters:
         ADAPTER_DIR = os.path.abspath(a.adapters)
     root = os.path.abspath(a.root)
-    manifest_path = os.path.join(root, ".agents", "manifest.yaml")
+    manifest_path = os.path.join(root, AGENTS, "manifest.yaml")
     if not os.path.exists(manifest_path):
         print("agents_render: no .agents/manifest.yaml — nothing to render")
         return 0
@@ -543,14 +544,14 @@ def main() -> int:
         t = mapping["targets"]
 
         for name in manifest.get("agents") or []:
-            src = os.path.join(root, ".agents", "agents", name, "AGENT.md")
+            src = os.path.join(root, AGENTS, "agents", name, "AGENT.md")
             if not os.path.exists(src):
                 die(f"manifest lists agent '{name}' but {os.path.relpath(src, root)} does not exist")
             write(os.path.join(root, t["agents"].format(name=name)),
                   render_agent(src, mapping, os.path.relpath(src, root), vendor_root), a.check, changes, root)
 
         for name in manifest.get("workflows") or []:
-            src = os.path.join(root, ".agents", "workflows", f"{name}.md")
+            src = os.path.join(root, AGENTS, "workflows", f"{name}.md")
             if not os.path.exists(src):
                 die(f"manifest lists workflow '{name}' but {name}.md does not exist")
             write(os.path.join(root, t["workflows"].format(name=name)),

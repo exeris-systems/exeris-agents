@@ -127,21 +127,21 @@ def pinned_by_line(text: str) -> tuple[str, str] | None:
     inside = False
     item: dict[str, str] = {}
     for line in text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
             continue
         if not line[0].isspace():                             # a top-level key
-            inside = re.match(r"imports\s*:", line) is not None
+            inside = entry.split(":", 1)[0].strip() == "imports"
             item = {}
             continue
         if not inside:
             continue
-        start = re.match(r"\s*-\s*(.*)$", line)               # a new list item
-        if start:
+        if entry.startswith("-"):                             # a new list item
             item = {}
-            line = start.group(1)
-        pair = re.match(r"\s*(bundle|version)\s*:\s*(\S+)", line)
-        if pair:
-            item[pair.group(1)] = pair.group(2).strip("'\"")
+            entry = entry[1:].strip()
+        key, sep, value = entry.partition(":")
+        if sep and key.strip() in ("bundle", "version") and value.split():
+            item[key.strip()] = value.split()[0].strip("'\"")
         if "bundle" in item and "version" in item:
             return item["bundle"], item["version"]
     return None
@@ -195,31 +195,37 @@ def flag_value(argv: list[str], name: str, default: str) -> str:
     return default
 
 
-def emit(vendor: str, event: str, decision: str, reason: str) -> int:
-    """The vendor's decision shape, for the cases this file has to answer alone.
+def payload(vendor: str, event: str, decision: str, reason: str) -> dict:
+    """The decision in the shape this runtime reads.
 
     A wire format written twice can drift, and this is the one place that cost is worth paying:
-    the file that owns the formats is the file that could not be found. Exit 2 is the documented
-    block on Claude, Codex and Copilot and is ignored on the others, so without the JSON an
-    `--on-error deny` would fail OPEN on cursor, gemini and antigravity — the opposite of what the
-    flag promises, and the opposite of what this file's docstring used to claim.
+    the file that owns the formats is the file that could not be found.
     """
+    allow = decision == "allow"
     if vendor == "cursor":
-        payload: dict = {"permission": "allow" if decision == "allow" else "deny"}
+        out: dict = {"permission": "allow" if allow else "deny"}
         if reason:
-            payload["userMessage"] = payload["agentMessage"] = reason
-    elif vendor in ("gemini", "antigravity"):
-        payload = {"decision": decision, "reason": reason} if reason else {"decision": decision}
-    elif event == "stop":
-        payload = {"decision": "block", "reason": reason} if decision != "allow" else {}
-    elif event == "pre-tool":
-        out = {"permissionDecision": "allow" if decision == "allow" else "deny"}
+            out["userMessage"] = out["agentMessage"] = reason
+        return out
+    if vendor in ("gemini", "antigravity"):
+        return {"decision": decision, "reason": reason} if reason else {"decision": decision}
+    if event == "stop":
+        return {} if allow else {"decision": "block", "reason": reason}
+    if event == "pre-tool":
+        out = {"permissionDecision": "allow" if allow else "deny"}
         if reason:
             out["permissionDecisionReason"] = reason
-        payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", **out}}
-    else:
-        payload = {}                          # post-tool and session-start permit nothing
-    print(json.dumps(payload))
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", **out}}
+    return {}                                 # post-tool and session-start permit nothing
+
+
+def emit(vendor: str, event: str, decision: str, reason: str) -> int:
+    """Write the decision and answer with the exit code that carries it where JSON does not.
+
+    Exit 2 is the documented block on Claude, Codex and Copilot and is ignored on the others, so
+    without the JSON above an `--on-error deny` would fail OPEN on cursor, gemini and antigravity.
+    """
+    print(json.dumps(payload(vendor, event, decision, reason)))
     if decision != "allow" and reason:
         print(reason, file=sys.stderr)
     return 2 if decision != "allow" and vendor in BLOCK_BY_EXIT else 0
@@ -269,12 +275,12 @@ def main(argv: list[str]) -> int:
     # inside the tree the pin's digest covers.
     sys.path.insert(0, os.path.dirname(hook))
     sys.argv = [hook] + args
+    # hook.py's `sys.exit(...)` raises SystemExit, which is not an Exception and so passes both
+    # this handler and the one at the bottom of the file untouched, straight to the interpreter.
+    # Catching it to read `.code` and return the same number was a longer way of writing what the
+    # interpreter already does, and it discarded the message a non-integer exit carries.
     try:
         runpy.run_path(hook, run_name="__main__")
-    except SystemExit as stop:                # hook.py's own exit code is the decision channel
-        if stop.code is None:
-            return 0
-        return stop.code if isinstance(stop.code, int) else 1
     except Exception as exc:                  # a hook that cannot start is not a hook that allows
         return refuse(argv, f"cannot run {hook}: {type(exc).__name__}: {exc}")
     return 0
