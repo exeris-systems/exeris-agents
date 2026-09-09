@@ -21,6 +21,11 @@ jobs:
           python tools/agents_render.py --help > /dev/null
           python tools/agents_file_check.py --help > /dev/null
           python tools/agents_bundle.py --help > /dev/null
+      # The enforcement layer has a regression suite because three review rounds each found it
+      # reporting enforcement it did not perform, and each was answered with a hand-run check
+      # nobody kept — so the next change re-broke what the last one fixed.
+      - name: L0 dispatcher regression suite
+        run: python tests/test_hook.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'

@@ -22,9 +22,15 @@ decision looks like on stdout. Everything between them is shared.
 Exit codes: 0 always, except where a vendor documents exit 2 as "blocked" and gives us no other
 channel. The decision travels in the JSON; an exit code is a fallback, not the contract.
 
-State lives under `.agents-state/` (git-ignored) and is per-checkout, not per-session: a session
-that ends without discharging its consequence leaves the marker for the next one, which is the
-conservative direction to fail in.
+State lives under `.agents-state/<session>/` (git-ignored), keyed by the identifier the runtime
+puts on the event. A shared directory would make a stop gate fire once per checkout and never
+again — the first check ever run would discharge it for every session afterwards.
+
+Failing closed is decided by `--on-error`, which the renderer sets from the hook's own `decision`
+in hooks.yaml. It is NOT decided by the hook's name: a guarantee that holds only for hooks
+someone happened to call `deny*` is not a guarantee, and the stop gate — the layer's actual
+enforcement — is not called that. The default is `deny`, so a config this dispatcher cannot read
+and a rendered command that predates this flag both fail in the safe direction.
 """
 from __future__ import annotations
 
@@ -43,11 +49,22 @@ STOP_BLOCKS = {"claude", "codex"}
 
 
 def repo_root(start: str | None = None) -> str:
-    d = os.path.abspath(start or HERE)
-    while d != "/":
-        if os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git")):
-            return d
-        d = os.path.dirname(d)
+    """The repository under management — found from the WORKING DIRECTORY first.
+
+    Walking up from this file finds whichever checkout the script itself lives in. Vendored that
+    is the same repository; run from a bundle checkout, a plugin directory or a test it is not,
+    and the dispatcher then reads another repository's rules. Every runtime in scope invokes a
+    hook with the project as the working directory, so that is the authority; the script's own
+    location is the fallback for the case where it is not.
+    """
+    for candidate in (start, os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd(), HERE):
+        if not candidate:
+            continue
+        d = os.path.abspath(candidate)
+        while d != os.path.dirname(d):
+            if os.path.exists(os.path.join(d, ".agents")) or os.path.exists(os.path.join(d, ".git")):
+                return d
+            d = os.path.dirname(d)
     return os.getcwd()
 
 
@@ -165,26 +182,40 @@ def session_key(event: dict) -> str:
     serviceable proxy for "this agent run", and a missing key is treated as a fresh session rather
     than as a shared one.
     """
+    def safe(v: str) -> str:
+        # No dots: `..` survives a naive sanitiser and `.agents-state/../` is the repository root,
+        # outside the gitignore entry and on top of whatever is named there.
+        cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", str(v))[:64].strip("_")
+        return cleaned or "unnamed"
+
     for k in ("session_id", "sessionId", "conversation_id", "conversationId"):
-        v = event.get(k)
-        if v:
-            return re.sub(r"[^A-Za-z0-9_.-]", "_", str(v))[:64]
+        if event.get(k):
+            return safe(event[k])
     env = os.environ.get("EXERIS_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
     if env:
-        return re.sub(r"[^A-Za-z0-9_.-]", "_", env)[:64]
-    return f"ppid-{os.getppid()}"
+        return safe(env)
+    # NOT the process id. Each hook is spawned by its own shell, so a pid-derived key gives the
+    # recorder and the gate different directories and the gate then never fires — a worse
+    # fail-open than the one it replaced. One shared key instead, which the stop gate clears when
+    # it passes, so the bleed between sessions is bounded rather than permanent.
+    return "no-session"
 
 
-def state_path(cfg: dict, name: str, session: str) -> str:
-    d = os.path.join(repo_root(), cfg.get("state-dir") or ".agents-state", session)
-    os.makedirs(d, exist_ok=True)
+def state_dir(cfg: dict, session: str) -> str:
+    return os.path.join(repo_root(), cfg.get("state-dir") or ".agents-state", session)
+
+
+def state_path(cfg: dict, name: str, session: str, create: bool = False) -> str:
+    d = state_dir(cfg, session)
+    if create:
+        os.makedirs(d, exist_ok=True)
     return os.path.join(d, name)
 
 
 def append_state(cfg: dict, name: str, value: str, session: str) -> None:
     if not value:
         return
-    p = state_path(cfg, name, session)
+    p = state_path(cfg, name, session, create=True)
     existing = set()
     if os.path.exists(p):
         existing = {l.strip() for l in open(p, encoding="utf-8") if l.strip()}
@@ -200,16 +231,27 @@ def read_state(cfg: dict, name: str, session: str) -> list[str]:
     return [l.strip() for l in open(p, encoding="utf-8") if l.strip()]
 
 
-def tool_failed(event: dict) -> bool:
-    """True when the runtime reported the tool call as failed. Absent information is not failure."""
-    resp = _first(event, "tool_response", "toolResponse", "response") or {}
+def tool_result(event: dict) -> bool | None:
+    """True = the runtime said it failed, False = it said it succeeded, None = it said nothing.
+
+    The distinction is the point. Most runtimes in scope report no status on a post-tool event, so
+    a recorder can establish that a check was INVOKED and — on those runtimes — not that it
+    passed. Collapsing "no information" into "succeeded" is what let a failing guardrail script
+    discharge the stop gate, and collapsing it into "failed" would make the recorder useless.
+    The gate says which of the two it observed rather than implying the stronger one.
+    """
+    resp = _first(event, "tool_response", "toolResponse", "response")
+    if isinstance(resp, str):
+        return None
     if not isinstance(resp, dict):
-        return False
-    for key in ("is_error", "isError", "error"):
-        if resp.get(key):
-            return True
-    code = resp.get("exit_code", resp.get("exitCode"))
-    return isinstance(code, int) and code != 0
+        return None
+    for key in ("is_error", "isError", "error", "interrupted"):
+        if key in resp:
+            return bool(resp[key])
+    code = resp.get("exit_code", resp.get("exitCode"), )
+    if isinstance(code, int):
+        return code != 0
+    return None
 
 
 def matches_any(patterns, text: str) -> bool:
@@ -230,32 +272,37 @@ def path_matches(globs, path: str) -> bool:
     return False
 
 
-# A hook id that denies must fail CLOSED when the rules are unreadable; a recorder may yield.
-DENYING_HOOKS = ("deny",)
+def refuse(vendor: str, on_error: str, why: str, kind: str = "pre-tool") -> int:
+    """What to do when the dispatcher cannot establish what the rule says.
+
+    `on_error` is rendered from the hook's `decision`, so a hook that enforces refuses and a
+    recorder yields — decided by the rule rather than by the hook's name.
+    """
+    if on_error == "allow":
+        print(f"exeris-hook: {why}; this hook only records, so it yields", file=sys.stderr)
+        return emit(vendor, kind, "allow", "")
+    decision = "block" if kind == "stop" else "deny"
+    return emit(vendor, kind, decision,
+                f"L0 cannot establish its rules and this hook enforces one, so it refuses "
+                f"rather than waving the action through: {why}")
 
 
-def run(hook_id: str, vendor: str) -> int:
+def run(hook_id: str, vendor: str, on_error: str, wired_event: str) -> int:
     event = read_event()
     session = session_key(event)
     try:
         cfg = load_config()
     except ConfigUnavailable as exc:
-        if hook_id.startswith(DENYING_HOOKS):
-            return emit(vendor, "pre-tool", "deny",
-                        f"L0 unavailable and this is a deny hook, so it refuses rather than "
-                        f"waving the action through: {exc}")
-        print(f"exeris-hook: {exc}; recorder inactive", file=sys.stderr)
-        return emit(vendor, "post-tool", "allow", "")
+        return refuse(vendor, on_error, str(exc), wired_event)
 
     spec = find_hook(cfg, hook_id)
     if not spec:
-        if hook_id.startswith(DENYING_HOOKS):
-            return emit(vendor, "pre-tool", "deny",
-                        f"L0: no hook '{hook_id}' in hooks.yaml, and a deny hook that cannot find "
-                        f"its own rule refuses rather than allowing")
-        return emit(vendor, "pre-tool", "allow", "")
+        return refuse(vendor, on_error, f"no hook '{hook_id}' in hooks.yaml", wired_event)
 
-    kind = spec.get("event", "pre-tool")
+    kind = spec.get("event", wired_event)
+    # The config IS readable here, so the rule itself decides — the flag was only ever the
+    # fallback for the case where it could not be read.
+    on_error = "deny" if spec.get("decision") in ("deny", "block-or-allow") else "allow"
     command, path = extract(event)
 
     if spec.get("decision") == "deny":
@@ -264,23 +311,23 @@ def run(hook_id: str, vendor: str) -> int:
         return emit(vendor, kind, "allow", "")
 
     if spec.get("record"):
-        # A check that ran and FAILED has not discharged anything. Where the runtime reports the
-        # result (Claude and Codex put it on the PostToolUse event) a failure is not recorded;
-        # where it does not, the recorder says so by recording anyway rather than pretending.
-        if spec.get("tool") == "shell" and tool_failed(event):
+        failed = tool_result(event)
+        if failed is True:
+            # A check that ran and FAILED has discharged nothing, on either branch — an edit the
+            # runtime rejected did not happen either.
             return emit(vendor, kind, "allow", "")
-        subject = command if spec.get("tool") == "shell" else path
+        # `?` marks an entry whose result the runtime did not report, so the gate can say what it
+        # actually observed instead of implying success.
+        suffix = "" if failed is False else "?"
         if spec.get("tool") == "shell":
-            if matches_any(spec.get("match"), subject):
-                # Record the script name, not the whole command line: the gate asks whether a
-                # check ran, and the flags it ran with are the reviewer's question, not the hook's.
-                for pat in spec.get("match") or []:
-                    m = re.search(pat, subject)
-                    if m:
-                        append_state(cfg, spec["record"],
-                                     m.group(0).replace("\\", ""), session)
-        elif subject and path_matches(spec.get("paths"), subject):
-            rel = os.path.relpath(subject, repo_root()) if os.path.isabs(subject) else subject
+            for pat in spec.get("match") or []:
+                m = re.search(pat, command)
+                if m:
+                    append_state(cfg, spec["record"],
+                                 m.group(0).replace("\\", "").strip() + suffix, session)
+                    break
+        elif path and path_matches(spec.get("paths"), path):
+            rel = os.path.relpath(path, repo_root()) if os.path.isabs(path) else path
             append_state(cfg, spec["record"], rel.replace(os.sep, "/"), session)
         return emit(vendor, kind, "allow", "")
 
@@ -297,15 +344,25 @@ def run(hook_id: str, vendor: str) -> int:
             # running either — the gate softens silently the moment a second requirement is added,
             # which is the failure this whole layer exists to prevent.
             missing = [req for req in required
-                       if not any(req.rstrip("$").replace("\\", "") in r for r in ran)]
+                       if not any(req.rstrip("$").replace("\\", "") in r.rstrip("?") for r in ran)]
             if not missing:
                 continue
             reason = " ".join((rule.get("reason") or "").split())
             blocked.append(f"{reason} (edited: {', '.join(sorted(hits)[:4])}; "
                            f"not run: {', '.join(missing)})")
         if not blocked:
+            # Clear on a clean stop. Without this the `no-session` key — used where a runtime
+            # names no session — would accumulate across sessions and discharge the next one's
+            # gate before it started.
+            import shutil
+            shutil.rmtree(state_dir(cfg, session), ignore_errors=True)
             return emit(vendor, kind, "allow", "")
+        unverified = [r for r in ran if r.endswith("?")]
         text = "L0 gate: " + " | ".join(blocked)
+        if unverified:
+            text += (f" [invocation observed but this runtime reported no result for: "
+                     f"{', '.join(sorted(x.rstrip('?') for x in unverified))} — the gate verifies "
+                     f"that a check ran, never that it passed]")
         if vendor in STOP_BLOCKS:
             return emit(vendor, kind, "block", text)
         # Degraded: the runtime documents no way to block a stop, so the gate reports and yields.
@@ -320,21 +377,25 @@ def main() -> int:
     ap.add_argument("--hook", required=True, help="hook id from .agents/hooks/hooks.yaml")
     ap.add_argument("--vendor", default=os.environ.get("EXERIS_HOOK_VENDOR", "claude"),
                     choices=["claude", "copilot", "codex", "gemini", "antigravity", "cursor"])
+    ap.add_argument("--event", dest="event", default="pre-tool",
+                    choices=["pre-tool", "post-tool", "stop", "session-start"],
+                    help="the event this hook is wired to. Rendered alongside --on-error, because "
+                         "the event normally comes from the config — and when the config is what "
+                         "cannot be read, a stop gate must still answer with a stop-shaped refusal "
+                         "rather than a pre-tool one.")
+    ap.add_argument("--on-error", dest="on_error", default="deny", choices=["deny", "allow"],
+                    help="what to do when the rules cannot be read. Rendered from the hook's own "
+                         "`decision`; the default is deny, so a command predating this flag fails "
+                         "in the safe direction.")
     a = ap.parse_args()
     try:
-        return run(a.hook, a.vendor)
-    except ConfigUnavailable:
-        raise
+        return run(a.hook, a.vendor, a.on_error, a.event)
     except Exception as exc:
-        # A recorder that crashes should not brick a session; a DENY hook that crashes must not
-        # become an allow, which is what returning {} silently did.
+        # Re-raising ConfigUnavailable here turned the one failure this layer made fatal into an
+        # uncaught traceback and exit 1 — which every runtime reads as a non-blocking hook error,
+        # i.e. allow. Every escape goes through `refuse`, which honours --on-error.
         print(f"exeris-hook: {type(exc).__name__}: {exc}", file=sys.stderr)
-        if a.hook.startswith(DENYING_HOOKS):
-            return emit(a.vendor, "pre-tool", "deny",
-                        f"L0 deny hook failed ({type(exc).__name__}), refusing rather than "
-                        f"allowing: {exc}")
-        print(json.dumps({}))
-        return 0
+        return refuse(a.vendor, a.on_error, f"{type(exc).__name__}: {exc}", a.event)
 
 
 if __name__ == "__main__":
