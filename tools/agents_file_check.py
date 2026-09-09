@@ -22,6 +22,7 @@ whether a reference is linked rather than copied.
 from __future__ import annotations
 import argparse, io, json, os, re, sys
 sys.path.insert(0, os.path.dirname(__file__))
+import _compose
 from _common import Report, read_frontmatter
 
 ROOT_LIMIT = 8 * 1024          # rule 1: AGENTS.md is an index and a safety boundary
@@ -169,7 +170,7 @@ def check_pinned_bundle(rep: Report, manifest: dict, root: str):
     The digest lives in agents_bundle.py so there is one definition of it; this is the CI entry
     point that makes `[L1: pinned-import and checksum check]` name a check that exists.
     """
-    if not pinned_bundle(manifest):
+    if not _compose.pinned_import(manifest):
         return
     import subprocess
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents_bundle.py")
@@ -189,13 +190,6 @@ def check_pinned_bundle(rep: Report, manifest: dict, root: str):
     rep.error(os.path.join(".agents", "manifest.yaml"),
               "the pinned bundle import does not verify — see the agents_bundle annotation above "
               "for which half is wrong (rule 8)", rule="pinned-import")
-
-
-def pinned_bundle(manifest: dict) -> dict | None:
-    for imp in manifest.get("imports") or []:
-        if isinstance(imp, dict) and imp.get("bundle"):
-            return imp
-    return None
 
 
 def check_machine_paths(path: str, rep: Report):
@@ -229,59 +223,60 @@ def _body_of(path: str) -> str:
     return text[end + 4:] if end >= 0 else text
 
 
-def vendored_root() -> str | None:
-    """`.agents/vendor/<bundle>-<version>` for the pinned import, or None when none is pinned."""
-    import yaml
-    path = os.path.join(".agents", "manifest.yaml")
-    if not os.path.exists(path):
-        return None
-    try:
-        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
-    except Exception:
-        return None
-    for imp in data.get("imports") or []:
-        if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
-            return os.path.join(VENDOR, f"{imp['bundle']}-{imp['version']}")
-    return None
-
-
 def check_composition(rel: str, fm: dict, rep: Report, fail, ctx: dict) -> None:
     """rule 5 — a profile composes by reference, so every reference must resolve.
 
-    Nothing checked these. A profile could name a policy that does not exist, a skill that does
-    not exist, a handoff to a role that does not exist, or a `bundle:` policy in a repository that
-    pins no bundle, and the check reported clean — so an empty composition and a typo were
-    indistinguishable from a correct one. Composition by reference is only worth more than copying
-    if the references are known to point at something.
+    Nothing checked these, so an empty composition and a typo were the same result. Rule 5 names
+    four kinds: skills, policies, references and a default workflow. Three have a field in the
+    `AGENT.md` table; the fourth does not, so `workflow:` is validated when a profile carries one
+    and its absence from the table is a `[DOC DEBT]` note rather than a silent omission here.
     """
-    vendor_root = ctx.get("vendor_root")
+    root = ctx.get("vendor_root")
 
-    def resolve(kind: str, name: str) -> tuple[str, str | None]:
-        """Return (path, error). `bundle:x` goes to the vendored tree, a bare name to the repo."""
-        if not str(name).startswith("bundle:"):
-            return os.path.join(".agents", kind, f"{name}.md"), None
-        bare = str(name).split(":", 1)[1]
-        if not vendor_root:
-            return "", (f"references '{name}' but the manifest pins no bundle, so there is no "
-                        f"vendored tree for it to come from (rule 8)")
-        return os.path.join(vendor_root, kind, f"{bare}.md"), None
+    def items(key):
+        values, scalar = _compose.as_list(fm.get(key))
+        if scalar:
+            fail(rel, f"'{key}' is a single value where a list belongs — YAML iterates a scalar "
+                      f"character by character, so this is one mistake and not {len(str(values[0]))}",
+                 rule="composition")
+            return []
+        return values
+
+    # A bundle pinned but not vendored is ONE cause. Reporting it per reference points the author
+    # at N individually-missing files instead of the one thing to fix.
+    skip_bundle = False
+    if root and not os.path.isdir(root):
+        uses_bundle = any(str(v).startswith(_compose.BUNDLE_PREFIX)
+                          for k in ("policies", "references") for v in items(k))
+        if uses_bundle:
+            fail(rel, f"references bundle content but {root} is not vendored — run "
+                      f"`agents_bundle.py vendor` (rule 8)", rule="composition")
+            # Reported once. Continuing to resolve each `bundle:` reference would point the author
+            # at N individually-missing files instead of the single thing to fix.
+            skip_bundle = True
 
     for kind, singular in (("policies", "policy"), ("references", "reference")):
-        for name in fm.get(kind) or []:
-            path, err = resolve(kind, name)
+        for name in items(kind):
+            if skip_bundle and str(name).startswith(_compose.BUNDLE_PREFIX):
+                continue
+            path, err = _compose.resolve(kind, name, root)
             if err:
-                fail(rel, err, rule="composition")
-            elif not os.path.exists(path):
+                fail(rel, f"{singular} '{name}' {err}", rule="composition")
+            elif path and not os.path.exists(path):
                 fail(rel, f"{singular} '{name}' does not exist at {path} (rule 5)",
                      rule="composition")
 
-    for name in fm.get("skills") or []:
-        if name not in ctx.get("skill_names", set()):
+    for name in items("skills"):
+        if str(name).startswith(_compose.BUNDLE_PREFIX):
+            fail(rel, f"skill '{name}' uses the `bundle:` prefix, which only policies and "
+                      f"references support — a skill is loaded by name from .agents/skills/",
+                 rule="composition")
+        elif name not in ctx.get("skill_names", set()):
             fail(rel, f"skill '{name}' is not a skill in this repository (rule 5)",
                  rule="composition")
 
     known = ctx.get("profile_names", set()) | {"human"}
-    for h in fm.get("handoffs") or []:
+    for h in items("handoffs"):
         if not isinstance(h, dict):
             fail(rel, f"handoff entry is not a mapping: {h!r}", rule="composition")
             continue
@@ -292,11 +287,21 @@ def check_composition(rel: str, fm: dict, rep: Report, fail, ctx: dict) -> None:
             fail(rel, f"handoff names '{target}', which is not a role in this repository (rule 5)",
                  rule="composition")
 
+    wf = fm.get("workflow")
+    if wf and not os.path.exists(os.path.join(".agents", "workflows", f"{wf}.md")):
+        fail(rel, f"default workflow '{wf}' does not exist at .agents/workflows/{wf}.md (rule 5)",
+             rule="composition")
+
     evals = fm.get("evals")
-    if evals and not os.path.isdir(os.path.join(os.path.dirname(rel), str(evals).rstrip("/"))) \
-            and not os.path.isdir(os.path.join(".agents", str(evals).rstrip("/"))):
-        rep.warning(rel, f"evals directory '{evals}' does not exist beside the profile or under "
-                         f".agents/", rule="composition")
+    if evals:
+        # Accept the `.agents/`-prefixed spelling, as the `output` check below does. Rejecting one
+        # of two spellings the rest of the tool accepts is a warning about a directory that exists.
+        raw = str(evals).rstrip("/")
+        candidates = [os.path.join(os.path.dirname(rel), raw), raw,
+                      raw if raw.startswith(".agents") else os.path.join(".agents", raw)]
+        if not any(os.path.isdir(c) for c in candidates):
+            rep.warning(rel, f"evals directory '{evals}' does not exist beside the profile or "
+                             f"under .agents/", rule="composition")
 
 
 def check_profile(d: str, rep: Report, strict: bool = True, ctx: dict | None = None):
@@ -534,7 +539,7 @@ def check_hooks(rep: Report, manifest: dict):
     # The dispatcher normally arrives with the pinned bundle; a repository that imports none keeps
     # its own copy. Either is fine, neither is optional.
     candidates = [os.path.join(".agents", "hooks", "bin", "hook.py")]
-    imp = pinned_bundle(manifest)
+    imp = _compose.pinned_import(manifest)
     if imp:
         candidates.insert(0, os.path.join(VENDOR, f"{imp['bundle']}-{imp.get('version')}",
                                           "hooks", "bin", "hook.py"))
@@ -764,27 +769,33 @@ def main():
                                   "a skill lives at .agents/skills/<name>/SKILL.md", rule="skill-path")
         manifest_path = os.path.join(".agents", "manifest.yaml")
         declared_v2 = False
+        manifest_data: dict = {}
         if os.path.exists(manifest_path):
             import yaml
             try:
-                declared_v2 = str((yaml.safe_load(open(manifest_path, encoding="utf-8")) or {})
-                                  .get("version")) == "2"
+                manifest_data = yaml.safe_load(open(manifest_path, encoding="utf-8")) or {}
+                declared_v2 = str(manifest_data.get("version")) == "2"
             except Exception:
+                # check_manifest reports the parse failure properly further down; this early read
+                # exists only to know which severity the v2 rules carry.
                 pass
 
         profiles = os.path.join(".agents", "agents")
         # Two passes: a handoff may name a role defined later in the listing, and a composition
         # check that depended on ordering would be a check with a false negative built in.
-        profile_names = {n for n in (os.listdir(profiles) if os.path.isdir(profiles) else [])
-                         if os.path.isdir(os.path.join(profiles, n))}
-        skill_names = {n for n in (os.listdir(skills) if os.path.isdir(skills) else [])
-                       if os.path.isdir(os.path.join(skills, n))}
-        ctx = {"vendor_root": vendored_root(), "profile_names": profile_names,
+        # A directory is a role only if it holds an AGENT.md, and a skill only with a SKILL.md —
+        # the same definition check_manifest_agreement uses four hundred lines below. A bare
+        # listing let an empty directory satisfy "is a role".
+        def _named(base, marker):
+            return {n for n in (os.listdir(base) if os.path.isdir(base) else [])
+                    if os.path.exists(os.path.join(base, n, marker))}
+        profile_names = _named(profiles, "AGENT.md")
+        skill_names = _named(skills, "SKILL.md")
+        ctx = {"vendor_root": _compose.vendor_root(manifest_data), "profile_names": profile_names,
                "skill_names": skill_names}
-        if os.path.isdir(profiles):
-            for name in sorted(profile_names):
-                rep.checked += 1
-                check_profile(os.path.join(profiles, name), rep, declared_v2, ctx)
+        for name in sorted(profile_names):
+            rep.checked += 1
+            check_profile(os.path.join(profiles, name), rep, declared_v2, ctx)
         check_no_lowercase_agent_md(rep, declared_v2)
         check_workflows(rep, profile_names, skill_names)
         check_schemas(rep)

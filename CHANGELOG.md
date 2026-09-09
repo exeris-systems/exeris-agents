@@ -2,16 +2,32 @@
 
 All notable changes to the Exeris agent bundle. Keep a Changelog 1.1, SemVer, ADR-085 §H.27.
 
-The version is the **schema contract**, not the file count: a change that makes a conforming
-repository stop conforming is MAJOR, a new policy or schema field a repository can ignore is MINOR,
-and wording is PATCH.
+Versioning, stated precisely because the earlier wording licensed the wrong reading:
+
+- **MAJOR** — a conforming repository stops conforming, **or** a repository that passed on the
+  previous version can fail on this one. Tool behaviour counts: for a bundle of gates, the build's
+  outcome *is* the public surface, and a consumer pinning a range must not have CI turn red.
+- **MINOR** — a policy, schema field or check a repository can ignore, and additions that cannot
+  change an existing verdict.
+- **PATCH** — wording, and fixes that only make a previously-failing case pass.
+
+The presence of a `### Breaking` section does **not** by itself mean MAJOR: ADR-085 §H.27 makes
+that section mandatory in *every* release, so "Breaking: nothing" is an answer. What decides the
+number is the section's content against the three rules above.
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-09-09
+## [2.0.0] - 2026-09-09
 
 ### Breaking
 
+- **Released as MAJOR, and the reason is worth stating**: two changes below can turn a
+  previously-green build red — a repository whose profile carries an unresolvable reference, and
+  one that deliberately symlinks `schemas` or `fixtures` out of the checkout. Neither was ever
+  *conforming*, but the rule at the top of this file was ambiguous enough to be read as
+  "Breaking section ⇒ MAJOR", and 1.1.0 and 1.1.1 both carried build-visible breaks released as
+  MINOR. The rule is now explicit and this release follows it. Earlier numbers are left as
+  published: renumbering them would break the pin that already names them.
 - **A symlinked `schemas` or `fixtures` directory pointing outside the checkout is now refused.**
   `within_repo` resolves through symlinks, which is the correct posture for a path guard and was
   filed under *Changed* in 1.1.1 when it should have been here: a consumer that deliberately

@@ -30,8 +30,10 @@ is the defect.
 checkouts through a version pin. So —
 
 - **A change to `bundle/` is a version change.** SemVer over the schema contract: a change that
-  makes a conforming repository stop conforming is MAJOR, an ignorable addition MINOR, wording
-  PATCH. `CHANGELOG.md` moves in the same pull request (ADR-085 §H.27).
+  makes a conforming repository stop conforming is MAJOR — and so is one that turns a
+  previously-green consumer build red, because for a bundle of gates that is the public surface.
+  An ignorable addition is MINOR, wording PATCH. A `### Breaking` section is mandatory per release
+  (ADR-085 §H.27); its content decides the number, not its presence. `CHANGELOG.md` moves in the same pull request (ADR-085 §H.27).
 - **A change to `bundle/policies/` may only restrict.** A consuming repository may restrict
   further and may never relax, so a relaxation here silently relaxes every repository at once.
 - **A change to `bundle/schemas/` that adds a required property is MAJOR**, because a repository's

@@ -35,6 +35,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _compose  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Mappings sit beside the renderer. `--adapters` exists so a repository can try a vendor
 # mapping out of tree before it is proposed to the bundle.
@@ -98,18 +101,15 @@ def tools_for(fm: dict, mapping: dict, path: str) -> list[str]:
 
 
 def resolve(kind: str, name: str, vendor_root: str | None) -> str:
-    """`bundle:<name>` resolves into the vendored bundle; a bare name is the repository's own.
+    """One implementation, shared with the checker (`tools/_compose.py`).
 
-    The prefix is explicit rather than inferred from where the file happens to be, so a reader of
-    the profile can tell at a glance which rules are the organisation's and which the repository
-    added — and so that moving a policy into the bundle is a visible edit, not a silent one.
+    Written twice these must agree, and a drift is silent in the direction that matters: the
+    renderer writing a link the checker already called valid, or the reverse.
     """
-    if not name.startswith("bundle:"):
-        return f".agents/{kind}/{name}.md"
-    bare = name.split(":", 1)[1]
-    if not vendor_root:
-        die(f"profile references '{name}' but the manifest pins no bundle import (rule 8)")
-    return f"{vendor_root}/{kind}/{bare}.md"
+    path, err = _compose.resolve(kind, name, vendor_root)
+    if err:
+        die(f"profile references '{name}': {err}")
+    return path.replace(os.sep, "/")
 
 
 def generated_section(fm: dict, vendor_root: str | None = None) -> str:
@@ -190,6 +190,11 @@ def render_agent(src: str, mapping: dict, rel: str, vendor_root: str | None = No
 
 def render_workflow(src: str, mapping: dict, rel: str) -> str:
     fm, body = split_frontmatter(src)
+    # Same as render_agent: a missing required field is named, not a bare KeyError traceback. The
+    # fix landed in one of the two renderers and the CHANGELOG announced it for both.
+    for required in ("name", "description"):
+        if not str(fm.get(required) or "").strip():
+            die(f"{rel}: workflow frontmatter has no '{required}' — every runtime reads it")
     # The user invokes it with /name; the model must not pick it up on its own, which is what the
     # legacy commands/ form guaranteed by being a different file kind.
     head = yaml_frontmatter([("name", fm["name"]),
