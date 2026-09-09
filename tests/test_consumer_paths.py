@@ -30,16 +30,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECK = os.path.join(ROOT, "tools", "agents_file_check.py")
 RUNNER = os.path.join(ROOT, "bundle", "evals", "run.py")
 
-FAILURES: list[str] = []
-PASSES = 0
-
-
-def check(name: str, got, want) -> None:
-    global PASSES
-    if got == want:
-        PASSES += 1
-    else:
-        FAILURES.append(f"{name}\n      expected {want!r}\n      got      {got!r}")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import FAILURES, check, main  # noqa: E402  (after the sys.path line it needs)
 
 
 def write(path: str, text: str) -> None:
@@ -190,6 +182,21 @@ def test_defaults_resolve_against_the_scenarios_file():
         shutil.rmtree(r)
 
 
+def test_a_path_leaving_the_checkout_is_refused():
+    """The guard the three `open()` sinks share: a scenarios file, a `schema_dir` or a fixture that
+    resolves outside the repository is a typo or an escape, and either way not something the runner
+    should read."""
+    r = vendored_consumer()
+    try:
+        write(os.path.join(r, ".agents", "evals", "escape.yaml"),
+              SCENARIOS.replace("schema_dir: ../schemas", "schema_dir: ../../../../../etc"))
+        p = run_dry(r, "--scenarios", os.path.join(".agents", "evals", "escape.yaml"))
+        check("a schema_dir outside the checkout is refused",
+              (p.returncode != 0, "outside the repository" in (p.stderr + p.stdout)), (True, True))
+    finally:
+        shutil.rmtree(r)
+
+
 def test_a_missing_fixture_is_still_an_error():
     """The fix must not turn every path into 'found something'."""
     r = vendored_consumer()
@@ -201,18 +208,5 @@ def test_a_missing_fixture_is_still_an_error():
         shutil.rmtree(r)
 
 
-def main() -> int:
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        try:
-            t()
-        except Exception as exc:  # a broken test is a failure, not a skip
-            FAILURES.append(f"{t.__name__} raised {type(exc).__name__}: {exc}")
-    print(f"{PASSES} assertions passed, {len(FAILURES)} failed")
-    for f in FAILURES:
-        print(f"  FAIL  {f}")
-    return 1 if FAILURES else 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    main(globals())

@@ -29,6 +29,15 @@ on 1.1.0.
   and **not one scenario resolved in any consumer**. Both are now relative to the scenarios file,
   and `--scenarios` defaults to the repository's `.agents/evals/scenarios.yaml` when there is one.
 
+### Changed
+
+- **The eval runner refuses a path that leaves the checkout.** `--scenarios` is a CLI argument and
+  `defaults.schema_dir` / `fixture_dir` are values in a YAML file; all three reach `open()`. The
+  runner has no business reading outside the repository it is evaluating, and a `schema_dir` that
+  silently resolves somewhere else is the same failure the fix above addresses one level up — a
+  path that resolves to *something* rather than to the right thing. A scenarios file that relied on
+  escaping the tree now exits with the resolved path named.
+
 Consumers on 1.1.0: re-vendor. The tooling half of the first fix reaches you without one, because
 `tools/` is checked out rather than vendored; the eval half does not.
 
