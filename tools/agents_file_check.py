@@ -20,7 +20,7 @@ covers its six concerns in order, whether a rule is encoded as the right kind of
 whether a reference is linked rather than copied.
 """
 from __future__ import annotations
-import argparse, io, os, re, sys
+import argparse, io, json, os, re, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import Report, read_frontmatter
 
@@ -661,33 +661,55 @@ def check_adapters(rep: Report, strict: bool, provider_owned: set[str] | None = 
                          f"semantic content belongs in .agents/ (first: {authored[0]})", rule="adapter")
 
 
-def provider_owned_paths() -> set[str]:
+def provider_owned_paths(manifest: dict, rep: Report | None = None) -> set[str]:
     """rule 7's `provider-owned` list, in both spellings the rule gives it.
 
     A plain string is a file or directory the renderer does not own at all. A mapping —
     `{path: …, generated-region: …}` — is a file the renderer writes PART of, which rule 7 requires
     to be declared here because a JSON settings file has no comment to carry a marker.
 
-    That second spelling used to be read by `set(...)` directly, which raises TypeError on an
-    unhashable dict inside a bare `except: pass` — so one mapping entry silently discarded the
-    WHOLE list, including every plain string in it, and the check then reported provider-owned
-    operational files as un-marked semantics. Silent, and in the direction that produces findings
-    nobody can act on.
+    Takes the parsed manifest rather than re-reading it. It used to open and parse `manifest.yaml`
+    a third time inside its own `except: pass`, so an unparseable manifest produced an empty list
+    here and exactly the false findings this entry was added to remove — silently, and while
+    `check_manifest` had already reported the parse failure properly one caller up.
+
+    `generated-region` is read rather than decorative: the named key must be present in the file,
+    or the declaration exempts a region that is not there.
     """
-    manifest = os.path.join(".agents", "manifest.yaml")
-    if not os.path.exists(manifest):
-        return set()
-    import yaml
-    try:
-        entries = (yaml.safe_load(open(manifest, encoding="utf-8")) or {}).get("provider-owned") or []
-    except Exception:
-        return set()
+    entries = manifest.get("provider-owned") or []
     out: set[str] = set()
-    for entry in entries if isinstance(entries, list) else []:
+    mpath = os.path.join(".agents", "manifest.yaml")
+    if not isinstance(entries, list):
+        if rep:
+            rep.error(mpath, "provider-owned must be a list", rule="adapter")
+        return out
+    for entry in entries:
         if isinstance(entry, str):
-            out.add(entry)
-        elif isinstance(entry, dict) and entry.get("path"):
-            out.add(str(entry["path"]))
+            out.add(entry.rstrip("/"))
+            continue
+        if not isinstance(entry, dict) or not entry.get("path"):
+            if rep:
+                rep.error(mpath, f"provider-owned entry is neither a path nor a mapping with one: "
+                                 f"{entry!r}", rule="adapter")
+            continue
+        path = str(entry["path"])
+        out.add(path.rstrip("/"))
+        region = entry.get("generated-region")
+        if not (rep and region):
+            continue
+        if not os.path.exists(path):
+            rep.warning(mpath, f"provider-owned '{path}' declares a generated region but the file "
+                               f"does not exist", rule="adapter")
+            continue
+        try:
+            body = json.load(open(path, encoding="utf-8")) if path.endswith(".json") \
+                else open(path, encoding="utf-8").read()
+        except Exception:
+            continue
+        if region not in body:
+            rep.error(mpath, f"provider-owned '{path}' declares generated region '{region}', which "
+                             f"the file does not contain — the declaration exempts a region that is "
+                             f"not there (rule 7)", rule="adapter")
     return out
 
 
@@ -704,6 +726,7 @@ def main():
     prefix = os.path.relpath(os.path.abspath(a.root), os.getcwd())
     os.chdir(a.root)
     rep = Report("agents_file_check", path_prefix="" if prefix == "." else prefix)
+    manifest: dict = {}   # a repository with no .agents/ still runs every other check
 
     if not os.path.exists("AGENTS.md"):
         rep.error("AGENTS.md", "AGENTS.md is required at the repository root and is the canonical "
@@ -812,7 +835,7 @@ def main():
     for fp in sorted(set(authored)):
         check_machine_paths(fp, rep)
 
-    provider_owned = provider_owned_paths()
+    provider_owned = provider_owned_paths(manifest, rep)
     check_adapters(rep, a.strict_adapters, provider_owned)
     sys.exit(rep.emit())
 

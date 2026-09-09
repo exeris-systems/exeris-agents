@@ -31,7 +31,7 @@ CHECK = os.path.join(ROOT, "tools", "agents_file_check.py")
 RUNNER = os.path.join(ROOT, "bundle", "evals", "run.py")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _harness import FAILURES, check, main  # noqa: E402  (after the sys.path line it needs)
+from _harness import check, main  # noqa: E402  (after the sys.path line it needs)
 
 
 def write(path: str, text: str) -> None:
@@ -42,19 +42,34 @@ def write(path: str, text: str) -> None:
 
 # ── 1. provider-owned ────────────────────────────────────────────────────────────────────────────
 
+_CHECKER = None
+
+
+def checker_module():
+    """Load and execute the checker once. Re-executing it per call also re-ran its imports and
+    appended to `sys.path` each time."""
+    global _CHECKER
+    if _CHECKER is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("afc", CHECK)
+        _CHECKER = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_CHECKER)
+    return _CHECKER
+
+
 def load_provider_owned(manifest_body: str) -> set[str]:
     """Call the checker's own helper with a temporary repository as the working directory."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("afc", CHECK)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = checker_module()
     d = tempfile.mkdtemp(prefix="po-")
     try:
         write(os.path.join(d, ".agents", "manifest.yaml"), manifest_body)
         cwd = os.getcwd()
         os.chdir(d)
         try:
-            return mod.provider_owned_paths()
+            import yaml
+            manifest = yaml.safe_load(open(os.path.join(".agents", "manifest.yaml"),
+                                           encoding="utf-8")) or {}
+            return mod.provider_owned_paths(manifest)
         finally:
             os.chdir(cwd)
     finally:
@@ -70,9 +85,9 @@ def test_plain_strings_survive_a_mapping_entry():
         "  - path: .claude/settings.json\n"
         "    generated-region: hooks\n"
     )
-    check("mapping entry contributes its path",
-          ".claude/settings.json" in owned, True)
-    check("plain strings are not discarded by the mapping entry",
+    # One assertion, not two: an equality over the whole set already says the mapping entry
+    # contributed its path, so the membership check could never fail independently of it.
+    check("the mapping entry contributes its path and discards no plain string",
           owned, {".claude/settings.local.json", ".github/workflows", ".claude/settings.json"})
 
 
@@ -109,6 +124,12 @@ def test_end_to_end_the_check_honours_a_list_carrying_a_mapping():
               "---\nname: s\ndescription: d\n---\n\nbody\n")
         p = subprocess.run([sys.executable, CHECK, "--root", d, "--strict-adapters"],
                            capture_output=True, text=True)
+        # Asserting only the ABSENCE of a string passes on an empty directory, on a crash, on any
+        # run that never reached the adapter check at all — which is the vacuous-green shape this
+        # suite exists to catch, reproduced inside the suite. Assert that the checker ran to
+        # completion and produced its report, then that the exemption held.
+        check("the checker ran to completion", p.returncode in (0, 1), True)
+        check("and reached its report", "agents_file_check" in p.stdout, True)
         check("a provider-owned directory listed beside a mapping entry is still exempt",
               ("provider-authored" in p.stdout or "no generated-from marker" in p.stdout), False)
     finally:
@@ -204,6 +225,71 @@ def test_a_missing_fixture_is_still_an_error():
         os.remove(os.path.join(r, ".agents", "evals", "fixtures", "f.md"))
         p = run_dry(r)
         check("a genuinely missing fixture still fails", p.returncode != 0, True)
+    finally:
+        shutil.rmtree(r)
+
+
+
+# ── 3. every path sink, in both directions ───────────────────────────────────────────────────────
+
+def test_scenarios_outside_the_repo_is_refused_before_it_is_read():
+    """The guard used to run seven lines after load_yaml(), so the read it exists for happened."""
+    r = vendored_consumer()
+    outside = tempfile.mkdtemp(prefix="outside-")
+    bad = os.path.join(outside, "not-yaml.yaml")
+    write(bad, "to: [nie: jest: poprawny: yaml\n")
+    try:
+        p = run_dry(r, "--scenarios", bad)
+        check("refused, and by the guard rather than by the YAML parser",
+              ("resolves outside the repository" in p.stdout + p.stderr,
+               "yaml" in p.stderr.lower() and "scanner" in p.stderr.lower()),
+              (True, False))
+    finally:
+        shutil.rmtree(r); shutil.rmtree(outside)
+
+
+def test_report_outside_the_repo_is_refused():
+    """The only WRITE sink, and it was the one left unguarded."""
+    r = vendored_consumer()
+    outside = tempfile.mkdtemp(prefix="outside-")
+    target = os.path.join(outside, "deep", "report.json")
+    try:
+        runner = os.path.join(r, ".agents", "vendor", "exeris-agents-1.1.0", "evals", "run.py")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report", target,
+                            "--scenarios", os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=r)
+        check("--report outside the checkout is refused",
+              "resolves outside the repository" in p.stdout + p.stderr, True)
+        check("and nothing was created there", os.path.exists(os.path.dirname(target)), False)
+    finally:
+        shutil.rmtree(r); shutil.rmtree(outside)
+
+
+def test_a_case_naming_no_schema_is_an_error_not_ok():
+    r = vendored_consumer()
+    try:
+        path = os.path.join(r, ".agents", "evals", "scenarios.yaml")
+        write(path, open(path, encoding="utf-8").read() +
+              "  - id: no-schema\n    agent: a\n    fixture: f.md\n"
+              "    prompt: p\n    expect: {fields: {x: y}}\n")
+        p = run_dry(r, "--scenarios", os.path.join(".agents", "evals", "scenarios.yaml"))
+        check("a case with no expect.schema does not resolve to the schema DIRECTORY",
+              ("ERROR no-schema" in p.stdout, "ok    no-schema" in p.stdout), (True, False))
+    finally:
+        shutil.rmtree(r)
+
+
+def test_a_missing_fixture_does_not_abort_the_run():
+    r = vendored_consumer()
+    try:
+        path = os.path.join(r, ".agents", "evals", "scenarios.yaml")
+        write(path, open(path, encoding="utf-8").read() +
+              "  - id: ghost-fixture\n    agent: a\n    fixture: nope.md\n"
+              "    prompt: p\n    expect: {schema: verdict.schema.json}\n")
+        p = run_dry(r, "--scenarios", os.path.join(".agents", "evals", "scenarios.yaml"))
+        check("a missing fixture is recorded, not raised",
+              ("Traceback" in p.stderr, "ERROR ghost-fixture" in p.stdout), (False, True))
+        check("and the earlier case still reported", "ok    only-case" in p.stdout, True)
     finally:
         shutil.rmtree(r)
 

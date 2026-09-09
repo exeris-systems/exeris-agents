@@ -12,6 +12,10 @@ and wording is PATCH.
 
 ### Breaking
 
+- **A symlinked `schemas` or `fixtures` directory pointing outside the checkout is now refused.**
+  `within_repo` resolves through symlinks, which is the correct posture for a path guard and was
+  filed under *Changed* in 1.1.1 when it should have been here: a consumer that deliberately
+  symlinked either directory out of the repository worked on 1.1.0 and stops working now.
 - **A profile whose composition does not resolve now fails the check.** Rule 5 always required a
   reference to point at something; nothing verified it, so a repository could carry a policy, a
   skill or a handoff target that does not exist and report `0 errors`. Repositories with such a
@@ -30,11 +34,44 @@ and wording is PATCH.
 - **The renderer answered a missing `name` or `description` with a `KeyError` traceback**, which
   says which key but not which file — while every other missing thing in it is reported by name.
 
+### Fixed — the eval runner's path guards, which guarded the wrong things
+
+- **`--scenarios` was read before it was guarded.** `load_yaml()` ran seven lines above
+  `within_repo()`, so the one CLI-controlled read the guard exists for still happened: a path
+  outside the checkout produced a YAML parse error or a raw `FileNotFoundError` rather than a
+  refusal. A guard that runs after its sink is a comment.
+- **`--report` was never guarded at all** — the only *write* sink, while three read sinks were
+  tightened. Confirmed creating a directory tree and a file outside the repository.
+- **`$ref` resolution was a fourth unguarded `open()`**, taking a path fragment out of schema JSON,
+  which is the same class of input as the three that were guarded.
+- **A case naming no `expect.schema` resolved to the schema *directory* and was reported `ok`** —
+  the "resolves to something rather than to the right thing" failure, one level below the one
+  1.1.1 fixed.
+- **A missing fixture aborted the whole run with a traceback** while a missing schema four lines
+  later was recorded and skipped, so one typo hid every later result.
+
+### Fixed — the checker
+
+- `provider_owned_paths()` re-read and re-parsed `manifest.yaml` a third time inside its own
+  `except: pass`, so an unparseable manifest produced an empty list and the same false findings
+  the entry was added to remove. It takes the parsed manifest and an explicit reporter now.
+- `generated-region` was read by nothing: the entry contributed only its `path`, exempting a
+  partially generated file as if it were wholly provider-owned. The named region must now be
+  present in the file.
+
 ### Added
 
 - `tests/test_composition.py` — 12 assertions over composition resolution, the `bundle:` prefix in
   its three states, forward handoffs and the renderer's missing-field message. Eight of them fail
   against 1.1.1.
+- Four more assertions in `tests/test_consumer_paths.py`, one per sink: `--scenarios` refused
+  *before* the read, `--report` refused with nothing created, a case with no schema reported as an
+  error rather than `ok`, and a missing fixture recorded without aborting the run.
+- `against-consumer` runs the eval runner over the real consumer tree. Its comment claimed that
+  job covered these cases; it never invoked the runner, so the eval half had no consumer-level
+  gate — the claim and the gap are both fixed here.
+- `_harness.reset()`, because extracting the shared harness replaced a duplicated counter with a
+  single un-resettable one: two suites in one process reported each other's numbers.
 
 ## [1.1.1] - 2026-09-09
 
