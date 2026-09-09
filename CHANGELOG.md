@@ -61,6 +61,12 @@ above, decides the number.
   tool call anyway. Fail-closed is again a property of the rule, which is what `--on-error` was
   introduced to make true.
 
+- **The shim runs the hook in its own process.** It exec'd a second interpreter, which made an
+  OS-command sink out of a call that never needed one and paid a Python startup on every tool
+  event — the hook fires on all of them. `runpy` runs the confined path here instead; the hook's
+  own exit code travels back through `SystemExit`, which is the decision channel on the runtimes
+  that document one, and a hook that cannot start now falls to the caller's `--on-error` rather
+  than to whatever the child process happened to return.
 - **The rendered command is validated before it becomes an argument vector.** The shim is the
   boundary between a provider's config and the dispatcher, and it forwarded whatever the config
   contained. It now requires `--flag value` pairs and rebuilds the vector from strings that each
@@ -79,7 +85,7 @@ above, decides the number.
 
 ### Added
 
-- `tests/test_dispatch.py` — 41 assertions over the renderer's output and the shim's behaviour,
+- `tests/test_dispatch.py` — 46 assertions over the renderer's output and the shim's behaviour,
   including the bump-without-re-render state that produced this, the case where recognising only
   the new command shape would leave a repository with every hook rendered twice, two escapes from
   the vendored tree that fail without the containment check, and a hand-edited command vector.

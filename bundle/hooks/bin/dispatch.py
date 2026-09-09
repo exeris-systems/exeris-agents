@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import runpy
 import sys
 
 AGENTS = ".agents"
@@ -175,15 +176,20 @@ def main(argv: list[str]) -> int:
     if args is None:
         return refuse(argv, "the rendered hook command is not a sequence of --flag value pairs; "
                             "re-render it rather than hand-editing the provider config")
+    # Run it here rather than exec a second interpreter. Nothing in this file is an OS command:
+    # `hook` was confined to the vendored tree by target(), the vector was rebuilt by sanitised(),
+    # and neither is handed to a shell or a process launcher. The hook fires on every tool call, so
+    # the interpreter startup this removes is paid back on each of them.
+    sys.argv = [hook] + args
     try:
-        # execv, not a shell: the vector is passed as a vector, so nothing in it is re-parsed by a
-        # shell, and the arguments sit after the script path, where the interpreter treats them as
-        # the script's. Every element was chosen here: `hook` by target(), confined to the vendored
-        # tree, and the rest rebuilt by sanitised() from strings that each matched a pattern.
-        os.execv(sys.executable, [sys.executable, hook] + args)
-    except OSError as exc:                    # exec failed; the process is still this one
+        runpy.run_path(hook, run_name="__main__")
+    except SystemExit as stop:                # hook.py's own exit code is the decision channel
+        if stop.code is None:
+            return 0
+        return stop.code if isinstance(stop.code, int) else 1
+    except Exception as exc:                  # a hook that cannot start is not a hook that allows
         return refuse(argv, f"cannot run {hook}: {type(exc).__name__}: {exc}")
-    return 0                                  # unreachable after a successful execv
+    return 0
 
 
 if __name__ == "__main__":

@@ -252,6 +252,34 @@ def test_the_working_directory_wins_over_the_shims_own_location():
     shutil.rmtree(a); shutil.rmtree(b)
 
 
+def test_the_hooks_own_exit_code_survives():
+    """The exit code IS the decision on the runtimes that document one, so the shim must not
+    replace it with its own. Running the hook in this process rather than exec'ing a second
+    interpreter moves that code through a `SystemExit`, which is the part worth a test."""
+    d = repo()
+    render(d)
+    hook = os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0", "hooks", "bin", "hook.py")
+    open(hook, "w").write("import sys\nprint('BLOCKING')\nsys.exit(2)\n")
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    check("a blocking hook still blocks", out.returncode, 2)
+    check("and its output still arrives", out.stdout.strip(), "BLOCKING")
+    shutil.rmtree(d)
+
+
+def test_a_hook_that_cannot_start_falls_back_to_on_error():
+    """A hook.py that raises on import is not a hook that allows."""
+    d = repo()
+    render(d)
+    hook = os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0", "hooks", "bin", "hook.py")
+    open(hook, "w").write("raise RuntimeError('broken')\n")
+    denied = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    allowed = fire(d, "--hook", "record-guardrail-run", "--vendor", "claude", "--on-error", "allow")
+    check("a deny rule blocks", denied.returncode, 2)
+    check("a recorder does not", allowed.returncode, 0)
+    check("and the reason names the file", "cannot run" in denied.stderr, True)
+    shutil.rmtree(d)
+
+
 def test_a_command_that_is_not_flag_value_pairs_is_not_forwarded():
     """What reaches `execv` is rebuilt from strings that each matched a pattern.
 
