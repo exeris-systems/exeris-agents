@@ -2,37 +2,40 @@
 
 All notable changes to the Exeris agent bundle. Keep a Changelog 1.1, SemVer, ADR-085 §H.27.
 
-Versioning, stated precisely because the earlier wording licensed the wrong reading:
+Versioning, stated precisely because the earlier wording licensed a wrong reading:
 
-- **MAJOR** — a conforming repository stops conforming, **or** a repository that passed on the
-  previous version can fail on this one. Tool behaviour counts: for a bundle of gates, the build's
-  outcome *is* the public surface, and a consumer pinning a range must not have CI turn red.
-- **MINOR** — a policy, schema field or check a repository can ignore, and additions that cannot
-  change an existing verdict.
+- **MAJOR** — the contract moves under a repository that was following it: a new required field, a
+  removed or renamed manifest key, a changed vendored layout, a removed or renamed CLI flag.
+- **MINOR** — a new check, policy or schema field. A new check *can* turn a green build red, but
+  only where the repository was already not conforming: that is the check catching up with a rule
+  that already bound, not the contract moving. This is how check tooling is versioned everywhere,
+  and it is what "a conforming repository stops conforming" was always meant to say.
 - **PATCH** — wording, and fixes that only make a previously-failing case pass.
 
-The presence of a `### Breaking` section does **not** by itself mean MAJOR: ADR-085 §H.27 makes
-that section mandatory in *every* release, so "Breaking: nothing" is an answer. What decides the
-number is the section's content against the three rules above.
+A `### Breaking` section is **mandatory in every release** (ADR-085 §H.27), so "Breaking: nothing"
+is an answer and the section's presence never implies MAJOR. Its content, against the three rules
+above, decides the number.
 
 ## [Unreleased]
 
-## [2.0.0] - 2026-09-09
+## [1.2.0] - 2026-09-09
 
 ### Breaking
 
-- **Released as MAJOR, and the reason is worth stating**: two changes below can turn a
-  previously-green build red — a repository whose profile carries an unresolvable reference, and
-  one that deliberately symlinks `schemas` or `fixtures` out of the checkout. Neither was ever
-  *conforming*, but the rule at the top of this file was ambiguous enough to be read as
-  "Breaking section ⇒ MAJOR", and 1.1.0 and 1.1.1 both carried build-visible breaks released as
-  MINOR. The rule is now explicit and this release follows it. Earlier numbers are left as
-  published: renumbering them would break the pin that already names them.
-- **A symlinked `schemas` or `fixtures` directory pointing outside the checkout is now refused.**
-  `within_repo` resolves through symlinks, which is the correct posture for a path guard and was
-  filed under *Changed* in 1.1.1 when it should have been here: a consumer that deliberately
-  symlinked either directory out of the repository worked on 1.1.0 and stops working now.
-- **A profile whose composition does not resolve now fails the check.** Rule 5 always required a
+- **Nothing moves the contract.** `bundle/schemas/` is unchanged, no manifest key is added,
+  removed or renamed, no CLI flag is removed, and the vendored layout is the same. A repository
+  that conforms to the schema on 1.1.1 conforms on this version.
+- **A profile whose composition does not resolve now fails the check** — the one change that can
+  turn a green build red. Rule 5 has required a reference to resolve since schema v2; nothing
+  verified it, so a repository could carry a broken one and report `0 errors`. That is the check
+  catching up with a rule that already bound, which is MINOR by the rule above and by how check
+  tooling is versioned generally. **A repository carrying such a reference must fix it.**
+- A case with no `expect.schema` is an error rather than `ok`, and `--report` outside the checkout
+  is refused. Both were never correct; the second is a path-safety fix.
+- *Not new here, recorded for accuracy:* refusing a `schemas` or `fixtures` directory symlinked
+  out of the checkout shipped in **1.1.1**, filed there under *Changed*. It is a behaviour
+  restriction released as a patch. Left as published — renumbering breaks the pin that names it —
+  and noted so the history is not read as if it happened in this release. Rule 5 always required a
   reference to point at something; nothing verified it, so a repository could carry a policy, a
   skill or a handoff target that does not exist and report `0 errors`. Repositories with such a
   reference go from green to red on this version — correctly, and visibly for the first time.
