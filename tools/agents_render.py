@@ -168,6 +168,12 @@ def yaml_frontmatter(pairs: list[tuple[str, str]]) -> str:
 
 def render_agent(src: str, mapping: dict, rel: str, vendor_root: str | None = None) -> str:
     fm, body = split_frontmatter(src)
+    # Every other missing thing in this renderer is reported by name; `name` and `description`
+    # were read straight out of the mapping, so a profile without one exited on a KeyError
+    # traceback that says which key but not which file.
+    for required in ("name", "description"):
+        if not str(fm.get(required) or "").strip():
+            die(f"{rel}: frontmatter has no '{required}' (rule 11) — every runtime reads it")
     over = ((fm.get("adapters") or {}).get(mapping["vendor"]) or {})
     out = {
         "name": fm["name"],

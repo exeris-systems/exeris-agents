@@ -229,7 +229,77 @@ def _body_of(path: str) -> str:
     return text[end + 4:] if end >= 0 else text
 
 
-def check_profile(d: str, rep: Report, strict: bool = True):
+def vendored_root() -> str | None:
+    """`.agents/vendor/<bundle>-<version>` for the pinned import, or None when none is pinned."""
+    import yaml
+    path = os.path.join(".agents", "manifest.yaml")
+    if not os.path.exists(path):
+        return None
+    try:
+        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for imp in data.get("imports") or []:
+        if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
+            return os.path.join(VENDOR, f"{imp['bundle']}-{imp['version']}")
+    return None
+
+
+def check_composition(rel: str, fm: dict, rep: Report, fail, ctx: dict) -> None:
+    """rule 5 — a profile composes by reference, so every reference must resolve.
+
+    Nothing checked these. A profile could name a policy that does not exist, a skill that does
+    not exist, a handoff to a role that does not exist, or a `bundle:` policy in a repository that
+    pins no bundle, and the check reported clean — so an empty composition and a typo were
+    indistinguishable from a correct one. Composition by reference is only worth more than copying
+    if the references are known to point at something.
+    """
+    vendor_root = ctx.get("vendor_root")
+
+    def resolve(kind: str, name: str) -> tuple[str, str | None]:
+        """Return (path, error). `bundle:x` goes to the vendored tree, a bare name to the repo."""
+        if not str(name).startswith("bundle:"):
+            return os.path.join(".agents", kind, f"{name}.md"), None
+        bare = str(name).split(":", 1)[1]
+        if not vendor_root:
+            return "", (f"references '{name}' but the manifest pins no bundle, so there is no "
+                        f"vendored tree for it to come from (rule 8)")
+        return os.path.join(vendor_root, kind, f"{bare}.md"), None
+
+    for kind, singular in (("policies", "policy"), ("references", "reference")):
+        for name in fm.get(kind) or []:
+            path, err = resolve(kind, name)
+            if err:
+                fail(rel, err, rule="composition")
+            elif not os.path.exists(path):
+                fail(rel, f"{singular} '{name}' does not exist at {path} (rule 5)",
+                     rule="composition")
+
+    for name in fm.get("skills") or []:
+        if name not in ctx.get("skill_names", set()):
+            fail(rel, f"skill '{name}' is not a skill in this repository (rule 5)",
+                 rule="composition")
+
+    known = ctx.get("profile_names", set()) | {"human"}
+    for h in fm.get("handoffs") or []:
+        if not isinstance(h, dict):
+            fail(rel, f"handoff entry is not a mapping: {h!r}", rule="composition")
+            continue
+        target = h.get("agent")
+        if not target:
+            fail(rel, "handoff has no 'agent'", rule="composition")
+        elif target not in known:
+            fail(rel, f"handoff names '{target}', which is not a role in this repository (rule 5)",
+                 rule="composition")
+
+    evals = fm.get("evals")
+    if evals and not os.path.isdir(os.path.join(os.path.dirname(rel), str(evals).rstrip("/"))) \
+            and not os.path.isdir(os.path.join(".agents", str(evals).rstrip("/"))):
+        rep.warning(rel, f"evals directory '{evals}' does not exist beside the profile or under "
+                         f".agents/", rule="composition")
+
+
+def check_profile(d: str, rep: Report, strict: bool = True, ctx: dict | None = None):
     """rules 10 and 11 — the AGENT.md layout, and frontmatter that is safe to be read raw.
 
     `strict` follows the repository's own manifest version. A repository still on v1 gets these as
@@ -239,6 +309,7 @@ def check_profile(d: str, rep: Report, strict: bool = True):
     frontmatter_check.py's ramp/strict, and the same reason.
     """
     fail = rep.error if strict else rep.warning
+    ctx = ctx or {}
     name = os.path.basename(d)
     path = os.path.join(d, "AGENT.md")
     rel = os.path.relpath(path)
@@ -292,6 +363,8 @@ def check_profile(d: str, rep: Report, strict: bool = True):
     if len(body) > PROFILE_BODY_MAX:
         fail(rel, f"profile body is {len(body)} characters (cap {PROFILE_BODY_MAX}) — the "
                        f"tightest vendor agent-body limit", rule="size")
+    check_composition(rel, fm, rep, fail, ctx)
+
     out = fm.get("output")
     if out:
         # The renderer accepts both spellings, so the checker must too — otherwise the
@@ -677,18 +750,19 @@ def main():
                 pass
 
         profiles = os.path.join(".agents", "agents")
-        profile_names: set[str] = set()
-        if os.path.isdir(profiles):
-            for name in sorted(os.listdir(profiles)):
-                d = os.path.join(profiles, name)
-                if os.path.isdir(d):
-                    rep.checked += 1
-                    profile_names.add(name)
-                    check_profile(d, rep, declared_v2)
-        check_no_lowercase_agent_md(rep, declared_v2)
-
+        # Two passes: a handoff may name a role defined later in the listing, and a composition
+        # check that depended on ordering would be a check with a false negative built in.
+        profile_names = {n for n in (os.listdir(profiles) if os.path.isdir(profiles) else [])
+                         if os.path.isdir(os.path.join(profiles, n))}
         skill_names = {n for n in (os.listdir(skills) if os.path.isdir(skills) else [])
                        if os.path.isdir(os.path.join(skills, n))}
+        ctx = {"vendor_root": vendored_root(), "profile_names": profile_names,
+               "skill_names": skill_names}
+        if os.path.isdir(profiles):
+            for name in sorted(profile_names):
+                rep.checked += 1
+                check_profile(os.path.join(profiles, name), rep, declared_v2, ctx)
+        check_no_lowercase_agent_md(rep, declared_v2)
         check_workflows(rep, profile_names, skill_names)
         check_schemas(rep)
 

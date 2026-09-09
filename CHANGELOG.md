@@ -8,6 +8,34 @@ and wording is PATCH.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-09
+
+### Breaking
+
+- **A profile whose composition does not resolve now fails the check.** Rule 5 always required a
+  reference to point at something; nothing verified it, so a repository could carry a policy, a
+  skill or a handoff target that does not exist and report `0 errors`. Repositories with such a
+  reference go from green to red on this version — correctly, and visibly for the first time.
+
+### Fixed
+
+- **`policies:` and `references:` on a profile were never validated.** Neither that a bare name
+  resolves under `.agents/`, nor that `bundle:<name>` resolves into the vendored tree, nor that
+  `bundle:` is used at all in a repository that pins no bundle. `skills:` and `handoffs:` were
+  unchecked on profiles too — a workflow's `steps.skill` was checked, a profile's was not. An
+  empty composition, a typo and a correct profile were indistinguishable at `0/0`. Reported from
+  the SDK side.
+- Profile checks run in two passes, so a handoff naming a role listed later resolves rather than
+  depending on directory order for its verdict.
+- **The renderer answered a missing `name` or `description` with a `KeyError` traceback**, which
+  says which key but not which file — while every other missing thing in it is reported by name.
+
+### Added
+
+- `tests/test_composition.py` — 12 assertions over composition resolution, the `bundle:` prefix in
+  its three states, forward handoffs and the renderer's missing-field message. Eight of them fail
+  against 1.1.1.
+
 ## [1.1.1] - 2026-09-09
 
 ### Fixed

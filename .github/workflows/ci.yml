@@ -32,6 +32,8 @@ jobs:
       # they were found in the first place.
       - name: Consumer path and manifest regression suite
         run: python tests/test_consumer_paths.py
+      - name: Composition regression suite
+        run: python tests/test_composition.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'
