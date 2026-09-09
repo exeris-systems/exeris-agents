@@ -40,8 +40,9 @@ targets:
   skills-link: ".claude/skills"
   hooks:     ".claude/settings.json"
 
-# Hook wiring. The rendered config carries no patterns: it invokes the canonical dispatcher, which
-# reads .agents/hooks/hooks.yaml at runtime.
+# Hook wiring. The rendered config carries no patterns and no version: it invokes
+# .agents/hooks/bin/dispatch.py, which resolves the pin and hands off to the canonical dispatcher,
+# which reads .agents/hooks/hooks.yaml at runtime.
 hooks:
   events:
     pre-tool:  PreToolUse

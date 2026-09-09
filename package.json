@@ -1,6 +1,6 @@
 {
   "name": "@exeris/agents",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Shared Exeris agent bundle: organisation-wide policies, base decision schemas, the L0 hook dispatcher, the eval runner, and the renderer that turns .agents/ into every provider's adapters.",
   "license": "Apache-2.0",
   "type": "module",

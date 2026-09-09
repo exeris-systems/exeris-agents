@@ -19,8 +19,9 @@ What is rendered, per vendor mapping file in `agents/adapters/<vendor>.yaml`:
   .agents/workflows/<n>.md      -> the vendor's user-invoked prompt.
   .agents/skills/               -> a symlink where the runtime cannot read .agents/skills natively.
   .agents/hooks/hooks.yaml      -> the vendor's hook config, which carries no patterns of its own:
-                                   it invokes .agents/hooks/bin/hook.py, which reads the canonical
-                                   definitions at runtime.
+                                   it invokes .agents/hooks/bin/dispatch.py — a version-free copy
+                                   of the shim, written here too — which finds the pinned hook.py
+                                   and lets it read the canonical definitions at runtime.
 
 Vendors other than Claude need one mapping file each and no change here. They are deliberately not
 shipped with a guessed tool vocabulary: a mapping written from memory would silently grant or
@@ -47,8 +48,14 @@ MARK_BEGIN = "<!-- BEGIN GENERATED: composition (agents-md-schema.md rule 5) -->
 MARK_END = "<!-- END GENERATED -->"
 
 CAPABILITIES = {"read", "search", "edit", "shell", "web", "subagents"}
-# How a rendered hook entry is recognised as this renderer's on the next run.
-DISPATCHER_MARK = "hooks/bin/hook.py"
+# How a rendered hook entry is recognised as this renderer's on the next run. BOTH spellings, and
+# the old one stays for good: entries rendered before the shim existed name the vendored hook.py
+# directly, and an entry this function does not recognise is treated as hand-authored and kept. A
+# repository upgrading from <=1.2.0 would otherwise get every hook twice — the second copy pointing
+# into a vendored tree the same bump has just removed.
+DISPATCHER_MARKS = ("hooks/bin/hook.py", "hooks/bin/dispatch.py")
+# The version-free path the rendered config names, and the file the renderer copies there.
+DISPATCH_REL = ".agents/hooks/bin/dispatch.py"
 
 
 def die(msg: str):
@@ -204,13 +211,53 @@ def render_workflow(src: str, mapping: dict, rel: str) -> str:
 
 
 def dispatcher_path(root: str, vendor_root: str | None) -> str:
-    """Where hook.py lives. Vendored is the normal case; a repository that pins no bundle keeps
-    its own copy, and either way the rendered config names one path and no patterns."""
+    """What the rendered config invokes — and it carries no version.
+
+    It used to name the vendored hook.py, whose path contains the pin. That put the version in two
+    places with different lifetimes: the adapter, written when the renderer last ran, and the
+    vendored tree, replaced at every bump. Wherever the two are not in step the command points at a
+    file that is not there, `python3` exits 2, and exit 2 from a PreToolUse hook is a block — so
+    every tool call is denied by a stale string rather than by a rule.
+
+    The shim at DISPATCH_REL is the same dispatcher reached by a path that never moves; it reads
+    the pin from the manifest when the hook fires. A bundle vendored before the shim existed has
+    none to copy, so the old stamped path is still rendered for it: upgrading the renderer alone
+    must not rewrite a repository's adapters into a file its pinned bundle does not ship.
+    """
     if vendor_root:
+        if os.path.exists(os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py")):
+            return DISPATCH_REL
         vendored = os.path.join(vendor_root, "hooks", "bin", "hook.py")
         if os.path.exists(os.path.join(root, vendored)):
             return vendored.replace(os.sep, "/")
     return ".agents/hooks/bin/hook.py"
+
+
+def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: list[str]) -> None:
+    """Copy the version-free shim out of the vendored tree to DISPATCH_REL.
+
+    Generated, and inside the canonical tree on purpose. The path the adapters name must not move
+    when the pin moves, which rules out the vendored tree; and one copy serves every vendor, which
+    is why it is not under `.claude/`. The v2 layout already reserves `.agents/plugins/` for
+    rendered output on the same reasoning.
+    """
+    if not vendor_root:
+        return
+    src = os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py")
+    if not os.path.exists(src):
+        return
+    body = open(src, encoding="utf-8").read()
+    # The marker names the bundle path, not the vendored one. A version in this header would make
+    # the one file whose whole purpose is not to move change on every bump, and a copy left behind
+    # by an older render would differ from a fresh one for no reason a reader could act on.
+    line = ("# DO NOT EDIT. Generated from bundle/hooks/bin/dispatch.py by agents_render.py\n"
+            "# (exeris-systems/exeris-agents; agents-md-schema.md rule 7). Edit the source.\n")
+    if body.startswith("#!"):
+        shebang, rest = body.split("\n", 1)
+        body = f"{shebang}\n{line}{rest}"
+    else:
+        body = line + body
+    write(os.path.join(root, DISPATCH_REL), body, check, changes, root)
 
 
 def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> str:
@@ -256,7 +303,7 @@ def render_hooks(root: str, mapping: dict, vendor_root: str | None = None) -> st
     # key deletes every hand-authored hook, silently and irreversibly. Ours are identifiable by the
     # dispatcher they invoke, so they can be swapped out without touching anything else.
     def ours(entry) -> bool:
-        return any(DISPATCHER_MARK in (h or {}).get("command", "")
+        return any(any(m in (h or {}).get("command", "") for m in DISPATCHER_MARKS)
                    for h in (entry or {}).get("hooks") or [])
 
     existing = settings.get("hooks") or {}
@@ -426,6 +473,9 @@ def main() -> int:
                            if (c or {}).get("status") != "deferred"]
 
     changes: list[str] = []
+    # Once, not per vendor: the shim is vendor-neutral and every adapter names the same copy.
+    if os.path.exists(os.path.join(root, ".agents", "hooks", "hooks.yaml")):
+        write_dispatch(root, vendor_root, a.check, changes)
     for vendor in vendors:
         mpath = os.path.join(ADAPTER_DIR, f"{vendor}.yaml")
         if not os.path.exists(mpath):

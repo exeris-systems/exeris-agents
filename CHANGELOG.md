@@ -18,6 +18,56 @@ above, decides the number.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-09
+
+### Breaking
+
+- **Nothing moves the contract.** No manifest key is added, removed or renamed; no CLI flag
+  changes; `bundle/schemas/` is untouched; the vendored layout gains a file and loses none. A
+  repository conforming on 1.2.0 conforms on this version.
+- **`.claude/settings.json` changes on the next render**, because the command it carries changes.
+  That is a generated file the renderer owns, and `--check` reports it the way it reports any
+  adapter whose source moved: re-render and commit. A repository that upgrades without re-rendering
+  keeps working — the old command is still valid until its vendored tree is replaced, which is the
+  same bump that rewrites it.
+- **A new generated file appears in the canonical tree**: `.agents/hooks/bin/dispatch.py`. It is
+  written by the renderer, carries the do-not-edit marker, and belongs in `.agents/` rather than
+  under a provider directory because one copy serves every vendor and its path must not move when
+  the pin does.
+
+### Fixed
+
+- **The rendered hook command no longer carries the pinned version.** It named
+  `.agents/vendor/<bundle>-<version>/hooks/bin/hook.py`, putting the version in two files with
+  different lifetimes: the adapter, written when the renderer last ran, and the vendored tree,
+  replaced at every bump. A checkout holding one at a version the other does not ran a command
+  pointing at a missing file — and the failure was not a warning. `python3` exits 2 on a file it
+  cannot open, and exit 2 from a `PreToolUse` hook is a *block*, so every shell call was denied
+  whatever each hook's own `--on-error` said: the interpreter answered before the layer could.
+
+  The state is routine, not exotic. A pull request's review environment pairs the base branch's
+  protected `.claude/` with the branch's own tree, so the first review of every bundle bump ran
+  with no shell at all — twice on exeris-docs #106, reporting ten checks as `not-run`, before
+  anyone asked why. A contributor whose editor holds the old settings while the checkout moves
+  hits the same wall.
+
+  The rendered config now names `.agents/hooks/bin/dispatch.py`, a version-free copy of a shim the
+  bundle ships. It reads the pin from `.agents/manifest.yaml` when the hook fires and hands off to
+  the vendored `hook.py`. `manifest.yaml` stays the single authority for which bundle runs; it is
+  read at a moment when both halves are on disk together.
+
+- **A missing dispatcher now honours the caller's `--on-error`.** It could not before: the
+  interpreter's exit code arrived first, so a recorder declaring `--on-error allow` blocked the
+  tool call anyway. Fail-closed is again a property of the rule, which is what `--on-error` was
+  introduced to make true.
+
+### Added
+
+- `tests/test_dispatch.py` — 30 assertions over the renderer's output and the shim's behaviour,
+  including the bump-without-re-render state that produced this, and the case where recognising
+  only the new command shape would leave a repository with every hook rendered twice.
+
+
 ## [1.2.0] - 2026-09-09
 
 ### Breaking
