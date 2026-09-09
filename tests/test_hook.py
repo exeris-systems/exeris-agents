@@ -59,16 +59,8 @@ hooks:
         reason: "test policy: ADR touched without its checks"
 """
 
-FAILURES: list[str] = []
-PASSES = 0
-
-
-def check(name: str, got, want) -> None:
-    global PASSES
-    if got == want:
-        PASSES += 1
-    else:
-        FAILURES.append(f"{name}\n      expected {want!r}\n      got      {got!r}")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import FAILURES, check, main  # noqa: E402  (after the sys.path line it needs)
 
 
 def call(repo: str, hook: str, payload: dict, *, on_error="deny", vendor="claude", env=None,
@@ -298,18 +290,5 @@ def test_stop_degrades_where_a_runtime_cannot_block():
     shutil.rmtree(r)
 
 
-def main() -> int:
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        try:
-            t()
-        except Exception as exc:  # a broken test is a failure, not a skip
-            FAILURES.append(f"{t.__name__} raised {type(exc).__name__}: {exc}")
-    print(f"{PASSES} assertions passed, {len(FAILURES)} failed")
-    for f in FAILURES:
-        print(f"  FAIL  {f}")
-    return 1 if FAILURES else 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    main(globals())
