@@ -243,8 +243,10 @@ def write_dispatch(root: str, vendor_root: str | None, check: bool, changes: lis
     """
     if not vendor_root:
         return
-    src = os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py")
-    if not os.path.exists(src):
+    # Confined here as well as at the manifest read: this path is built from repository content
+    # and its bytes are copied into the tree the adapters execute from.
+    src = _compose.contained(root, os.path.join(root, vendor_root, "hooks", "bin", "dispatch.py"))
+    if not src or not os.path.exists(src):
         return
     body = open(src, encoding="utf-8").read()
     # The marker names the bundle path, not the vendored one. A version in this header would make
@@ -462,6 +464,11 @@ def main() -> int:
     vendor_root = None
     for imp in manifest.get("imports") or []:
         if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
+            bad = _compose.unsafe_pin(imp)
+            if bad:
+                die(f"manifest import has {bad}: {imp[bad]!r}, which is not a plain name — the pin "
+                    f"becomes a path under .agents/vendor/, so a separator, an absolute value or a "
+                    f"leading dot names a tree the digest in rule 8 does not cover")
             vendor_root = f".agents/vendor/{imp['bundle']}-{imp['version']}"
             if not os.path.isdir(os.path.join(root, vendor_root)):
                 die(f"manifest pins {imp['bundle']} {imp['version']} but {vendor_root} is not "

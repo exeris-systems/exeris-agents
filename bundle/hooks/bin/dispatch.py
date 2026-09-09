@@ -30,6 +30,11 @@ import sys
 
 MANIFEST = os.path.join(".agents", "manifest.yaml")
 FALLBACK = os.path.join(".agents", "hooks", "bin", "hook.py")
+VENDOR = os.path.join(".agents", "vendor")
+# A pin component is a plain name. Leading `.` is excluded, so `..` never reaches a path join, and
+# no separator can appear in one — the two ways repository content could aim this file's exec at
+# something the digest in rule 8 does not vouch for.
+SAFE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def repo_root() -> str:
@@ -83,21 +88,39 @@ def pinned(text: str) -> tuple[str, str] | None:
     return None
 
 
+def under(base: str, path: str) -> str | None:
+    """`path` resolved, or None if it does not stay inside `base`.
+
+    Both ends are realpath'd, so a symlink pointing out of the checkout is caught as well as a
+    `..` that survived the component check. This file execs what it returns; a path that left the
+    tree would be code the pin cannot vouch for, running with the session's permissions.
+    """
+    root = os.path.realpath(base)
+    full = os.path.realpath(path)
+    return full if full == root or full.startswith(root + os.sep) else None
+
+
 def target(root: str) -> str | None:
-    """The hook.py this call should run: the pinned vendored copy, else a repository-owned one."""
+    """The hook.py this call should run: the pinned vendored copy, else a repository-owned one.
+
+    The pin is repository content and its value becomes an argument to `execv`, so it is checked
+    rather than trusted: components must be plain names and the result must stay under
+    `.agents/vendor/`. Rule 8's digest vouches for what is inside that tree, and for nothing else.
+    """
     manifest = os.path.join(root, MANIFEST)
     if os.path.exists(manifest):
         try:
             pin = pinned(open(manifest, encoding="utf-8").read())
         except OSError:
             pin = None
-        if pin:
-            vendored = os.path.join(root, ".agents", "vendor", f"{pin[0]}-{pin[1]}",
-                                    "hooks", "bin", "hook.py")
-            if os.path.exists(vendored):
+        if pin and SAFE.match(pin[0]) and SAFE.match(pin[1]):
+            base = os.path.join(root, VENDOR)
+            vendored = under(base, os.path.join(base, f"{pin[0]}-{pin[1]}",
+                                                "hooks", "bin", "hook.py"))
+            if vendored and os.path.exists(vendored):
                 return vendored
-    local = os.path.join(root, FALLBACK)
-    return local if os.path.exists(local) else None
+    local = under(root, os.path.join(root, FALLBACK))
+    return local if local and os.path.exists(local) else None
 
 
 def refuse(argv: list[str], reason: str) -> int:
@@ -124,6 +147,9 @@ def main(argv: list[str]) -> int:
         return refuse(argv, f"no hook.py under {root} — the manifest pins no vendored bundle and "
                             f"{FALLBACK} is absent (run tools/agents_bundle.py vendor)")
     try:
+        # execv, not a shell: the argument vector is passed through as a vector, so nothing in it
+        # is re-parsed. `hook` is the only element this file chose, and `target()` has already
+        # confined it to the vendored tree; the rest belong to hook.py, which parses them itself.
         os.execv(sys.executable, [sys.executable, hook] + argv)
     except OSError as exc:                    # exec failed; the process is still this one
         return refuse(argv, f"cannot run {hook}: {type(exc).__name__}: {exc}")

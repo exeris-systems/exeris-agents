@@ -252,6 +252,59 @@ def test_the_working_directory_wins_over_the_shims_own_location():
     shutil.rmtree(a); shutil.rmtree(b)
 
 
+def test_a_pin_that_leaves_the_vendored_tree_is_not_run():
+    """The pin is repository content and its value becomes an argument to `execv`.
+
+    The vendored path is `.agents/vendor/{bundle}-{version}/hooks/bin/hook.py`, built from two
+    manifest values — and an absolute `bundle` swallows the base it was joined to, so the pin can
+    name any directory on the machine. That is code outside the tree rule 8's digest vouches for,
+    running with the session's permissions. It is refused, and the hook's own `--on-error` decides
+    what the refusal means.
+    """
+    d = repo()
+    render(d)
+    outside = tempfile.mkdtemp(prefix="dispatch-outside-")
+    os.makedirs(os.path.join(outside + "-v", "hooks", "bin"))
+    open(os.path.join(outside + "-v", "hooks", "bin", "hook.py"), "w").write(
+        "import sys\nprint('ESCAPED')\n")
+    open(os.path.join(d, ".agents", "manifest.yaml"), "w").write(
+        MANIFEST.format(version="v").replace("bundle: exeris-agents", f"bundle: {outside}"))
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    check("nothing outside the tree ran", "ESCAPED" in out.stdout, False)
+    check("and the deny rule still blocks", out.returncode, 2)
+    shutil.rmtree(d); shutil.rmtree(outside); shutil.rmtree(outside + "-v")
+
+
+def test_the_renderer_refuses_a_pin_that_is_not_a_plain_name():
+    """The same value, refused earlier and louder. The shim declines to run such a pin; the
+    renderer will not build a path from one at all, so the repository is told rather than left
+    with adapters whose behaviour depends on what happens to exist outside the tree."""
+    d = repo()
+    open(os.path.join(d, ".agents", "manifest.yaml"), "w").write(
+        MANIFEST.format(version="v").replace("bundle: exeris-agents", "bundle: /etc"))
+    out = render(d)
+    check("the render fails", out.returncode, 2)
+    check("and names the offending key", "not a plain name" in out.stderr, True)
+    shutil.rmtree(d)
+
+
+def test_a_symlinked_vendor_entry_is_not_run():
+    """`..` is not the only way out of a directory."""
+    d = repo("1.3.0")
+    render(d)
+    outside = tempfile.mkdtemp(prefix="dispatch-outside-")
+    os.makedirs(os.path.join(outside, "hooks", "bin"))
+    open(os.path.join(outside, "hooks", "bin", "hook.py"), "w").write(
+        "import sys\nprint('ESCAPED')\n")
+    pinned_dir = os.path.join(d, ".agents", "vendor", "exeris-agents-1.3.0")
+    shutil.rmtree(pinned_dir)
+    os.symlink(outside, pinned_dir)
+    out = fire(d, "--hook", "deny-irreversible", "--vendor", "claude", "--on-error", "deny")
+    check("a symlinked bundle is not vouched for", "ESCAPED" in out.stdout, False)
+    check("and the deny rule still blocks", out.returncode, 2)
+    shutil.rmtree(d, ignore_errors=True); shutil.rmtree(outside)
+
+
 # ── the pin parser ───────────────────────────────────────────────────────────────────────────────
 
 def shim_module():

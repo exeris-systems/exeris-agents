@@ -61,11 +61,22 @@ above, decides the number.
   tool call anyway. Fail-closed is again a property of the rule, which is what `--on-error` was
   introduced to make true.
 
+- **The pin is validated before it becomes a path.** `bundle` and `version` are joined into a
+  path under `.agents/vendor/` which is read, written and — through the shim — executed, and
+  neither was checked. An absolute `bundle` is the sharp case: `os.path.join` swallows the base it
+  was joined to, so the pin could name any directory on the machine, and the shim would have run
+  code the digest in rule 8 does not cover. Components must now be plain names, the resolved path
+  must stay inside the vendored tree (realpath, so a symlink out is caught too), and the renderer
+  refuses such a manifest outright rather than building adapters from it. Raised by SonarCloud on
+  the pull request that introduced the shim; the same shape was reachable through the renderer
+  before it.
+
 ### Added
 
-- `tests/test_dispatch.py` — 30 assertions over the renderer's output and the shim's behaviour,
-  including the bump-without-re-render state that produced this, and the case where recognising
-  only the new command shape would leave a repository with every hook rendered twice.
+- `tests/test_dispatch.py` — 36 assertions over the renderer's output and the shim's behaviour,
+  including the bump-without-re-render state that produced this, the case where recognising only
+  the new command shape would leave a repository with every hook rendered twice, and two escapes
+  from the vendored tree that fail without the containment check.
 
 
 ## [1.2.0] - 2026-09-09
