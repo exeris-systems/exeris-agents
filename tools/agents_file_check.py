@@ -553,9 +553,14 @@ def vendored_tree(path: str) -> str:
     return os.path.join(_compose.VENDOR, rel.split(os.sep)[0])
 
 
-# The property injected to ask whether a location refuses one. Long and ugly on purpose: it has to
-# be a name no schema declares and no `patternProperties` expects.
-PROBE_PROPERTY = "exeris-closer-probe-property"
+# The properties injected to ask whether a location refuses one. Two, of deliberately different
+# name shapes: a refusal that only rejects the SHAPE of a name — a `propertyNames` pattern of
+# `^[a-z_]+$` — refuses the hyphenated one and takes the plain one, and reading either refusal as
+# "closed"
+# would call that schema closed while ordinary undeclared properties walk in. Both must be refused.
+# Long and ugly on purpose: neither may be a name a schema declares or a `patternProperties`
+# expects.
+PROBE_PROPERTIES = ("exeris-closer-probe-property", "exeris_closer_probe_two")
 
 # What an error at a location says about the probe VALUE rather than about the object: the probe
 # put `{}` where a string or an enum belongs, so that location is not an object and nothing is
@@ -587,92 +592,153 @@ def applies_at_the_root(schema):
     return out
 
 
-def probe_for(node, base_dir: str, roots, depth: int = 5, seen=None):
-    """A structural instance of one base object, and the locations it puts an object at.
+# Keywords that carry subschemas the probe does not walk. Each can introduce an object, and each
+# is declined by name rather than passed over: the check measures the shapes it understands and
+# says which ones it met and left alone.
+UNWALKED = ("allOf", "anyOf", "oneOf", "if", "then", "else", "not", "dependentSchemas")
+
+
+def object_ish(node) -> bool:
+    """Whether a subschema could describe an object with properties of its own."""
+    return isinstance(node, dict) and bool(
+        {"properties", "items", "prefixItems", "$ref", "patternProperties"} & set(node)
+        or node.get("type") == "object")
+
+
+def introduces_shape(node) -> bool:
+    """Whether anything inside could put an object somewhere the probe has not been.
+
+    A branch that only constrains what the probe already reaches — `findings` to `minItems: 1`, a
+    `decision` enum — introduces nothing, and declining it would be noise on every composition the
+    bundle's own bases produce.
+    """
+    for sub in subschemas(node):
+        if not isinstance(sub, dict):
+            continue
+        if "patternProperties" in sub or object_ish(sub.get("additionalProperties")):
+            return True
+        if any(object_ish(v) for v in (sub.get("properties") or {}).values()):
+            return True
+    return False
+
+
+def probe_for(node, document, base_dir: str, roots, depth: int = 5, seen=frozenset()):
+    """A structural instance of one base object, the locations it puts an object at, and every
+    construct it declined.
 
     `{}` for a property that holds an object, `[{}]` for an array of them, and the same again for
-    whatever those declare — an object two levels down is as open as one at the top, and probing
-    only the first level accepted a composition that left it unclosed. Nothing here tries to
-    satisfy `required`, `minLength`, `pattern`, `minItems` or an enum: a conforming verdict is not
-    needed and chasing one is its own trap. Only the DIFFERENCE between two validations is read,
-    and both sides carry the same unmet requirements.
-
-    Every declared property is a candidate, including the ones that plainly hold a string — being
-    wrong here costs a location that gets skipped by `WRONG_KIND` a moment later, while being
+    whatever those declare. Nothing here tries to satisfy `required`, `minLength`, `pattern`,
+    `minItems` or an enum: a conforming verdict is not needed and chasing one is its own trap. Only
+    the DIFFERENCE between two validations is read, and both sides carry the same unmet
+    requirements. Every declared property is a candidate, including the ones that plainly hold a
+    string — being wrong there costs a location `WRONG_KIND` skips a moment later, while being
     clever about which properties are "really" objects is how the previous mechanism lost them.
 
-    A `$ref` into the bundle is followed, because a base declares part of its shape one file over —
-    `handoffs` is `handoff.base`, and an object that base declared would otherwise have no probe
-    location at all. Two shapes stay out of reach, and no base uses either: an object reachable
-    only through `patternProperties` (the probe would have to invent a name matching the pattern)
-    or through an object-valued `additionalProperties`.
+    A `$ref` is followed into the bundle and inside the document it came from, because a base
+    declares part of its shape one file over and part of it under its own `$defs`.
 
-    Returns `(instance, locations, stopped)`. `stopped` names the locations where `depth` ran out
-    with objects still below them — unmeasured, and said so, rather than reported as neither open
-    nor closed.
+    **What it declines, it names.** Five review rounds each found a construct this walk did not
+    understand, and each time the answer had been silence — indistinguishable from measured and
+    closed. The third return value is every construct met and not walked, with the location: a
+    branching keyword that could introduce an object, `patternProperties`, an object-valued
+    `additionalProperties`, an array whose item schema is not a schema object, a reference that
+    leads outside what can be resolved here, and the depth bound running out. The caller reports
+    each. The check measures a stated set of shapes and says where it stopped, rather than
+    promising to measure everything and quietly not.
     """
-    seen = seen if seen is not None else set()
-    instance, locations, stopped = {}, [], []
+    instance, locations, declined = {}, [], []
+    for keyword in UNWALKED:
+        if keyword in node and introduces_shape(node[keyword]):
+            declined.append(((), keyword))
+    if "patternProperties" in node:
+        declined.append(((), "patternProperties"))
+    if object_ish(node.get("additionalProperties")):
+        declined.append(((), "additionalProperties"))
+
     for name, sub in (node.get("properties") or {}).items():
         if not isinstance(sub, dict):
             continue
-        array = sub.get("items") if "items" in sub or "prefixItems" in sub else None
-        below = array if isinstance(array, dict) else sub
-        here = (name, 0) if array is not None else (name,)
-        onward = base_dir
-        target = ref_target(below.get("$ref"), base_dir, roots) if isinstance(below, dict) else None
-        if target:
-            key = (os.path.realpath(target[0]), target[1])
-            if key in seen:
-                below = {}
+        # An array is `items` (every element) or `prefixItems` (element by element); a `true`,
+        # `false` or missing item schema is an array whose elements this cannot describe.
+        positions, below = [], sub
+        if isinstance(sub.get("prefixItems"), list):
+            positions = [(i, item if isinstance(item, dict) else None)
+                         for i, item in enumerate(sub["prefixItems"])]
+        elif isinstance(sub.get("items"), dict):
+            positions = [(0, sub["items"])]
+        elif "items" in sub or "prefixItems" in sub:
+            positions = [(0, None)]
+
+        for index, item in positions or [(None, below)]:
+            here = (name,) if index is None else (name, index)
+            if item is None:
+                declined.append((here, "an array whose item schema is not a schema object"))
+                item = {}
+            child, child_document, onward, refused = resolve_for_probe(
+                item, document, base_dir, roots, seen)
+            if refused:
+                declined.append((here, refused))
+            if depth > 0:
+                nested, deeper, below_declined = probe_for(
+                    child, child_document, onward, roots, depth - 1, seen | {id(child)})
+            elif child.get("properties"):
+                nested, deeper, below_declined = {}, [], [((), "the depth bound")]
             else:
-                seen.add(key)
-                document = load_schema(target[0])
-                resolved = document if not target[1] else node_at(document, target[1])
-                below = resolved if isinstance(resolved, dict) else {}
-                onward = os.path.dirname(target[0])
-        if depth > 0:
-            nested, deeper, deep_stops = probe_for(below, onward, roots, depth - 1, seen)
-        else:
-            nested, deeper = {}, []
-            deep_stops = [()] if (below.get("properties") if isinstance(below, dict) else None) else []
-        instance[name] = [nested] if array is not None else nested
-        locations.append(here)
-        locations += [here + l for l in deeper]
-        stopped += [here + l for l in deep_stops]
-    return instance, locations, stopped
+                nested, deeper, below_declined = {}, [], []
+            if index is None:
+                instance[name] = nested
+            else:
+                instance.setdefault(name, [])
+                while len(instance[name]) <= index:
+                    instance[name].append({})
+                instance[name][index] = nested
+            locations.append(here)
+            locations += [here + l for l in deeper]
+            declined += [(here + l, what) for l, what in below_declined]
+    return instance, locations, declined
+
+
+def resolve_for_probe(node, document, base_dir: str, roots, seen):
+    """`(node, its document, its directory, what was declined)` for a subschema behind a `$ref`.
+
+    Three kinds of reference: into the vendored bundle, inside the document that named it, and
+    anything else — a repository's own file, a URL — which is declined by name. `seen` is the
+    ancestors of this node, not everything visited: a shared visited-set meant a base referencing
+    one neighbour from two properties lost every location under the second.
+    """
+    ref = node.get("$ref") if isinstance(node, dict) else None
+    if not isinstance(ref, str):
+        return node, document, base_dir, None
+    target = ref_target(ref, base_dir, roots)
+    if target:
+        onward = load_schema(target[0])
+        resolved = onward if not target[1] else node_at(onward, target[1])
+        if not isinstance(resolved, dict) or id(resolved) in seen:
+            return {}, document, base_dir, None if isinstance(resolved, dict) else \
+                f"a reference this check cannot resolve into an object ('{ref}')"
+        return resolved, onward, os.path.dirname(target[0]), None
+    if ref.startswith("#"):
+        resolved = node_at(document, ref[1:])
+        if not isinstance(resolved, dict):
+            return {}, document, base_dir, f"a fragment that names no object ('{ref}')"
+        if id(resolved) in seen:
+            return {}, document, base_dir, None
+        return resolved, document, base_dir, None
+    return {}, document, base_dir, f"a reference outside the bundle ('{ref}')"
 
 
 def probe_validator(schema, schema_path: str):
     """A validator for one composed schema, resolving `$ref` from the filesystem.
 
-    The same two moves the eval grader makes in `bundle/evals/run.py`: the document is identified
-    by the file it was read from, and a reference is retrieved from disk. Not imported from there —
-    that module resolves at import time which checkout it may read, and it would resolve the
-    bundle's own rather than the tree being checked — so this is the checker's own, guarded by
-    `_compose.contained` against the tree it has chdir'd into.
+    The two moves live in `_compose` now, beside the other definitions the checker and the renderer
+    share: a document is identified by the file it was read from, and a reference is retrieved from
+    disk. What is local here is the reader — `load_schema`, which contains a path against the tree
+    being checked and parses each file once.
     """
     from jsonschema import Draft202012Validator
-    from referencing import Registry, Resource
-    from referencing.jsonschema import DRAFT202012
-    from pathlib import Path
-    from urllib.parse import unquote, urlparse
-
     base_dir = os.path.dirname(os.path.abspath(schema_path))
-
-    def retrieve(uri: str):
-        # Through `load_schema`, which contains the path against the checkout and parses each file
-        # once. Reading here directly re-opened and re-parsed a base for every probed location —
-        # measured at twelve reads of one base for one composed schema.
-        target = (unquote(urlparse(uri).path) if uri.startswith("file:")
-                  else os.path.normpath(os.path.join(base_dir, uri)))
-        document = load_schema(target)
-        if document is None:
-            raise FileNotFoundError(f"$ref '{uri}' is not readable JSON inside this repository")
-        return Resource.from_contents(document, default_specification=DRAFT202012)
-
-    rooted = {**schema, "$id": Path(os.path.abspath(schema_path)).as_uri()}
-    return Draft202012Validator(rooted, registry=Registry(retrieve=retrieve))
+    return Draft202012Validator(_compose.located(schema, schema_path),
+                                registry=_compose.registry_over(load_schema, base_dir))
 
 
 def failures(validator, instance) -> set:
@@ -684,39 +750,41 @@ def failures(validator, instance) -> set:
     return {(tuple(e.absolute_path), e.validator) for e in validator.iter_errors(instance)}
 
 
-def names_the_probe(validator, instance) -> bool:
+def refuses_both_probes(validator, instance) -> bool:
     """Whether anything in the schema refuses the property that was just added.
 
-    Not "did the error set change", which is the comparison this started as and which measurement
-    ruled out. A probe deliberately does not satisfy `required`, `type` or an enum, so the base's
+    Both of them, and not "did the error set change" — the comparison this started as, which
+    measurement ruled out. A probe deliberately does not satisfy `required`, `type` or an enum, so the base's
     own branch fails — and a failing subschema contributes no annotations, so an
     `unevaluatedProperties` above it reports every property present, in both runs, at the same
     location under the same keyword. The two error sets are then identical whether or not the
     location closes, and reading them would call every closed object open.
 
-    What separates the two runs is which properties the refusal names. The probe property is a
+    What separates the two runs is which properties the refusal names. Each probe property is a
     token nothing else can produce, so its appearance — in the message a refusal renders, as the
     instance a `propertyNames` refusal rejects, or in the path an error is anchored at — is the
     schema saying it will not take this property. Which keyword did the refusing is not asked:
     `unevaluatedProperties`, `additionalProperties` and `propertyNames` all answer the question a
     consumer has, which is what an instance may carry.
     """
+    named = set()
     for e in validator.iter_errors(instance):
-        if e.instance == PROBE_PROPERTY or PROBE_PROPERTY in str(e.message):
-            return True
-        if any(str(step) == PROBE_PROPERTY for step in e.absolute_path):
-            return True
-    return False
+        for probe in PROBE_PROPERTIES:
+            if e.instance == probe or probe in str(e.message) \
+                    or any(str(step) == probe for step in e.absolute_path):
+                named.add(probe)
+    return named == set(PROBE_PROPERTIES)
 
 
 def carrying(instance, location):
-    """The probe with one foreign property added at one location."""
+    """The probe with the foreign properties added at one location."""
     import copy
     out = copy.deepcopy(instance)
     node = out
     for step in location:
         node = node[step]
-    node[PROBE_PROPERTY] = "probe"
+    for probe in PROBE_PROPERTIES:
+        node[probe] = "probe"
     return out
 
 
@@ -768,7 +836,8 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
             rep.warning(rel, f"`$ref` '{ref}' names something this check cannot resolve into an "
                              f"object, so the shape behind it was not measured", rule="schema")
             continue
-        instance, found, stopped = probe_for(node, os.path.dirname(target[0]), roots)
+        instance, found, declined = probe_for(doc, doc, os.path.dirname(target[0]), roots) \
+            if node is doc else probe_for(node, doc, os.path.dirname(target[0]), roots)
         # Two bases at the root may declare the same property with different shapes — an object in
         # one, an array in the other. The first to declare it fixes the probe's shape there, and
         # only its locations are kept: mixing them left a location naming an index into a value
@@ -778,10 +847,13 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
             probe.setdefault(name, value)
         locations += [l for l in found
                       if l and owner.get(l[0]) == ref and l not in locations]
-        for l in stopped:
-            rep.warning(rel, f"the probe stopped at {where(l)}: objects nested below it were not "
-                             f"measured, so whether they refuse a property the base does not name "
-                             f"is unknown", rule="schema")
+        # What the probe declined, said out loud. A construct it does not walk can put an object
+        # somewhere it never looks, and silence there is indistinguishable from measured-and-closed
+        # — the shape five review rounds each found one more of.
+        for l, what in dict.fromkeys(declined):
+            rep.warning(rel, f"not measured at {where(l)}: {what}. An object introduced there is "
+                             f"not probed, so whether this schema refuses a property the base "
+                             f"does not name is unknown for it", rule="schema")
     if not composes:
         # Nothing of the bundle's applies where an instance meets this schema, so the probe has no
         # root to stand on and the question cannot be asked. Asked-and-answered and never-asked
@@ -793,7 +865,10 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
         # Or through a file the root names: `applies_at_the_root` follows a local `#/` pointer and
         # stops at a file boundary, so a root that is `{"$ref": "inner.schema.json"}` composed the
         # base one file over and was neither probed nor reported.
-        for node in applies_at_the_root(schema) if not elsewhere else []:
+        branching = [k for k in ("anyOf", "oneOf", "if", "then", "else") if k in schema
+                     and any(ref_target(n.get("$ref"), here, roots) for n in subschemas(schema[k])
+                             if isinstance(n, dict))]
+        for node in applies_at_the_root(schema) if not elsewhere and not branching else []:
             ref = node.get("$ref")
             if not isinstance(ref, str) or ref.startswith("#") or "://" in ref:
                 continue
@@ -804,7 +879,12 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
                     for n in subschemas(document) if isinstance(n.get("$ref"), str)):
                 elsewhere = True
                 break
-        if elsewhere:
+        if branching:
+            rep.warning(rel, f"pulls a bundle base in under `{branching[0]}`, where whether it "
+                             f"applies depends on the instance — so the probe has no shape to "
+                             f"stand on and nothing here was measured. `allOf` at the root is the "
+                             f"composition this check measures", rule="schema")
+        elif elsewhere:
             # A warning, not an error: measured, a composition that pulls the base in below the
             # root can be correct at every level — closed at the root, at the wrapper and at each
             # item — and calling that an error fires where the repository conforms, which the
@@ -828,7 +908,9 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
     # `<root>: Unevaluated properties are not allowed ('checks_run', 'decision', …)`. The same
     # keyword on the branch that carries the reference is a different shape and is left alone: it
     # sees the base's own annotations, and a conforming decision passes it.
-    for node in applies_at_the_root(schema):
+    for node in subschemas(schema):
+        if not isinstance(node, dict):
+            continue
         branches = [b for b in node.get("allOf") or [] if isinstance(b, dict)]
         carriers = [b for b in branches
                     if ref_target(b.get("$ref"), os.path.dirname(schema_path), roots)]
@@ -842,8 +924,9 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
                 rep.error(rel, "a closer sits inside an `allOf` branch beside the one that pulls "
                                "the base in, where it sees only the properties named in that same "
                                "branch — so every decision carrying what the base declares is "
-                               "refused. Move it onto the object that holds the `allOf`",
-                          rule="schema")
+                               "refused. Move it onto the object that holds the `allOf`. This is "
+                               "checked at every level: the same mistake inside `findings.items` "
+                               "refuses every finding", rule="schema")
 
     try:
         validator = probe_validator(schema, schema_path)
@@ -878,7 +961,7 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
         if any(at == location and keyword in WRONG_KIND for at, keyword in before):
             continue
         try:
-            refused = names_the_probe(validator, carrying(probe, location))
+            refused = refuses_both_probes(validator, carrying(probe, location))
         except Exception as exc:
             rep.error(rel, f"whether {where(location)} refuses a property the base does not name "
                            f"could not be decided ({type(exc).__name__}: {exc})", rule="schema")
@@ -894,7 +977,7 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
                        f"`description`", rule="schema")
 
 
-def check_schemas(rep: Report, roots=()):
+def check_schemas(rep: Report, roots=None):
     """The schema files a decision conforms to are real, valid JSON Schema — rule 13 — and each
     reference in them resolves. That a composition over a vendored base must refuse what the base
     does not name is this bundle's own contract rather than a clause of the standard, and it is

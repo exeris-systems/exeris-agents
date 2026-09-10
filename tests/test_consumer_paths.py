@@ -425,7 +425,11 @@ def test_a_grader_that_cannot_build_its_registry_says_so():
     d, composed, runner = grader_tree()
     try:
         mod = load_runner(runner, "evalrun_noregistry")
+        import jsonschema                             # noqa: F401 — see below
         real = dict(sys.modules)
+        # jsonschema is imported first, deliberately: it imports `referencing` itself, so stubbing
+        # that out beforehand would fail jsonschema's own import and exercise the other branch.
+        # This passed for the right reason only because the suite happens to run alphabetically.
         sys.modules["referencing"] = None            # force the ImportError branch
         try:
             out = mod.validate(VERDICT, composed)
@@ -532,20 +536,16 @@ def test_an_unparseable_schema_fails_the_case_rather_than_the_run():
     try:
         write(composed, "{ this is not json")
         mod = load_runner(runner, "evalrun_unparseable")
-        for label, stub in (("with jsonschema", False), ("without jsonschema", True)):
-            real = dict(sys.modules)
-            if stub:
-                sys.modules["jsonschema"] = None
-            try:
-                out = mod.validate({}, composed)
-            except BaseException as exc:
-                check(f"{label}: an unparseable schema is graded ({type(exc).__name__})",
-                      False, True)
-                return
-            finally:
-                sys.modules.clear(); sys.modules.update(real)
-            check(f"{label}: it says the schema itself will not parse",
-                  bool(out) and "not readable JSON" in out[0], True)
+        # One case, not two: the read happens before either branch is chosen, so stubbing
+        # jsonschema out would exercise the same three lines and assert nothing further.
+        try:
+            out = mod.validate({}, composed)
+        except BaseException as exc:
+            check(f"an unparseable schema is graded, not raised ({type(exc).__name__})",
+                  False, True)
+            return
+        check("it says the schema itself will not parse",
+              bool(out) and "not readable JSON" in out[0], True)
     finally:
         shutil.rmtree(d)
 

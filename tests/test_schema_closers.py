@@ -172,24 +172,37 @@ def refusals(instance: dict, *, schema: str = COMPOSED, **shape) -> list[str]:
         shutil.rmtree(d)
 
 
-def warnings(repo: str) -> list[str]:
-    """The checker's warning annotations — what it could not measure, as against what it refuses."""
-    env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
-    proc = subprocess.run([sys.executable, CHECKER, "--root", repo], capture_output=True,
-                          text=True, env=env)
-    return [l for l in proc.stdout.splitlines() if l.startswith("::warning")]
+_RUNS: dict = {}
+
+
+def annotations(repo: str) -> tuple[list[str], list[str]]:
+    """`(errors, warnings)` from one run of the checker, cached per fixture.
+
+    One run, because several cases ask two questions of one tree and the checker is a subprocess;
+    and after asserting it ran at all, because ignoring the return code let every "expect nothing"
+    assertion pass on a crash.
+    """
+    if repo not in _RUNS:
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
+        proc = subprocess.run([sys.executable, CHECKER, "--root", repo], capture_output=True,
+                              text=True, env=env)
+        if proc.returncode not in (0, 1) or "Traceback" in proc.stderr:
+            raise AssertionError(f"checker did not run: rc={proc.returncode}\n{proc.stderr[-500:]}")
+        if "agents_file_check" not in proc.stdout:
+            raise AssertionError(f"checker produced no report:\n{proc.stdout[-500:]}")
+        lines = proc.stdout.splitlines()
+        _RUNS[repo] = ([l for l in lines if l.startswith("::error")],
+                       [l for l in lines if l.startswith("::warning")])
+    return _RUNS[repo]
 
 
 def errors(repo: str) -> list[str]:
-    """The checker's error annotations, after asserting it ran at all."""
-    env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
-    proc = subprocess.run([sys.executable, CHECKER, "--root", repo], capture_output=True,
-                          text=True, env=env)
-    if proc.returncode not in (0, 1) or "Traceback" in proc.stderr:
-        raise AssertionError(f"checker did not run: rc={proc.returncode}\n{proc.stderr[-500:]}")
-    if "agents_file_check" not in proc.stdout:
-        raise AssertionError(f"checker produced no report:\n{proc.stdout[-500:]}")
-    return [l for l in proc.stdout.splitlines() if l.startswith("::error")]
+    return annotations(repo)[0]
+
+
+def warnings(repo: str) -> list[str]:
+    """What the checker could not measure, as against what it refuses."""
+    return annotations(repo)[1]
 
 
 OPEN_AT = "may carry any property at "
@@ -209,10 +222,12 @@ def closer_errors(**shape) -> list[str]:
 
 
 def open_locations_for(composed: dict, **kwargs) -> list[str]:
+    """The open locations of one composed schema; the fixture it builds is consumed."""
     d = custom(composed, **kwargs)
     try:
         return open_locations(d)
     finally:
+        _RUNS.pop(d, None)
         shutil.rmtree(d)
 
 
@@ -247,10 +262,13 @@ def custom(composed: dict, *, vendored: dict | None = None, pin: str = DEFAULT_P
     return d
 
 
-def findings_for(repo: str) -> list[str]:
+def findings_then_drop(repo: str) -> list[str]:
+    """The schema findings for a fixture, which this then deletes — the name says so, because a
+    getter that removes what it was handed is not a getter."""
     try:
         return [l.split("schema::", 1)[-1] for l in errors(repo) if "schema::" in l]
     finally:
+        _RUNS.pop(repo, None)
         shutil.rmtree(repo)
 
 
@@ -292,8 +310,9 @@ def test_a_ref_into_an_unpinned_vendored_tree_is_not_a_skip():
     `$ref` is retargeted the composition still names the old directory — which exists, so no
     "target does not exist" fires. The closer rule used to answer that by recognising nothing at
     all, so the one moment it is there for was the one moment it said nothing."""
-    out = findings_for(stray(closed_base=False))
-    check("composing over a vendored tree the manifest does not pin is reported",
+    out = findings_then_drop(stray(closed_base=False))
+    check("composing over a vendored tree the manifest does not pin is reported once — two checks "
+          "touch that reference and only the one that judges references reports it",
           len(off_pin(out)), 1)
     check("and the objects behind it are still asked the question — an instance is validated "
           "against them whichever tree they were reached through",
@@ -305,26 +324,16 @@ def test_a_stray_reference_is_heard_from_with_nothing_else_wrong():
     themselves, so the closer rule has nothing to say about this schema at all — and a repository
     whose reference points at a tree its pin does not vouch for should not need a second defect
     before anything tells it."""
-    out = findings_for(stray(closed_base=True))
+    out = findings_then_drop(stray(closed_base=True))
     check("the stray reference is reported on its own", len(off_pin(out)), 1)
     check("and it is the only thing reported", len(out), 1)
-
-
-def test_a_stray_reference_is_reported_once_beside_a_closure_problem():
-    """Two checks now touch the same reference. The one that judges references reports it; the one
-    that judges closure uses it and says nothing about it."""
-    out = findings_for(stray(closed_base=False))
-    check("one annotation for the stray tree, not one per check that noticed",
-          len(off_pin(out)), 1)
-    check("and the closure findings are still there beside it",
-          len([f for f in out if OPEN_AT in f]) > 0, True)
 
 
 def test_a_closer_in_a_dead_branch_does_not_launder_an_open_one():
     """`$defs` is not applied to anything unless something references it. A closer parked there
     was counted as closing the object for the whole document, so the live composition — the one
     every instance is actually validated against — could be wide open with nothing red."""
-    out = findings_for(custom(
+    out = findings_then_drop(custom(
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": BASE}, {"properties": {"agent": {"enum": ["r"]}}}],
          "$defs": {"legacy": {"$ref": BASE, "unevaluatedProperties": False}}}))
@@ -337,7 +346,7 @@ def test_composing_one_object_is_not_ordered_to_close_the_rest():
     """A repository may compose a single sub-object — a finding, for a schema about findings. The
     requirement was computed per base FILE, so it was told to close a root, a check entry and a
     handoff it never pulls in."""
-    out = findings_for(custom(
+    out = findings_then_drop(custom(
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": BASE + "#/properties/findings/items"},
                    {"properties": {"tag": {"enum": ["style"]}}}],
@@ -351,7 +360,7 @@ def test_following_a_forwarding_ref_keeps_the_pointer():
     """`handoffs` forwards into another file at a pointer. The walk dropped the pointer and
     enumerated the whole target document, so objects the composition never names became work."""
     other = "exeris-agents-2.0.0/schemas/other.base.schema.json"
-    out = findings_for(custom(
+    out = findings_then_drop(custom(
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": "../vendor/" + other + "#/$defs/wanted"}],
          "unevaluatedProperties": False},
@@ -369,7 +378,7 @@ def test_a_property_name_that_a_pointer_must_escape_keeps_its_identity():
     object to the requirement and another to the closure — and the two never met."""
     odd = "exeris-agents-2.0.0/schemas/odd.base.schema.json"
     ref = "../vendor/" + odd
-    out = findings_for(custom(
+    out = findings_then_drop(custom(
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": ref},
                    {"properties": {"a/b": {"$ref": ref + "#/properties/a~1b",
@@ -386,7 +395,7 @@ def test_a_ref_whose_pointer_does_not_resolve_is_reported():
     """A `$ref` used to be checked as a file and never as a pointer. This release makes pointer
     refs the documented way to close a nested object, so a typo in one is a closer that closes
     nothing — and the file behind it exists, so nothing else notices."""
-    out = findings_for(custom(
+    out = findings_then_drop(custom(
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": BASE}],
          "unevaluatedProperties": False,
@@ -782,9 +791,152 @@ def test_the_probe_says_where_it_stopped():
                vendored={f"{VENDORED}/schemas/deep.base.schema.json": deep})
     try:
         check("the location the probe stopped at is named",
-              any("the probe stopped at" in w for w in warnings(d)), True)
+              any("not measured at" in w and "depth bound" in w for w in warnings(d)), True)
     finally:
         shutil.rmtree(d)
+
+
+# ── the shapes the probe declines, said out loud ──────────────────────────────────────────────
+
+def test_what_the_probe_declines_is_reported():
+    """The inversion. The probe walks the constructs it understands and used to be silent
+    everywhere else, so an object introduced through a construct it does not walk was
+    indistinguishable from one measured and closed — five review rounds, five more such shapes. It
+    now names what it met and left alone."""
+    odd = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+           "properties": {"a": {"type": "string"}},
+           "patternProperties": {"^x-": {"type": "object", "properties": {"deep": {"type": "object"}}}}}
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/odd.base.schema.json"}],
+                "unevaluatedProperties": False},
+               vendored={f"{VENDORED}/schemas/odd.base.schema.json": odd})
+    try:
+        check("the construct it did not walk is named",
+              any("not measured at" in w and "patternProperties" in w for w in warnings(d)), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_branch_that_constrains_what_is_already_probed_is_not_declined():
+    """The bases' own `allOf` of `if`/`then` tightens `findings` and `decision`, both already
+    probed. Declining every branching keyword would put four warnings on every composition in the
+    ecosystem and teach the reader to skip them."""
+    d = consumer()
+    try:
+        check("no noise from the bundle's own bases",
+              [w for w in warnings(d) if "not measured at" in w], [])
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_an_object_behind_a_same_document_ref_is_probed():
+    """`handoff.base` reaches its own `$defs` this way today. Only vendored-tree references were
+    followed, so an object a base declares under its own `$defs` had no location at all."""
+    defs_base = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                 "properties": {"inner": {"$ref": "#/$defs/thing"}},
+                 "$defs": {"thing": {"type": "object", "properties": {"a": {"type": "string"}}}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/defs.base.schema.json"}],
+         "unevaluatedProperties": False},
+        vendored={f"{VENDORED}/schemas/defs.base.schema.json": defs_base})
+    check("the object behind the fragment is measured", out, ["inner"])
+
+
+def test_one_neighbour_referenced_twice_keeps_both_sets_of_locations():
+    """`seen` was a visited-set for the whole traversal rather than the ancestors of a node, so a
+    base referencing one neighbour from two properties lost every location under the second."""
+    neighbour = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                 "properties": {"nested": {"type": "object", "properties": {"a": {"type": "string"}}}}}
+    twice = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "properties": {"first": {"$ref": "nb.base.schema.json"},
+                            "second": {"$ref": "nb.base.schema.json"}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/twice.base.schema.json"}],
+         "unevaluatedProperties": False,
+         "properties": {"first": {"unevaluatedProperties": False},
+                        "second": {"unevaluatedProperties": False}}},
+        vendored={f"{VENDORED}/schemas/twice.base.schema.json": twice,
+                  f"{VENDORED}/schemas/nb.base.schema.json": neighbour})
+    check("both occurrences keep their nested location", out, ["first/nested", "second/nested"])
+
+
+def test_a_tuple_array_is_probed_position_by_position():
+    """`prefixItems` was read in the guard and never used, so a tuple-form array of objects was
+    probed as though it were an object and its elements never measured."""
+    tuple_base = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                  "properties": {"pair": {"prefixItems": [
+                      {"type": "object", "properties": {"a": {"type": "string"}}},
+                      {"type": "object", "properties": {"b": {"type": "string"}}}]}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/tuple.base.schema.json"}],
+         "unevaluatedProperties": False},
+        vendored={f"{VENDORED}/schemas/tuple.base.schema.json": tuple_base})
+    check("each position is a location of its own", out, ["pair/0", "pair/1"])
+
+
+def test_an_array_whose_item_schema_is_a_boolean_is_declined():
+    """`items: true` is legal and describes no object, so building a location out of the array's
+    own properties was measuring something that does not exist."""
+    weird = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "properties": {"anything": {"items": True}}}
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/weird.base.schema.json"}],
+                "unevaluatedProperties": False},
+               vendored={f"{VENDORED}/schemas/weird.base.schema.json": weird})
+    try:
+        check("it says so rather than inventing a location",
+              any("item schema is not a schema object" in w for w in warnings(d)), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_root_composition_under_one_of_is_named_for_what_it_is():
+    """It fell into the branch that says the reference sits under a shape the repository owns,
+    which was simply untrue — the base is at the root, under a keyword whose applicability depends
+    on the instance."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "oneOf": [{"allOf": [{"$ref": BASE}], "unevaluatedProperties": False}]})
+    try:
+        check("the keyword it is under is named",
+              any("under `oneOf`" in w for w in warnings(d)), True)
+        check("and it is not called a reference that sits elsewhere",
+              any("not where an instance meets" in w for w in warnings(d)), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_closer_parked_in_a_branch_one_level_down_is_reported():
+    """The shape README documents for a finding, written wrongly: the closer inside the `allOf`
+    branch next to the `$ref` rather than on the object that holds them. The check ran only over
+    what applies at the root, so this passed green while every real finding was refused."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE}], "unevaluatedProperties": False,
+                "properties": {"findings": {"items": {"allOf": [
+                    {"$ref": BASE + "#/properties/findings/items"},
+                    {"properties": {"tag": {"type": "string"}},
+                     "unevaluatedProperties": False}]}}}})
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("the misplaced closer is caught at every level",
+              any("inside an `allOf` branch beside" in f for f in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_refusal_of_one_name_shape_is_not_a_closed_object():
+    """A `propertyNames` pattern refuses a name for its shape, not for being undeclared. One probe
+    name was one shape, so `^[a-z_]+$` read as closed while `sneaky_extra` walked in. Two probes of
+    different shapes, and both must be refused."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE}], "propertyNames": {"pattern": "^[a-z_]+$"}})
+    try:
+        check("the object is reported open, because an ordinary name still gets in",
+              "<root>" in open_locations(d), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
 
 
 # ── what the schema check may read ────────────────────────────────────────────────────────────

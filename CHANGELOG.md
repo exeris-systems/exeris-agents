@@ -82,6 +82,15 @@ number.
   shape. Both see only the properties written beside them, so both reject everything the base
   declares while looking closed to a check that asks only whether a foreign property can get in. A
   conforming decision graded against such a schema is refused outright.
+- **The check names what it did not measure.** The probe understands a stated set of shapes —
+  `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
+  document that named them — and every construct it meets and does not walk is now a warning
+  naming the construct and the location: a branching keyword that could introduce an object,
+  `patternProperties`, an object-valued `additionalProperties`, an array whose item schema is not
+  a schema object, a reference it cannot resolve, the depth bound running out. Silence there was
+  indistinguishable from measured-and-closed, which is how five review rounds each found one more
+  shape it did not know. A branch that only tightens what is already probed is not reported, or
+  the bundle's own bases would put warnings on every composition in the ecosystem.
 - A composition that pulls the base in below an instance's root — under a wrapper, or through
   another file — is reported as **not measured**, at warning level. It can be entirely correct, and
   measuring it would mean deriving instance locations from the composition's own structure, which
