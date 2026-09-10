@@ -108,6 +108,15 @@ number.
   path refused for leaving the repository, and any other failure, which says it was the grader that
   failed and names what raised. The history is here rather than tidied away because this release's
   argument is that a claim nothing re-measures is worth less than a run.
+- **The checker read a `$ref` target before deciding it was allowed to.** `load_schema` opened
+  whatever path it was handed; what stopped it leaving the checkout was `ref_target()`, two modules
+  away, which every caller happened to go through. Measured on a direct call, it read and parsed a
+  JSON file outside the tree and returned its contents — for files outside the tree the refusal was
+  `json.load` failing on something it had already read. The containment is now against the `open()`
+  itself, the value opened is the one the check returned, and a `$ref` that resolves outside the
+  repository is reported rather than surfacing as a target that does not exist or a pointer that
+  does not resolve. Raised by SonarCloud as path injection, which as reported was a false positive:
+  the sanitiser was real, it was just in another module — and so was the defect.
 - **Every failure was reported as a `$ref` that did not resolve.** The catch-all told each case the
   same story, path and all, whatever had actually gone wrong — a grader that misnames a failure
   sends its reader to the wrong file.

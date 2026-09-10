@@ -517,6 +517,83 @@ def test_a_base_referenced_somewhere_an_instance_never_meets_is_reported():
         shutil.rmtree(d)
 
 
+# ── what the schema check may read ────────────────────────────────────────────────────────────
+
+def checker_module():
+    """The checker itself, for the calls no fixture can reach through the CLI."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("afc_direct", CHECKER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_load_schema_refuses_a_path_outside_the_tree_it_is_checking():
+    """Called directly, without the resolver in front of it — the case with no coverage and the
+    one that makes the invariant real. Every caller today arrives through `ref_target()`, which
+    refuses anything not landing in `.agents/vendor/`; nothing makes that true of the next caller,
+    and the file this opens is chosen by a `$ref` inside a repository the checker was pointed at.
+    A JSON file outside the tree, not a broken one: the old refusal was `json.load` failing, which
+    is not a refusal at all — it read the file first."""
+    mod = checker_module()
+    outside = tempfile.mkdtemp(prefix="outside-")
+    inside = tempfile.mkdtemp(prefix="inside-")
+    here = os.getcwd()
+    try:
+        secret = os.path.join(outside, "readable.json")
+        with open(secret, "w", encoding="utf-8") as fh:
+            json.dump({"read": "it"}, fh)
+        neighbour = os.path.join(inside, ".agents", "schemas", "own.schema.json")
+        os.makedirs(os.path.dirname(neighbour))
+        with open(neighbour, "w", encoding="utf-8") as fh:
+            json.dump({"type": "object"}, fh)
+        os.chdir(inside)
+        check("a JSON file outside the checkout is refused, not parsed",
+              mod.load_schema(secret), None)
+        check("and the same file by a traversing relative path is refused too",
+              mod.load_schema(os.path.join(".agents", "schemas", "..", "..", "..",
+                                           os.path.basename(outside), "readable.json")), None)
+        check("while the repository's own schema is read",
+              mod.load_schema(os.path.join(".agents", "schemas", "own.schema.json")),
+              {"type": "object"})
+    finally:
+        os.chdir(here)
+        shutil.rmtree(outside)
+        shutil.rmtree(inside)
+
+
+def test_a_ref_that_leaves_the_checkout_is_reported():
+    """The other half: the sink refuses silently, because `None` is what a caller already reads as
+    a reference that led nowhere, and the reference itself is named where references are judged."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"x": {"$ref": "/etc/hosts#/anything"}}})
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a reference out of the checkout is a finding with a reason",
+              any("resolves outside the repository" in f for f in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_pointer_into_a_neighbouring_schema_still_resolves():
+    """Why the boundary is the checkout and not the vendored subtree: a `$ref` at a pointer inside
+    a `.agents/schemas/` neighbour is an ordinary thing for a repository to write, and containing
+    the reader to the vendored tree would have reported it as a pointer that does not resolve."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"x": {"$ref": "shared.schema.json#/$defs/thing"}}})
+    try:
+        with open(os.path.join(d, ".agents", "schemas", "shared.schema.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                       "$defs": {"thing": {"type": "object"}}}, fh)
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a neighbour's pointer resolves", [f for f in out if "pointer" in f], [])
+    finally:
+        shutil.rmtree(d)
+
+
 # ── one case per cause of the walker this check used to be ────────────────────────────────────
 
 def test_a_composition_declared_through_defs():

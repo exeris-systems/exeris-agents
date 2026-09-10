@@ -497,15 +497,36 @@ _PARSED: dict = {}
 
 
 def load_schema(path: str):
-    """Parsed once per file."""
-    key = os.path.realpath(path)
-    if key not in _PARSED:
+    """Parsed once per file, and never from outside the tree being checked.
+
+    The containment sits here, against the `open()`, and not only in `ref_target()` where a `$ref`
+    becomes a path. Every caller today arrives through that resolver, which refuses anything not
+    landing in `.agents/vendor/` — but that is an invariant held by calling convention, and the
+    next caller inherits none of it: it reaches this `open()` with whatever path it has and no test
+    fails. What protects a sink belongs where the sink is.
+
+    Two checks on one path is the intended shape, and they answer different questions. The resolver
+    decides whether a reference is a composition over the bundle, and REPORTS; this decides whether
+    a file may be read at all, and REFUSES. Deleting either as redundant is how this class comes
+    back.
+
+    The boundary is the checkout rather than the vendored subtree, because this also parses the
+    repository's own schemas — a `$ref` naming a pointer inside a `.agents/schemas/` neighbour is
+    an ordinary thing to write, and measured, it is clean today. `None` is the refusal: every
+    caller already reads `None` as a `$ref` that led nowhere, which is what a path leaving the tree
+    is. The reference itself is reported by `check_schemas`, where references are judged and a
+    finding can carry a reason.
+    """
+    inside = _compose.contained(os.getcwd(), path)
+    if inside is None:
+        return None
+    if inside not in _PARSED:
         try:
-            with open(key, encoding="utf-8") as fh:
-                _PARSED[key] = json.load(fh)
+            with open(inside, encoding="utf-8") as fh:
+                _PARSED[inside] = json.load(fh)
         except Exception:
-            _PARSED[key] = None    # a missing or broken target is reported as a bad $ref
-    return _PARSED[key]
+            _PARSED[inside] = None    # a missing or broken target is reported as a bad $ref
+    return _PARSED[inside]
 
 
 def vendored_tree(path: str) -> str:
@@ -782,6 +803,12 @@ def check_schemas(rep: Report, roots=()):
             file_part, _, fragment = ref.partition("#")
             if file_part:
                 target = os.path.normpath(os.path.join(d, file_part))
+                if _compose.contained(os.getcwd(), target) is None:
+                    rep.error(rel, f"$ref '{ref}' resolves outside the repository — a reference "
+                                   f"resolves from the filesystem, inside the checkout, and one "
+                                   f"that leaves it names a file this repository cannot vouch for "
+                                   f"and a reader cannot see (rule 8)", rule="schema")
+                    continue
                 if not os.path.exists(target):
                     rep.error(rel, f"$ref target does not exist: {ref}", rule="schema")
                     continue
