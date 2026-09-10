@@ -5,17 +5,19 @@ A base that closes itself cannot be extended. `additionalProperties: false` refu
 field, and `unevaluatedProperties: false` in the base refuses it just as flatly, because that
 keyword sees only the annotations of its own schema object and its in-place applicators and never
 a sibling `allOf` branch in the composing schema. So from 2.0.0 the bases carry no closer at all
-and the composition carries it — at its root, and inside every subschema that extends a shape the
-bundle owns.
+and the composition carries them — one per object, because a closer at the root does not reach
+into an array's items: with `checks_run` left open a foreign property in a check entry validates
+however tightly the root is closed. `test_an_unclosed_object_takes_any_property` is that
+measurement.
 
 Two halves, and each is worthless without the other:
 
-  * the refusals a repository actually relies on — a foreign property, a value outside an enum —
-    now exist only in the composed schema. `test_the_bare_base_refuses_nothing` is the measurement
-    that says so, and it is why the instance cases here are graded against a composition rather
-    than against `verdict.base.schema.json`;
-  * `agents_file_check.py` is what keeps the closer there. Without that rule a repository bumps the
-    bundle, changes nothing, and gets an open contract with no check red.
+  * the refusals a repository relies on — a foreign property, a value outside an enum — now exist
+    only in the composed schema. `test_the_bare_base_refuses_nothing` says how little is left
+    without it, and is why the instance cases here are graded against a composition rather than
+    against `verdict.base.schema.json`;
+  * `agents_file_check.py` is what keeps the closers there. Without that rule a repository bumps
+    the bundle, changes nothing, and gets an open contract with no check red.
 
 The instances are graded by `bundle/evals/run.py`'s own `validate()`, loaded from where vendoring
 puts it, so what is exercised is the grader a consumer's evals actually run.
@@ -40,7 +42,7 @@ CHECKER = os.path.join(ROOT, "tools", "agents_file_check.py")
 RUNNER = os.path.join(ROOT, "bundle", "evals", "run.py")
 SCHEMAS = os.path.join(ROOT, "bundle", "schemas")
 VENDORED = "exeris-agents-2.0.0"
-BASE_REL = f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"
+BASE = f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"
 
 MANIFEST = f"""\
 version: 2
@@ -63,30 +65,42 @@ provider-owned: []
 """
 
 
-def composition(*, root_closer: bool, nested_closer: bool, extend: bool) -> dict:
-    """This repository's verdict schema: the bundle's shape, narrowed, plus a `tag` on a finding."""
-    finding = {"allOf": [{"$ref": BASE_REL + "#/properties/findings/items"},
-                         {"properties": {"tag": {"enum": ["style", "correctness"]}}}]}
-    if not extend:
-        finding = {"$ref": BASE_REL + "#/properties/findings/items"}
-    if nested_closer:
-        finding["unevaluatedProperties"] = False
+def composition(*, root: bool = True, finding: bool = True, checks: bool = True,
+                handoffs: bool = True, compose_checks: bool = True) -> dict:
+    """This repository's verdict schema: the bundle's shape, narrowed, plus a `tag` on a finding.
+
+    Every object the base declares is closed here, whether or not this repository extends it — a
+    `findings` item because the `tag` is added there, a check entry and a handoff because leaving
+    either open is a hole the root cannot cover.
+    """
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Review verdict (fixture)",
         "allOf": [
-            {"$ref": BASE_REL},
-            {"properties": {"agent": {"enum": ["fixture-reviewer"]},
-                            "scope_class": {"enum": ["docs-only"]},
-                            "findings": {"items": finding}}},
+            {"$ref": BASE},
+            {"properties": {
+                "agent": {"enum": ["fixture-reviewer"]},
+                "scope_class": {"enum": ["docs-only"]},
+                "findings": {"items": closed(
+                    {"allOf": [{"$ref": BASE + "#/properties/findings/items"},
+                               {"properties": {"tag": {"enum": ["style", "correctness"]}}}]},
+                    finding)},
+                "handoffs": {"items": closed({"$ref": BASE + "#/properties/handoffs/items"},
+                                             handoffs)},
+            }},
         ],
     }
-    if root_closer:
-        schema["unevaluatedProperties"] = False
-    return schema
+    if compose_checks:
+        schema["allOf"][1]["properties"]["checks_run"] = {
+            "items": closed({"$ref": BASE + "#/properties/checks_run/items"}, checks)}
+    return closed(schema, root)
 
 
-def consumer(*, root_closer: bool = True, nested_closer: bool = True, extend: bool = True) -> str:
+def closed(node: dict, yes: bool) -> dict:
+    return {**node, "unevaluatedProperties": False} if yes else node
+
+
+def consumer(**shape) -> str:
     """A repository laid out the way `agents_bundle.py vendor` lays one out."""
     d = tempfile.mkdtemp(prefix="closers-")
     os.makedirs(os.path.join(d, ".git"))
@@ -101,8 +115,7 @@ def consumer(*, root_closer: bool = True, nested_closer: bool = True, extend: bo
         fh.write(MANIFEST)
     with open(os.path.join(d, ".agents", "schemas", "verdict.schema.json"), "w",
               encoding="utf-8") as fh:
-        json.dump(composition(root_closer=root_closer, nested_closer=nested_closer,
-                              extend=extend), fh, indent=2)
+        json.dump(composition(**shape), fh, indent=2)
     return d
 
 
@@ -120,11 +133,16 @@ def grader(repo: str):
     return mod
 
 
+FINDING = {"what": "a finding long enough to clear minLength", "why": "adr-conventions.md#7",
+           "fix": "name the clause", "tag": "style"}
+HANDOFF = {"from": "fixture-reviewer", "to": "human", "blocking": True,
+           "reason": "the receiving role owns the number"}
+
+
 def verdict(**over) -> dict:
     v = {"agent": "fixture-reviewer", "decision": "CONDITIONAL", "scope_class": "docs-only",
-         "findings": [{"what": "a finding long enough to clear minLength",
-                       "why": "adr-conventions.md#7", "fix": "name the clause", "tag": "style"}],
-         "checks_run": [{"check": "vale", "result": "pass"}]}
+         "findings": [dict(FINDING)], "checks_run": [{"check": "vale", "result": "pass"}],
+         "handoffs": [dict(HANDOFF)]}
     v.update(over)
     return v
 
@@ -133,9 +151,9 @@ COMPOSED = os.path.join(".agents", "schemas", "verdict.schema.json")
 BARE_BASE = os.path.join(".agents", "vendor", VENDORED, "schemas", "verdict.base.schema.json")
 
 
-def refusals(instance: dict, *, schema: str = COMPOSED) -> list[str]:
+def refusals(instance: dict, *, schema: str = COMPOSED, **shape) -> list[str]:
     """What the grader says about one instance, against a schema named repository-relative."""
-    d = consumer()
+    d = consumer(**shape)
     try:
         return grader(d).validate(instance, os.path.join(d, schema))
     finally:
@@ -154,8 +172,12 @@ def errors(repo: str) -> list[str]:
     return [l for l in proc.stdout.splitlines() if l.startswith("::error")]
 
 
-def closer_errors(repo: str) -> int:
-    return sum(1 for l in errors(repo) if "unevaluatedProperties" in l)
+def closer_errors(**shape) -> list[str]:
+    d = consumer(**shape)
+    try:
+        return [l for l in errors(d) if "unevaluatedProperties" in l]
+    finally:
+        shutil.rmtree(d)
 
 
 # ── the grader has jsonschema, or it is grading nothing ───────────────────────────────────────
@@ -180,80 +202,102 @@ def test_a_finding_may_carry_the_repositorys_own_property():
 
 def test_a_foreign_property_at_the_root_is_refused():
     out = refusals(verdict(sneaky="x"))
-    check("an undeclared root property is refused",
-          bool(out) and "sneaky" in out[0], True)
+    check("an undeclared root property is refused", bool(out) and "sneaky" in out[0], True)
 
 
 def test_a_foreign_property_inside_a_finding_is_refused():
-    out = refusals(verdict(findings=[{"what": "a finding long enough to clear minLength",
-                                      "why": "adr-conventions.md#7", "fix": "name the clause",
-                                      "tag": "style", "sneaky": "x"}]))
+    out = refusals(verdict(findings=[dict(FINDING, sneaky="x")]))
     check("an undeclared property inside a finding is refused",
           bool(out) and "sneaky" in out[0], True)
 
 
+def test_a_foreign_property_inside_a_check_entry_is_refused():
+    out = refusals(verdict(checks_run=[{"check": "vale", "result": "pass", "sneaky": "x"}]))
+    check("an undeclared property inside a check entry is refused",
+          bool(out) and "sneaky" in out[0], True)
+
+
+def test_a_foreign_property_inside_a_handoff_is_refused():
+    """The object the verdict base does not declare itself — `handoffs` items are `handoff.base`,
+    one file over, and closing them is the composition's job just the same."""
+    out = refusals(verdict(handoffs=[dict(HANDOFF, sneaky="x")]))
+    check("an undeclared property inside a handoff is refused",
+          bool(out) and "sneaky" in out[0], True)
+
+
 def test_a_tag_outside_the_enum_is_refused():
-    out = refusals(verdict(findings=[{"what": "a finding long enough to clear minLength",
-                                      "why": "adr-conventions.md#7", "fix": "name the clause",
-                                      "tag": "vibes"}]))
+    out = refusals(verdict(findings=[dict(FINDING, tag="vibes")]))
     check("the added property is constrained, not merely permitted",
           bool(out) and "vibes" in out[0], True)
 
 
 def test_the_bare_base_refuses_nothing():
-    """The measurement behind every line above. Graded against the base, all three mutants pass —
-    so an evaluation pointed at `verdict.base.schema.json` reports a clean run over answers no
+    """The measurement behind every line above. Graded against the base, every mutant passes — so
+    an evaluation pointed at `verdict.base.schema.json` reports a clean run over answers no
     repository would accept."""
-    base = BARE_BASE
-    check("the open base accepts a foreign root property",
-          refusals(verdict(sneaky="x"), schema=base), [])
-    check("the open base accepts a foreign property inside a finding",
-          refusals(verdict(findings=[{"what": "a finding long enough to clear minLength",
-                                      "why": "adr-conventions.md#7", "fix": "name the clause",
-                                      "sneaky": "x"}]), schema=base), [])
-    check("and knows nothing of the enum the repository added",
-          refusals(verdict(findings=[{"what": "a finding long enough to clear minLength",
-                                      "why": "adr-conventions.md#7", "fix": "name the clause",
-                                      "tag": "vibes"}]), schema=base), [])
+    for name, instance in (("a foreign root property", verdict(sneaky="x")),
+                           ("a foreign property in a finding",
+                            verdict(findings=[dict(FINDING, sneaky="x")])),
+                           ("a foreign property in a check entry",
+                            verdict(checks_run=[{"check": "vale", "result": "pass",
+                                                 "sneaky": "x"}])),
+                           ("a value outside an enum the repository added",
+                            verdict(findings=[dict(FINDING, tag="vibes")]))):
+        check(f"the open base accepts {name}", refusals(instance, schema=BARE_BASE), [])
 
 
-# ── the checker keeps the closer where the refusals live ──────────────────────────────────────
+def test_an_unclosed_object_takes_any_property():
+    """Why the rule is every object and not every extension: the root's closer stops at the root.
+    A composition that closes everything but `checks_run` refuses a foreign property in two places
+    and waves it through in the third."""
+    check("the root is closed, so a foreign root property is refused",
+          bool(refusals(verdict(sneaky="x"), checks=False)), True)
+    check("a finding is closed, so a foreign property there is refused",
+          bool(refusals(verdict(findings=[dict(FINDING, sneaky="x")]), checks=False)), True)
+    check("the unclosed check entry takes it",
+          refusals(verdict(checks_run=[{"check": "vale", "result": "pass", "sneaky": "x"}]),
+                   checks=False), [])
 
-def test_a_composition_that_carries_both_closers_is_clean():
-    d = consumer()
-    try:
-        check("both closers present", closer_errors(d), 0)
-    finally:
-        shutil.rmtree(d)
+
+# ── the checker keeps a closer over every object the base leaves open ─────────────────────────
+
+def test_a_composition_that_closes_every_object_is_clean():
+    check("root, finding, check entry and handoff all closed", closer_errors(), [])
 
 
 def test_a_composition_without_the_root_closer_is_an_error():
-    d = consumer(root_closer=False)
-    try:
-        check("a root that closes nothing is reported", closer_errors(d), 1)
-    finally:
-        shutil.rmtree(d)
+    out = closer_errors(root=False)
+    check("a root that closes nothing is reported", len(out), 1)
+    check("and the message says it is the root", "the root composes" in out[0], True)
 
 
-def test_a_composition_without_the_nested_closer_is_an_error():
-    d = consumer(nested_closer=False)
-    try:
-        out = [l for l in errors(d) if "unevaluatedProperties" in l]
-        check("an extended subschema that closes nothing is reported", len(out), 1)
-        check("and the message names the site", "/allOf/1/properties/findings/items" in out[0],
-              True)
-    finally:
-        shutil.rmtree(d)
+def test_a_composition_without_the_finding_closer_is_an_error():
+    out = closer_errors(finding=False)
+    check("an extended object that closes nothing is reported", len(out), 1)
+    check("and the message names the site",
+          "verdict.base.schema.json#/properties/findings/items" in out[0], True)
 
 
-def test_a_subschema_that_adds_nothing_needs_no_closer():
-    """`$ref` alone narrows nothing, so there is nothing for a closer to hold. Reporting it would
-    be a finding a repository can only answer by writing a keyword that changes no outcome."""
-    d = consumer(extend=False, nested_closer=False)
-    try:
-        check("a plain reference is not an extension", closer_errors(d), 0)
-    finally:
-        shutil.rmtree(d)
+def test_a_composition_without_the_check_entry_closer_is_an_error():
+    """The case the instance measurement above pairs with: what validates silently is red here."""
+    out = closer_errors(checks=False)
+    check("an unextended object that closes nothing is reported too", len(out), 1)
+    check("and the message names the site",
+          "verdict.base.schema.json#/properties/checks_run/items" in out[0], True)
+
+
+def test_an_object_the_composition_never_mentions_is_an_error():
+    out = closer_errors(compose_checks=False)
+    check("an object with no subschema over it at all is reported", len(out), 1)
+    check("and the message asks for the subschema, not for a keyword in one that is not there",
+          "nothing here closes" in out[0], True)
+
+
+def test_the_handoff_object_counts_although_it_lives_in_another_file():
+    out = closer_errors(handoffs=False)
+    check("a shape the base pulls in by `$ref` is one of its open objects", len(out), 1)
+    check("and the message names the file that declares it",
+          "handoff.base.schema.json" in out[0], True)
 
 
 if __name__ == "__main__":

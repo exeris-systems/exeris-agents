@@ -29,6 +29,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECK = os.path.join(ROOT, "tools", "agents_file_check.py")
 RUNNER = os.path.join(ROOT, "bundle", "evals", "run.py")
+SCHEMAS = os.path.join(ROOT, "bundle", "schemas")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, main  # noqa: E402  (after the sys.path line it needs)
@@ -323,6 +324,59 @@ def test_the_no_jsonschema_fallback_says_when_it_cannot_validate():
                   mod.validate({"decision": "PASS"}, reachable), [])
         finally:
             sys.modules.clear(); sys.modules.update(real)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_base_ref_resolves_beside_the_base_that_names_it():
+    """The third path defect, and the one this file's second entry above is the pattern for.
+
+    A base has relative `$ref`s of its own — `handoff.base.schema.json`, beside it in the vendored
+    tree — and they were resolved against the COMPOSED schema's directory. That directory is only
+    right for the composition's own references. Worse, the join was relative to relative:
+    `urljoin("../vendor/<pin>/schemas/verdict.base.schema.json", "handoff.base.schema.json")` is
+    `"vendor/<pin>/schemas/handoff.base.schema.json"` — the leading `../` normalised away, a
+    directory no repository has. So a verdict carrying a handoff raised `Unresolvable` out of the
+    grader, and a grader that raises reports nothing at all: not a failed case, a lost run.
+    """
+    import importlib.util
+    d = tempfile.mkdtemp(prefix="baseref-")
+    try:
+        vendor = os.path.join(d, ".agents", "vendor", "exeris-agents-2.0.0")
+        os.makedirs(os.path.join(d, ".git"))
+        shutil.copytree(SCHEMAS, os.path.join(vendor, "schemas"))
+        os.makedirs(os.path.join(vendor, "evals"))
+        shutil.copy(RUNNER, os.path.join(vendor, "evals", "run.py"))
+        base = "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"
+        composed = os.path.join(d, ".agents", "schemas", "verdict.schema.json")
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": base},
+                      {"properties": {"agent": {"enum": ["fixture-reviewer"]}}}],
+            "unevaluatedProperties": False}))
+
+        spec = importlib.util.spec_from_file_location(
+            "evalrun_baseref", os.path.join(vendor, "evals", "run.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def verdict(handoff):
+            return {"agent": "fixture-reviewer", "decision": "PASS", "scope_class": "docs-only",
+                    "findings": [], "checks_run": [{"check": "vale", "result": "pass"}],
+                    "handoffs": [handoff]}
+
+        good = {"from": "fixture-reviewer", "to": "human", "blocking": True,
+                "reason": "the receiving role owns the number"}
+        try:
+            clean = mod.validate(verdict(good), composed)
+            bad = mod.validate(verdict({"from": "fixture-reviewer", "to": "human",
+                                        "blocking": True}), composed)
+        except Exception as exc:                       # the defect: it raised out of the grader
+            check(f"a handoff is graded, not raised on ({type(exc).__name__})", False, True)
+            return
+        check("a well-formed handoff validates", clean, [])
+        check("and a handoff missing `reason` is a graded failure, so the base really applied",
+              bool(bad) and "reason" in bad[0], True)
     finally:
         shutil.rmtree(d)
 

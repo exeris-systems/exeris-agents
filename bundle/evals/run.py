@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -87,12 +89,42 @@ def load_yaml(path: str):
         return yaml.safe_load(fh) or {}
 
 
-def file_registry(schema_path: str):
-    """Resolve `$ref` relative paths from the filesystem, so a composed schema works offline.
+def located(schema: dict, schema_path: str) -> dict:
+    """The schema, carrying the file it was read from as its `$id`.
 
-    A repository schema narrows a vendored base by `allOf` + a relative `$ref`. Nothing here
+    Nothing on disk carries one: an `$id` in a vendored base would make its canonical identifier a
+    URL to fetch or register, which is the whole reason the bases do without. But a validator with
+    no `$id` starts from an empty base URI, and every `$ref` then resolves relative to relative —
+    where the join is not the join anyone means. See `resolvable_from()`. The identifier is
+    supplied here, at read time, out of where the file actually is: it names a location, never
+    something to retrieve.
+    """
+    if not isinstance(schema, dict) or "$id" in schema:
+        return schema
+    return {**schema, "$id": resolvable_from(schema_path)}
+
+
+def resolvable_from(path: str) -> str:
+    """An absolute path as the URI a `$ref` can be joined against.
+
+    A relative base is the trap, and it cost a real failure: with the composed schema's own
+    directory as the base, `urljoin("../vendor/<pin>/schemas/verdict.base.schema.json",
+    "handoff.base.schema.json")` is `"vendor/<pin>/schemas/handoff.base.schema.json"` — the leading
+    `../` is normalised away, the second hop lands in a directory that does not exist, and a
+    verdict carrying a handoff raised `Unresolvable` out of the grader instead of being graded.
+    An absolute `file:` URI joins by the rules the resolver assumes.
+    """
+    return Path(os.path.abspath(path)).as_uri()
+
+
+def file_registry(schema_path: str):
+    """Resolve `$ref` paths from the filesystem, so a composed schema works offline.
+
+    A repository schema narrows a vendored base by `allOf` + a relative `$ref`, and that base has
+    relative `$ref`s of its own — `handoff.base.schema.json`, beside it in the vendored tree. Each
+    resolves against the file that names it, which is what the `file:` URIs here buy. Nothing
     touches the network: agents-md-schema.md rule 8 forbids fetching at runtime, and a bundle is
-    vendored precisely so the base is a file on disk.
+    vendored precisely so every base is a file on disk.
     """
     from referencing import Registry, Resource
     from referencing.jsonschema import DRAFT202012
@@ -102,7 +134,12 @@ def file_registry(schema_path: str):
     def retrieve(uri: str):
         # A `$ref` is a path fragment out of a JSON file, which is the same class of input as
         # `--scenarios` and `schema_dir`. Three of those were guarded and this one was not.
-        target = uri if os.path.isabs(uri) else os.path.normpath(os.path.join(base_dir, uri))
+        if uri.startswith("file:"):
+            target = unquote(urlparse(uri).path)
+        elif os.path.isabs(uri):
+            target = uri
+        else:
+            target = os.path.normpath(os.path.join(base_dir, uri))
         target = within_repo(target, f"$ref '{uri}'")
         with open(target, encoding="utf-8") as fh:
             return Resource.from_contents(json.load(fh), default_specification=DRAFT202012)
@@ -138,7 +175,8 @@ def validate(instance, schema_path: str) -> list[str]:
                 for k in missing]
     schema = json.load(open(schema_path, encoding="utf-8"))
     try:
-        v = jsonschema.Draft202012Validator(schema, registry=file_registry(schema_path))
+        v = jsonschema.Draft202012Validator(located(schema, schema_path),
+                                            registry=file_registry(schema_path))
     except (ImportError, TypeError):
         v = jsonschema.Draft202012Validator(schema)
     return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"

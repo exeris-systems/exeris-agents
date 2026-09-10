@@ -4,8 +4,12 @@ All notable changes to the Exeris agent bundle. Keep a Changelog 1.1, SemVer, AD
 
 Versioning, stated precisely because the earlier wording licensed a wrong reading:
 
-- **MAJOR** — the contract moves under a repository that was following it: a new required field, a
-  removed or renamed manifest key, a changed vendored layout, a removed or renamed CLI flag.
+- **MAJOR** — the change requires work of a repository that was already conforming, whichever
+  direction the text moved. Tightening does it: a new required field, a removed or renamed manifest
+  key, a changed vendored layout, a removed or renamed CLI flag. So does relaxing: a base that
+  stops constraining leaves every composing schema accepting what it used to refuse, and only the
+  repository can put the refusal back. The work a conforming consumer must do decides this, not
+  whether the contract grew or shrank.
 - **MINOR** — a new check, policy or schema field. A new check *can* turn a green build red, but
   only where the repository was already not conforming: that is the check catching up with a rule
   that already bound, not the contract moving. This is how check tooling is versioned everywhere,
@@ -26,26 +30,31 @@ the added field is refused; with `unevaluatedProperties: false` in the base it i
 identically, since that keyword sees only the annotations of its own schema object and its in-place
 applicators and never a sibling `allOf` branch in the composing schema — it reads like the fix and
 is not; with no closer in the base at all, the added field validates and a foreign one is still
-refused, at the root and inside a finding, by the composition.
+refused, by the composition.
 
 **MAJOR by relaxation.** Nothing here adds a required field, renames a key or moves the vendored
 layout. The base alone becomes more permissive, and that is the sharper direction: a repository
 that bumps and changes nothing keeps a schema which now accepts any property, with nothing going
-red. That is the contract moving under a repository that was following it, which is what MAJOR is
-for.
+red. The preamble above says what that costs a conforming consumer, which is what decides the
+number.
 
 ### Breaking
 
-- **The bases no longer refuse a foreign property on their own.** `verdict.base.schema.json` (its
-  root and each `findings` item), `handoff.base.schema.json` and `triage-result.base.schema.json`
-  (their roots) declare neither `additionalProperties` nor `unevaluatedProperties`. Each file's
-  `description` now says so, and says where the closer belongs, because it is the thing a later
-  reader would otherwise put back.
-- **What a consumer must add**: `"unevaluatedProperties": false` at the root of every schema that
-  `$ref`s a base, and again inside any subschema that both `$ref`s a shape from the base and
-  extends it — a finding, for instance. The closer sees only what its own object composes, so it
-  belongs in the same object as the extension. `agents_file_check.py` reports a composition that
-  carries neither, so the work is named rather than waited for.
+- **The bases refuse nothing on their own.** No object in `verdict.base.schema.json`,
+  `handoff.base.schema.json` or `triage-result.base.schema.json` declares `additionalProperties` or
+  `unevaluatedProperties` — not a root, not a finding, not a check entry, not a validation gate.
+  Each file's `description` says so and says where the closers belong, because that is the thing a
+  later reader would otherwise put back.
+- **What a consumer must add: one closer per object, not one per schema.**
+  `"unevaluatedProperties": false` at the root of every schema that `$ref`s a base, and again in a
+  subschema over every object that base leaves open. A verdict composition closes four: its root,
+  a `findings` item, a `checks_run` item, and a `handoffs` item — the last declared in
+  `handoff.base.schema.json`, one file over, and open all the same. `unevaluatedProperties` stops
+  at the object it sits in, so a root closer leaves every array item taking any property; measured,
+  a composition closing only its root refuses a foreign property at the root and admits one in a
+  check entry. An object the repository does not extend still needs a subschema of its own,
+  carrying the `$ref` and the closer. `agents_file_check.py` names every object left open, so the
+  work is enumerated rather than discovered.
 - **The root closer can be added before the bump.** Over 1.4.0's closed base it changes no outcome:
   a conforming instance still validates and a foreign root property is still refused, by the base.
   An extension cannot be added early — 1.4.0's base refuses the added field, which is the whole
@@ -53,22 +62,37 @@ for.
 
 ### Added
 
-- `agents_file_check.py`: a composition over a bundle base that carries no
-  `unevaluatedProperties: false` is an error — at the root, and in every subschema where it extends
-  a shape the bundle owns. Without it, bumping the bundle and changing nothing is a silent loss of
-  enforcement, which is the failure this release would otherwise ship. A composition is recognised
-  by where its `$ref` resolves — into the vendored tree `_compose` already defines — rather than by
-  a filename, so a repository that renames a schema does not quietly stop being checked.
-- `tests/test_schema_closers.py`, run in CI: what a composition over the open base refuses and what
-  the bare base no longer does, and the checker's answer to a composition missing either closer.
-  The instance cases are graded through `bundle/evals/run.py`'s own `validate()`, so what is
-  exercised is the grader a consumer's evals run.
+- `agents_file_check.py`: a composed schema must close every object its bundle base leaves open,
+  at the root and over each nested one, and each object it does not close is an error naming that
+  object. Without the check, bumping the bundle and changing nothing is a silent loss of
+  enforcement — the failure this release would otherwise ship. A composition is recognised by where
+  its `$ref` resolves — into the vendored tree `_compose` already defines — rather than by a
+  filename, so a repository that renames a schema does not quietly stop being checked, and both
+  spellings of one object (`verdict.base#/properties/handoffs/items` and `handoff.base` itself)
+  count as closing it once. The objects are read out of the vendored base, so a repository still
+  pinning 1.4.0 stays green and goes red when it re-vendors — measured on a copy of `exeris-docs`:
+  0 findings on its current pin, 8 the moment 2.0.0 is vendored in.
+- `tests/test_schema_closers.py`, run in CI: what a composition over the open bases refuses, what
+  the bare base no longer does, what an unclosed object admits, and the checker's answer to every
+  closer removed in turn. The instance cases are graded through `bundle/evals/run.py`'s own
+  `validate()`, so what is exercised is the grader a consumer's evals run.
+
+### Fixed
+
+- **The eval grader raised instead of grading whenever a verdict carried a handoff.** `$ref`s were
+  resolved against the composed schema's directory, so the base's own relative reference to
+  `handoff.base.schema.json` was joined onto a relative base URI — and `urljoin` normalises the
+  leading `../` away, landing in a directory that does not exist. Every verdict or triage result
+  with a non-empty `handoffs` / `secondary_handoffs` ended the run with `Unresolvable` rather than
+  a graded failure. The schema is now identified by the file it was read from, so each `$ref`
+  resolves next to the file that names it. Latent since 1.0.0 and fixed here because this release
+  makes that path the one every evaluation takes.
 
 ### Changed
 
 - An eval case that named a base schema in `expect.schema` was validating against the shape that
   now refuses nothing. Point it at the repository's composed schema: the base accepts a foreign
-  property, a foreign property inside a finding, and a value outside an enum the repository added.
+  property anywhere, and a value outside any enum the repository added.
 
 ## [1.4.0] - 2026-09-09
 

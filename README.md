@@ -47,14 +47,25 @@ and a repository's schema narrows a base one instead of copying it:
 ```json
 { "allOf": [
     { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json" },
-    { "properties": { "agent": { "enum": ["my-repo-reviewer"] } } } ],
+    { "properties": {
+        "agent": { "enum": ["my-repo-reviewer"] },
+        "findings": { "items": {
+          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/findings/items",
+          "unevaluatedProperties": false } },
+        "checks_run": { "items": {
+          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/checks_run/items",
+          "unevaluatedProperties": false } },
+        "handoffs": { "items": {
+          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/handoffs/items",
+          "unevaluatedProperties": false } } } } ],
   "unevaluatedProperties": false }
 ```
 
-The closer is the composition's, not the base's: a base that closes itself cannot be extended, and
-each base's `description` says so and says where the closer belongs. Without it the schema
-accepts any property at all, so `agents_file_check.py` reports a composition that carries none —
-at its root, and inside any subschema that extends a shape the bundle owns.
+One closer per object, and the base carries none: a base that closes itself cannot be extended, and
+each base's `description` says where its closers belong. `unevaluatedProperties` stops at the
+object it sits in — a closer at the root does not reach into an array's items — so a schema that
+closes only its root still accepts any property inside a finding, a check entry or a handoff.
+`agents_file_check.py` names every object a composition leaves open.
 
 ## Verifying it
 
@@ -77,11 +88,11 @@ been read.
 
 ## Versioning
 
-SemVer over the **contract**. MAJOR is the contract moving under a repository that was following
-it — a new required field, a removed or renamed manifest key, a changed vendored layout. A new
-check is MINOR even when it turns a build red, because it does that only where the repository was
-already not conforming. Wording is PATCH. A `### Breaking` section is mandatory in every release
-(ADR-085 §H.27), so its presence never implies MAJOR — its content does. See [`CHANGELOG.md`](CHANGELOG.md).
+SemVer over the **contract**, and the three cases are stated once, in
+[`CHANGELOG.md`](CHANGELOG.md)'s preamble — the file that ships with the package and the one a
+consumer reads when deciding whether a bump is safe. A `### Breaking` section is mandatory in every
+release (ADR-085 §H.27), so its presence never implies MAJOR — its content, against those cases,
+does.
 
 ## Licence
 

@@ -471,8 +471,8 @@ def subschemas(node, pointer: str = ""):
             yield from subschemas(v, f"{pointer}/{i}")
 
 
-def into_the_bundle(ref: str, schema_dir: str, vendor_root: str | None) -> bool:
-    """True when this `$ref` lands in the vendored bundle tree.
+def ref_target(ref: str, from_dir: str, vendor_root: str | None):
+    """`(path, pointer)` for a `$ref` that lands in the vendored bundle tree, else None.
 
     A composition is recognised by where its reference resolves, not by a filename: `.base.` in a
     target's name is a convention the bundle happens to follow, and a repository that renamed one
@@ -481,59 +481,169 @@ def into_the_bundle(ref: str, schema_dir: str, vendor_root: str | None) -> bool:
     With nothing pinned, `.agents/vendor/` still names that tree — an unpinned import is reported
     by check_pinned_bundle, and a schema composing over it is no less a composition meanwhile.
     """
-    if ref.startswith("#") or ref.startswith(("http://", "https://")):
-        return False
-    target = os.path.normpath(os.path.join(schema_dir, ref.split("#", 1)[0]))
-    return _compose.contained(vendor_root or _compose.VENDOR, target) is not None
+    if not isinstance(ref, str) or ref.startswith("#") or ref.startswith(("http://", "https://")):
+        return None
+    path, _, pointer = ref.partition("#")
+    target = os.path.normpath(os.path.join(from_dir, path))
+    if _compose.contained(vendor_root or _compose.VENDOR, target) is None:
+        return None
+    return target, pointer
 
 
-# Keywords that carry no constraint of their own, so a node holding only these alongside its
-# reference has narrowed nothing and has nothing to close.
-INERT = {"$ref", "allOf", "$schema", "$id", "title", "description", "$comment",
+def node_at(doc, pointer: str):
+    """The node a JSON pointer names, or None."""
+    node = doc
+    for part in pointer.split("/")[1:]:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        elif isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return None
+    return node
+
+
+# Keywords that constrain nothing on their own, so a node carrying only these beside its `$ref` is
+# a plain alias for what it names rather than a shape of its own.
+INERT = {"$ref", "$schema", "$id", "title", "description", "$comment",
          "unevaluatedProperties", "additionalProperties"}
 
 
-def composes(node: dict, schema_dir: str, vendor_root: str | None) -> bool:
-    """The node pulls a bundle shape in at its own level — its own `$ref`, or an `allOf` branch
-    that is one. That is the composition idiom rule 13 prescribes and the README documents."""
-    refs = [node.get("$ref")] + [b.get("$ref") for b in (node.get("allOf") or [])
-                                 if isinstance(b, dict)]
-    return any(isinstance(r, str) and into_the_bundle(r, schema_dir, vendor_root) for r in refs)
+def alias(node) -> str | None:
+    """The `$ref` of a node that only forwards, or None."""
+    if isinstance(node, dict) and isinstance(node.get("$ref"), str) and not set(node) - INERT:
+        return node["$ref"]
+    return None
 
 
-def extends(node: dict) -> bool:
-    """The node adds to the shape it pulled in: a constraining sibling, or a second `allOf`
-    branch that constrains."""
-    if any(k not in INERT for k in node):
-        return True
-    return any(set(b) - INERT for b in (node.get("allOf") or []) if isinstance(b, dict))
+def load_schema(path: str):
+    import json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None      # a missing or broken target is already reported as a bad $ref
 
 
-def check_closers(rep: Report, rel: str, schema: dict, schema_dir: str, vendor_root: str | None):
-    """A composition over a bundle base closes what the base leaves open.
+def site(path: str, pointer: str, vendor_root: str | None, seen=None):
+    """One identity for one object, whichever spelling reached it.
 
-    The bases declare no `additionalProperties` and no `unevaluatedProperties`, because a base that
-    closes itself cannot be extended — and `unevaluatedProperties: false` in the base refuses an
-    added field just as flatly, since it sees only the annotations of its own schema object and its
-    in-place applicators, never a sibling `allOf` branch here. So the refusal lives in the
-    composition or nowhere, and "nowhere" is the state a repository lands in by bumping the bundle
-    and changing nothing: a contract that accepts any property, with no check red.
+    `verdict.base#/properties/handoffs/items` forwards to `handoff.base.schema.json`, and a
+    composition may close that object by either spelling. Both normalise here, so closing it once
+    counts once.
+    """
+    seen = seen if seen is not None else set()
+    real = os.path.realpath(path)
+    if (real, pointer) in seen:
+        return real, pointer
+    seen.add((real, pointer))
+    doc = load_schema(path)
+    node = doc if not pointer else node_at(doc, pointer)
+    ref = alias(node)
+    if ref:
+        onward = ref_target(ref, os.path.dirname(path), vendor_root)
+        if onward:
+            return site(onward[0], onward[1], vendor_root, seen)
+    return real, pointer
+
+
+def open_objects(path: str, vendor_root: str | None, seen=None):
+    """Every object a base leaves open, as normalised sites.
+
+    An object is what the base declares with `"type": "object"`; open is one carrying neither
+    closer. The walk follows a forwarding `$ref` into another base file, because `handoffs` is an
+    object of the verdict contract even though it is declared one file over — and an object nobody
+    closes accepts any property whatever the root does.
+    """
+    seen = seen if seen is not None else set()
+    real = os.path.realpath(path)
+    if real in seen:
+        return []
+    seen.add(real)
+    doc = load_schema(path)
+    if not isinstance(doc, dict):
+        return []
+    found = []
+    for pointer, node in subschemas(doc):
+        if not isinstance(node, dict):
+            continue
+        ref = alias(node)
+        if ref:
+            onward = ref_target(ref, os.path.dirname(path), vendor_root)
+            if onward and onward[0] != path:
+                found += open_objects(onward[0], vendor_root, seen)
+        elif node.get("type") == "object" and node.get("additionalProperties") is not False \
+                and node.get("unevaluatedProperties") is not False:
+            found.append(site(path, pointer, vendor_root))
+    return list(dict.fromkeys(found))
+
+
+def composed_over(schema, schema_dir: str, vendor_root: str | None):
+    """Which bundle objects this schema pulls in: site -> (closed?, where it says so)."""
+    pulled: dict = {}
+    for pointer, node in subschemas(schema):
+        if not isinstance(node, dict):
+            continue
+        refs = [node.get("$ref")] + [b.get("$ref") for b in node.get("allOf") or []
+                                     if isinstance(b, dict)]
+        closed = node.get("unevaluatedProperties") is False
+        for ref in refs:
+            target = ref_target(ref, schema_dir, vendor_root)
+            if not target:
+                continue
+            key = site(target[0], target[1], vendor_root)
+            was, where = pulled.get(key, (False, pointer))
+            pulled[key] = (was or closed, where if was or not closed else pointer)
+    return pulled
+
+
+def check_closers(rep: Report, rel: str, schema, schema_dir: str, vendor_root: str | None):
+    """A composition closes every object the base leaves open.
+
+    The bases close nothing: a base that closes itself cannot be extended, and
+    `unevaluatedProperties: false` in the base refuses an added field just as flatly, since it sees
+    only the annotations of its own schema object and its in-place applicators, never a sibling
+    `allOf` branch here. So the refusal lives in the composition or nowhere, and "nowhere" is what
+    a repository gets by bumping the bundle and changing nothing: a contract that accepts any
+    property, with no check red.
+
+    Every object, not only the ones the composition extends — a closer at the root does not reach
+    into an array's items, so an unclosed `checks_run` entry takes any property however tightly the
+    root is closed. What the composition does with an object only decides the wording: it either
+    already has a subschema over it and is missing the keyword, or it has no subschema there at all
+    and needs one carrying the `$ref` and the closer.
+
+    What is read is the base that is actually vendored, so a repository pinning a bundle whose
+    bases still close themselves stays green and turns red on the bump — the moment the enforcement
+    really moves, and not before.
     """
     if not isinstance(schema, dict):
         return
-    for pointer, node in subschemas(schema):
-        if not composes(node, schema_dir, vendor_root):
+    pulled = composed_over(schema, schema_dir, vendor_root)
+    if not pulled:
+        return
+    # One report per object, not per base that reaches it: `handoffs` is an open object of the
+    # verdict base and the root object of the handoff base, and a composition closes it once.
+    required = dict.fromkeys(target for base in dict.fromkeys(path for path, _ in pulled)
+                             for target in open_objects(base, vendor_root))
+    for target in required:
+        closed, where = pulled.get(target, (False, None))
+        if closed:
             continue
-        if pointer and not extends(node):
-            continue
-        if node.get("unevaluatedProperties") is False:
-            continue
-        where = ("at its root" if not pointer else
-                 f"in the object at '{pointer}', where the extension is")
-        rep.error(rel, f"composes over a bundle base but carries no `unevaluatedProperties: false` "
-                       f"{where} — the base is open and the composition is what closes it, so as "
-                       f"written this schema accepts any property the base does not name "
-                       f"(rule 13)", rule="schema")
+        named = os.path.relpath(target[0]) + ("#" + target[1] if target[1]
+                                              else " (its root object)")
+        if where is None:
+            rep.error(rel, f"nothing here closes {named}, which the base leaves open — a "
+                           f"composition closes every object it pulls in, and a closer at the "
+                           f"root does not reach into an array's items. Add a subschema over "
+                           f"that object carrying its `$ref` and `unevaluatedProperties: "
+                           f"false` (rule 13)", rule="schema")
+        else:
+            rep.error(rel, f"{'the root' if not where else chr(39) + where + chr(39)} composes "
+                           f"{named} and carries no `unevaluatedProperties: false` — the closer "
+                           f"sees only what its own object composes, so it belongs in that "
+                           f"same object (rule 13)", rule="schema")
 
 
 def check_schemas(rep: Report, vendor_root: str | None = None):
