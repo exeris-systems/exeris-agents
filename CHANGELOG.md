@@ -18,6 +18,58 @@ above, decides the number.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-10
+
+The base schemas stop closing themselves, because a composing schema cannot add a property to a
+base that does. Three shapes, measured side by side: with `additionalProperties: false` in the base
+the added field is refused; with `unevaluatedProperties: false` in the base it is refused
+identically, since that keyword sees only the annotations of its own schema object and its in-place
+applicators and never a sibling `allOf` branch in the composing schema — it reads like the fix and
+is not; with no closer in the base at all, the added field validates and a foreign one is still
+refused, at the root and inside a finding, by the composition.
+
+**MAJOR by relaxation.** Nothing here adds a required field, renames a key or moves the vendored
+layout. The base alone becomes more permissive, and that is the sharper direction: a repository
+that bumps and changes nothing keeps a schema which now accepts any property, with nothing going
+red. That is the contract moving under a repository that was following it, which is what MAJOR is
+for.
+
+### Breaking
+
+- **The bases no longer refuse a foreign property on their own.** `verdict.base.schema.json` (its
+  root and each `findings` item), `handoff.base.schema.json` and `triage-result.base.schema.json`
+  (their roots) declare neither `additionalProperties` nor `unevaluatedProperties`. Each file's
+  `description` now says so, and says where the closer belongs, because it is the thing a later
+  reader would otherwise put back.
+- **What a consumer must add**: `"unevaluatedProperties": false` at the root of every schema that
+  `$ref`s a base, and again inside any subschema that both `$ref`s a shape from the base and
+  extends it — a finding, for instance. The closer sees only what its own object composes, so it
+  belongs in the same object as the extension. `agents_file_check.py` reports a composition that
+  carries neither, so the work is named rather than waited for.
+- **The root closer can be added before the bump.** Over 1.4.0's closed base it changes no outcome:
+  a conforming instance still validates and a foreign root property is still refused, by the base.
+  An extension cannot be added early — 1.4.0's base refuses the added field, which is the whole
+  reason for this release.
+
+### Added
+
+- `agents_file_check.py`: a composition over a bundle base that carries no
+  `unevaluatedProperties: false` is an error — at the root, and in every subschema where it extends
+  a shape the bundle owns. Without it, bumping the bundle and changing nothing is a silent loss of
+  enforcement, which is the failure this release would otherwise ship. A composition is recognised
+  by where its `$ref` resolves — into the vendored tree `_compose` already defines — rather than by
+  a filename, so a repository that renames a schema does not quietly stop being checked.
+- `tests/test_schema_closers.py`, run in CI: what a composition over the open base refuses and what
+  the bare base no longer does, and the checker's answer to a composition missing either closer.
+  The instance cases are graded through `bundle/evals/run.py`'s own `validate()`, so what is
+  exercised is the grader a consumer's evals run.
+
+### Changed
+
+- An eval case that named a base schema in `expect.schema` was validating against the shape that
+  now refuses nothing. Point it at the repository's composed schema: the base accepts a foreign
+  property, a foreign property inside a finding, and a value outside an enum the repository added.
+
 ## [1.4.0] - 2026-09-09
 
 Seven findings from an xhigh review of `exeris-kernel`'s v2 migration, all in the executable layer,

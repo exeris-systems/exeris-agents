@@ -40,6 +40,12 @@ jobs:
       # review environment is in on every bump.
       - name: Hook dispatcher regression suite
         run: python tests/test_dispatch.py
+      # From 2.0.0 the bases close nothing and the composition closes everything, so the refusals
+      # a consumer relies on live in a schema this repository does not hold. This suite builds one
+      # and measures both halves: what the composition refuses, and what the checker says when a
+      # composition carries no closer.
+      - name: Schema closer regression suite
+        run: python tests/test_schema_closers.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'

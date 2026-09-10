@@ -460,8 +460,85 @@ def refs_in(node):
             yield from refs_in(v)
 
 
-def check_schemas(rep: Report):
-    """rule 13 — the decision handoffs are real, valid JSON Schema."""
+def subschemas(node, pointer: str = ""):
+    """Every object node in a schema, with the JSON pointer that names it."""
+    if isinstance(node, dict):
+        yield pointer, node
+        for k, v in node.items():
+            yield from subschemas(v, f"{pointer}/{k}")
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from subschemas(v, f"{pointer}/{i}")
+
+
+def into_the_bundle(ref: str, schema_dir: str, vendor_root: str | None) -> bool:
+    """True when this `$ref` lands in the vendored bundle tree.
+
+    A composition is recognised by where its reference resolves, not by a filename: `.base.` in a
+    target's name is a convention the bundle happens to follow, and a repository that renamed one
+    would silently stop being checked. `_compose` owns the one definition of the vendored root, so
+    the checker cannot disagree with the renderer about which tree the bundle's shapes live in.
+    With nothing pinned, `.agents/vendor/` still names that tree — an unpinned import is reported
+    by check_pinned_bundle, and a schema composing over it is no less a composition meanwhile.
+    """
+    if ref.startswith("#") or ref.startswith(("http://", "https://")):
+        return False
+    target = os.path.normpath(os.path.join(schema_dir, ref.split("#", 1)[0]))
+    return _compose.contained(vendor_root or _compose.VENDOR, target) is not None
+
+
+# Keywords that carry no constraint of their own, so a node holding only these alongside its
+# reference has narrowed nothing and has nothing to close.
+INERT = {"$ref", "allOf", "$schema", "$id", "title", "description", "$comment",
+         "unevaluatedProperties", "additionalProperties"}
+
+
+def composes(node: dict, schema_dir: str, vendor_root: str | None) -> bool:
+    """The node pulls a bundle shape in at its own level — its own `$ref`, or an `allOf` branch
+    that is one. That is the composition idiom rule 13 prescribes and the README documents."""
+    refs = [node.get("$ref")] + [b.get("$ref") for b in (node.get("allOf") or [])
+                                 if isinstance(b, dict)]
+    return any(isinstance(r, str) and into_the_bundle(r, schema_dir, vendor_root) for r in refs)
+
+
+def extends(node: dict) -> bool:
+    """The node adds to the shape it pulled in: a constraining sibling, or a second `allOf`
+    branch that constrains."""
+    if any(k not in INERT for k in node):
+        return True
+    return any(set(b) - INERT for b in (node.get("allOf") or []) if isinstance(b, dict))
+
+
+def check_closers(rep: Report, rel: str, schema: dict, schema_dir: str, vendor_root: str | None):
+    """A composition over a bundle base closes what the base leaves open.
+
+    The bases declare no `additionalProperties` and no `unevaluatedProperties`, because a base that
+    closes itself cannot be extended — and `unevaluatedProperties: false` in the base refuses an
+    added field just as flatly, since it sees only the annotations of its own schema object and its
+    in-place applicators, never a sibling `allOf` branch here. So the refusal lives in the
+    composition or nowhere, and "nowhere" is the state a repository lands in by bumping the bundle
+    and changing nothing: a contract that accepts any property, with no check red.
+    """
+    if not isinstance(schema, dict):
+        return
+    for pointer, node in subschemas(schema):
+        if not composes(node, schema_dir, vendor_root):
+            continue
+        if pointer and not extends(node):
+            continue
+        if node.get("unevaluatedProperties") is False:
+            continue
+        where = ("at its root" if not pointer else
+                 f"in the object at '{pointer}', where the extension is")
+        rep.error(rel, f"composes over a bundle base but carries no `unevaluatedProperties: false` "
+                       f"{where} — the base is open and the composition is what closes it, so as "
+                       f"written this schema accepts any property the base does not name "
+                       f"(rule 13)", rule="schema")
+
+
+def check_schemas(rep: Report, vendor_root: str | None = None):
+    """rule 13 — the decision handoffs are real, valid JSON Schema, and a composition over a
+    vendored base carries the closer the base leaves to it."""
     import json
     d = os.path.join(".agents", "schemas")
     if not os.path.isdir(d):
@@ -498,6 +575,7 @@ def check_schemas(rep: Report):
             target = os.path.normpath(os.path.join(d, ref.split("#", 1)[0]))
             if not os.path.exists(target):
                 rep.error(rel, f"$ref target does not exist: {ref}", rule="schema")
+        check_closers(rep, rel, schema, d, vendor_root)
         if Validator is None:
             rep.warning(rel, "jsonschema is not installed; only JSON syntax was checked",
                         rule="schema")
@@ -870,7 +948,7 @@ def main():
             check_profile(os.path.join(profiles, name), rep, declared_v2, ctx)
         check_no_lowercase_agent_md(rep, declared_v2)
         check_workflows(rep, profile_names, skill_names)
-        check_schemas(rep)
+        check_schemas(rep, ctx["vendor_root"])
 
         manifest: dict = {}
         if os.path.exists(manifest_path):

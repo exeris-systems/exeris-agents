@@ -22,7 +22,7 @@ what is true; this repository is what makes it run.**
 
 ```bash
 # once, when choosing a version — the network is used here, by a human, and nowhere else
-python3 tools/agents_bundle.py vendor --root ../my-repo --from . --version 1.0.0 --ref <sha>
+python3 tools/agents_bundle.py vendor --root ../my-repo --from . --version 2.0.0 --ref <sha>
 ```
 
 It prints the pin to paste into `.agents/manifest.yaml`:
@@ -30,7 +30,7 @@ It prints the pin to paste into `.agents/manifest.yaml`:
 ```yaml
 imports:
   - bundle: exeris-agents
-    version: 1.0.0
+    version: 2.0.0
     ref: <full commit sha>
     sha256: sha256:<digest over every vendored byte>
 ```
@@ -46,9 +46,15 @@ and a repository's schema narrows a base one instead of copying it:
 
 ```json
 { "allOf": [
-    { "$ref": "../vendor/exeris-agents-1.0.0/schemas/verdict.base.schema.json" },
-    { "properties": { "agent": { "enum": ["my-repo-reviewer"] } } } ] }
+    { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json" },
+    { "properties": { "agent": { "enum": ["my-repo-reviewer"] } } } ],
+  "unevaluatedProperties": false }
 ```
+
+The closer is the composition's, not the base's: a base that closes itself cannot be extended, and
+each base's `description` says so and says where the closer belongs. Without it the schema
+accepts any property at all, so `agents_file_check.py` reports a composition that carries none —
+at its root, and inside any subschema that extends a shape the bundle owns.
 
 ## Verifying it
 
