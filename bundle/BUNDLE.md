@@ -22,10 +22,23 @@ the version is chosen.
 | Path | What it is | Who reads it |
 |:--|:--|:--|
 | `policies/` | Organisation-wide constraints. A repository may restrict further, never relax. | every role, through its `policies: [bundle:<name>]` |
-| `schemas/*.base.schema.json` | The decision handoffs, minus the role vocabulary. | the repository's own schemas, by `$ref` + `allOf` |
+| `schemas/*.base.schema.json` | The decision handoffs, minus the role vocabulary **and minus every closer** — see below. | the repository's own schemas, by `$ref` + `allOf`, plus one `unevaluatedProperties: false` per object |
 | `hooks/bin/hook.py` | The L0 dispatcher. Carries no patterns: it reads the repository's own `hooks.yaml` at runtime. | `hooks/bin/dispatch.py`, on every hook event |
 | `hooks/bin/dispatch.py` | A version-free shim, copied by the renderer to `.agents/hooks/bin/dispatch.py`. It reads the pin from `manifest.yaml` and hands off to the `hook.py` above, so the rendered command never carries a version and a stale adapter still finds the current tree. | every rendered vendor hook config |
 | `evals/run.py`, `evals/eval-rubric.md` | The runtime-independent eval runner and the rubric for its prose residue. | `.agents/evals/scenarios.yaml` |
+
+## What a schema here costs you
+
+From 2.0.0 these bases refuse nothing on their own. A base that closes itself cannot be extended,
+so the closing belongs to the schema that composes it — and to every object in it, because a
+closer at the root does not reach into an array's items: with `checks_run` left open, an instance
+may put anything inside a check entry however tightly the root is closed. A verdict composition
+closes four objects: its root, a `findings` item, a `checks_run` item and a `handoffs` item.
+
+That is the migration cost of vendoring 2.0.0, and it is the whole of it. Why the bases are open
+and where each closer belongs is written in each base's own `description`, next to the shape it
+describes; `agents_file_check.py` adds a property to a probe and names every location where
+nothing refused it, so the list of what is left to do comes from a run rather than from reading.
 
 Not vendored, and deliberately: `tools/` — the renderer, the checker and this materialiser. They
 run in CI from a checkout of the bundle repository at a pinned ref. Copying executable tooling into

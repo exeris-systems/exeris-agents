@@ -16,8 +16,15 @@ Two halves, and each is worthless without the other:
     only in the composed schema. `test_the_bare_base_refuses_nothing` says how little is left
     without it, and is why the instance cases here are graded against a composition rather than
     against `verdict.base.schema.json`;
-  * `agents_file_check.py` is what keeps the closers there. Without that rule a repository bumps
-    the bundle, changes nothing, and gets an open contract with no check red.
+  * `agents_file_check.py` is what keeps the closers there, and it asks the same question the same
+    way: it adds a property to a probe and reports the locations where nothing refuses it.
+
+The last section is one case per cause of the three review rounds this check spent being a walker
+that re-derived what a validator already knows. Each of those defects had a shape — a composition
+under `$defs`, an object declared without `type`, a base that closes what it forwards, a property
+name a pointer must escape, a shape reached through another file, a reference into a tree the
+manifest does not pin — and each is here because the mechanism that answered them by reading
+syntax answered at least one of them wrongly.
 
 The instances are graded by `bundle/evals/run.py`'s own `validate()`, loaded from where vendoring
 puts it, so what is exercised is the grader a consumer's evals actually run.
@@ -172,16 +179,32 @@ def errors(repo: str) -> list[str]:
     return [l for l in proc.stdout.splitlines() if l.startswith("::error")]
 
 
+OPEN_AT = "may carry any property at "
+
+
+def open_locations(repo: str) -> list[str]:
+    """The instance locations the checker says nothing refuses a property at."""
+    return sorted(l.split(OPEN_AT, 1)[1].split(" ", 1)[0] for l in errors(repo) if OPEN_AT in l)
+
+
 def closer_errors(**shape) -> list[str]:
     d = consumer(**shape)
     try:
-        return [l for l in errors(d) if "unevaluatedProperties" in l]
+        return open_locations(d)
+    finally:
+        shutil.rmtree(d)
+
+
+def open_locations_for(composed: dict, **kwargs) -> list[str]:
+    d = custom(composed, **kwargs)
+    try:
+        return open_locations(d)
     finally:
         shutil.rmtree(d)
 
 
 def custom(composed: dict, *, vendored: dict | None = None, pin: str = "2.0.0",
-           name: str = "verdict.schema.json") -> str:
+           name: str = "verdict.schema.json", manifest: str | None = None) -> str:
     """A consumer with a composed schema of the case's own making, and optionally its own bases.
 
     The standard fixture above answers "does the rule hold for the real bundle". These cases ask
@@ -204,8 +227,9 @@ def custom(composed: dict, *, vendored: dict | None = None, pin: str = "2.0.0",
     with open(os.path.join(d, "AGENTS.md"), "w", encoding="utf-8") as fh:
         fh.write("# fixture\n\nPoints at `.agents/` for the semantics.\n")
     with open(os.path.join(d, ".agents", "manifest.yaml"), "w", encoding="utf-8") as fh:
-        fh.write(MANIFEST.replace("verdict.schema.json", name).replace("2.0.0", pin, 1)
-                 if pin != "2.0.0" else MANIFEST.replace("verdict.schema.json", name))
+        body = manifest or MANIFEST
+        fh.write(body.replace("verdict.schema.json", name) if pin == "2.0.0"
+                 else body.replace("verdict.schema.json", name).replace("2.0.0", pin, 1))
     with open(os.path.join(d, ".agents", "schemas", name), "w", encoding="utf-8") as fh:
         json.dump(composed, fh, indent=2)
     return d
@@ -232,17 +256,23 @@ def stray(closed_base: bool) -> str:
     `closed_base` is what the old tree holds. A bundle whose bases still close themselves leaves
     nothing for the closer rule to say, which is the case that has to be heard from anyway.
     """
-    base = ({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
-             "additionalProperties": False, "properties": {"agent": {"type": "string"}}}
-            if closed_base else
-            json.load(open(os.path.join(SCHEMAS, "verdict.base.schema.json"), encoding="utf-8")))
+    if closed_base:
+        vendored = {STALE: {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                            "type": "object", "additionalProperties": False,
+                            "properties": {"agent": {"type": "string"}}}}
+    else:
+        # A whole vendored tree, not one file: the base references its neighbours, and a stale tree
+        # missing them would be measuring a broken checkout rather than a stale pin.
+        vendored = {f"exeris-agents-1.4.0/schemas/{name}":
+                    json.load(open(os.path.join(SCHEMAS, name), encoding="utf-8"))
+                    for name in sorted(os.listdir(SCHEMAS))}
     return custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
                    "allOf": [{"$ref": f"../vendor/{STALE}"}]},
-                  vendored={STALE: base})
+                  vendored=vendored)
 
 
 def off_pin(out: list[str]) -> list[str]:
-    return [f for f in out if "does not pin" in f]
+    return [f for f in out if "no import in the manifest pins" in f]
 
 
 def test_a_ref_into_an_unpinned_vendored_tree_is_not_a_skip():
@@ -253,9 +283,9 @@ def test_a_ref_into_an_unpinned_vendored_tree_is_not_a_skip():
     out = findings_for(stray(closed_base=False))
     check("composing over a vendored tree the manifest does not pin is reported",
           len(off_pin(out)), 1)
-    check("and the objects behind it are still required to be closed — an instance is validated "
+    check("and the objects behind it are still asked the question — an instance is validated "
           "against them whichever tree they were reached through",
-          sum(1 for f in out if "unevaluatedProperties" in f) > 0, True)
+          sum(1 for f in out if OPEN_AT in f) > 0, True)
 
 
 def test_a_stray_reference_is_heard_from_with_nothing_else_wrong():
@@ -275,7 +305,7 @@ def test_a_stray_reference_is_reported_once_beside_a_closure_problem():
     check("one annotation for the stray tree, not one per check that noticed",
           len(off_pin(out)), 1)
     check("and the closure findings are still there beside it",
-          len([f for f in out if "unevaluatedProperties" in f]) > 0, True)
+          len([f for f in out if OPEN_AT in f]) > 0, True)
 
 
 def test_a_closer_in_a_dead_branch_does_not_launder_an_open_one():
@@ -287,7 +317,8 @@ def test_a_closer_in_a_dead_branch_does_not_launder_an_open_one():
          "allOf": [{"$ref": BASE}, {"properties": {"agent": {"enum": ["r"]}}}],
          "$defs": {"legacy": {"$ref": BASE, "unevaluatedProperties": False}}}))
     check("the live root, which closes nothing, is reported",
-          any(f.startswith("the root composes") for f in out), True)
+          any(f.startswith(OPEN_AT.strip() + " <root>") or OPEN_AT + "<root>" in f for f in out),
+          True)
 
 
 def test_composing_one_object_is_not_ordered_to_close_the_rest():
@@ -438,39 +469,121 @@ def test_a_composition_that_closes_every_object_is_clean():
     check("root, finding, check entry and handoff all closed", closer_errors(), [])
 
 
-def test_a_composition_without_the_root_closer_is_an_error():
-    out = closer_errors(root=False)
-    check("a root that closes nothing is reported", len(out), 1)
-    check("and the message says it is the root", "the root composes" in out[0], True)
+def test_the_root_left_open_is_named():
+    check("the instance location, which is where a fixer acts", closer_errors(root=False),
+          ["<root>"])
 
 
-def test_a_composition_without_the_finding_closer_is_an_error():
-    out = closer_errors(finding=False)
-    check("an extended object that closes nothing is reported", len(out), 1)
-    check("and the message names the site",
-          "verdict.base.schema.json#/properties/findings/items" in out[0], True)
+def test_a_finding_left_open_is_named():
+    check("an extended object that refuses nothing", closer_errors(finding=False),
+          ["findings/0"])
 
 
-def test_a_composition_without_the_check_entry_closer_is_an_error():
+def test_a_check_entry_left_open_is_named():
     """The case the instance measurement above pairs with: what validates silently is red here."""
-    out = closer_errors(checks=False)
-    check("an unextended object that closes nothing is reported too", len(out), 1)
-    check("and the message names the site",
-          "verdict.base.schema.json#/properties/checks_run/items" in out[0], True)
+    check("an unextended object that refuses nothing", closer_errors(checks=False),
+          ["checks_run/0"])
 
 
-def test_an_object_the_composition_never_mentions_is_an_error():
-    out = closer_errors(compose_checks=False)
-    check("an object with no subschema over it at all is reported", len(out), 1)
-    check("and the message asks for the subschema, not for a keyword in one that is not there",
-          "nothing here closes" in out[0], True)
+def test_an_object_the_composition_never_mentions_is_named_the_same_way():
+    """One finding for one fact. The old check had two messages here — a keyword missing from a
+    subschema, or no subschema at all — and the fix is the same either way: close that object."""
+    check("an object with no subschema over it at all", closer_errors(compose_checks=False),
+          ["checks_run/0"])
 
 
 def test_the_handoff_object_counts_although_it_lives_in_another_file():
-    out = closer_errors(handoffs=False)
-    check("a shape the base pulls in by `$ref` is one of its open objects", len(out), 1)
-    check("and the message names the file that declares it",
-          "handoff.base.schema.json" in out[0], True)
+    check("a shape the base pulls in by `$ref` is one of its objects",
+          closer_errors(handoffs=False), ["handoffs/0"])
+
+
+# ── one case per cause of the walker this check used to be ────────────────────────────────────
+
+def test_a_composition_declared_through_defs():
+    """Cause: liveness was guessed from `/$defs/` in a pointer, so a composition kept there was
+    read as applying to nothing and not checked at all. What applies at the root is now resolved:
+    a local `$ref` is followed, however many hops."""
+    def routed(closer: bool) -> dict:
+        inner = {"allOf": [{"$ref": BASE}]}
+        if closer:
+            inner["unevaluatedProperties"] = False
+        return {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$ref": "#/$defs/verdict", "$defs": {"verdict": inner}}
+    check("an open composition under `$defs` is reported, not skipped",
+          "<root>" in open_locations_for(routed(closer=False)), True)
+    check("and a closed one under `$defs` is accepted, because it does close",
+          "<root>" in open_locations_for(routed(closer=True)), False)
+
+
+def test_a_base_object_written_without_a_type_keyword():
+    """Cause: an object was recognised by a literal `"type": "object"`, so a base declaring one
+    with `properties` and `required` alone — valid, ordinary JSON Schema — was invisible and owed
+    nothing."""
+    typeless = {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/typeless.base.schema.json"}]},
+        vendored={f"{VENDORED}/schemas/typeless.base.schema.json": typeless})
+    check("an object is whatever behaves like one", out, ["<root>"])
+
+
+def test_a_base_that_closes_what_it_forwards():
+    """Cause: a node carrying `$ref` plus `unevaluatedProperties: false` was read as a bare alias,
+    because the closer was in the list of keywords that mean "this only forwards". The walker then
+    stepped through the closer it was looking for and demanded one the base already had."""
+    outer = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "properties": {"inner": {"$ref": "inner.base.schema.json",
+                                      "unevaluatedProperties": False}}}
+    inner = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "properties": {"a": {"type": "string"}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/outer.base.schema.json"}],
+         "unevaluatedProperties": False},
+        vendored={f"{VENDORED}/schemas/outer.base.schema.json": outer,
+                  f"{VENDORED}/schemas/inner.base.schema.json": inner})
+    check("a closer the base already carries is not work for the repository", out, [])
+
+
+def test_a_property_name_a_pointer_would_have_to_escape():
+    """Cause: one half built JSON pointers raw and the other unescaped them, so `a/b~c` was one
+    object to the requirement and another to the closure. There are no pointers here now — a
+    location is where it is in the instance."""
+    odd = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+           "properties": {"a/b~c": {"type": "object", "properties": {"x": {"type": "string"}}}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/odd.base.schema.json"}],
+         "unevaluatedProperties": False},
+        vendored={f"{VENDORED}/schemas/odd.base.schema.json": odd})
+    check("the location is named as an instance carries it", out, ["a/b~c"])
+
+
+def test_a_shape_reached_through_another_base_file():
+    """Cause: following a forwarding `$ref` across files was pointer arithmetic, and it dropped the
+    pointer — walking the whole target document instead of the subschema named. Nothing is followed
+    now; the validator resolves what it resolves."""
+    check("the object behind the hop is named, and nothing else is",
+          closer_errors(handoffs=False), ["handoffs/0"])
+
+
+def test_a_reference_into_a_tree_no_import_pins():
+    """Cause: the pinned tree was read from the first import alone, so a repository pinning two
+    bundles was told the second was a stray. And the closer question is asked of the objects behind
+    the reference either way — an instance is validated against the shapes it actually reaches."""
+    two_imports = MANIFEST.replace(
+        "imports:\n  - bundle: exeris-agents",
+        "imports:\n  - bundle: other-bundle\n    version: 1.0.0\n    ref: dead\n"
+        "    sha256: 'sha256:00'\n  - bundle: exeris-agents")
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE}], "unevaluatedProperties": False},
+               manifest=two_imports)
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a second pinned bundle is pinned", off_pin(out), [])
+    finally:
+        shutil.rmtree(d)
 
 
 if __name__ == "__main__":

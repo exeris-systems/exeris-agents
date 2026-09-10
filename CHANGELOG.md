@@ -62,22 +62,22 @@ number.
 
 ### Added
 
-- `agents_file_check.py`: a composed schema must close every object its bundle base leaves open,
-  at the root and over each nested one, and each object it does not close is an error naming that
-  object. Without the check, bumping the bundle and changing nothing is a silent loss of
-  enforcement — the failure this release would otherwise ship. A composition is recognised by where
-  its `$ref` resolves — into the vendored tree `_compose` already defines — rather than by a
-  filename, so a repository that renames a schema does not quietly stop being checked, and both
-  spellings of one object (`verdict.base#/properties/handoffs/items` and `handoff.base` itself)
-  count as closing it once. What is required is read out of the vendored base, so a repository
-  stays green while it pins a bundle whose bases still close themselves and goes red when it
-  re-vendors — the moment the enforcement actually moves. From then on a schema composing over a
-  base closes every object that base leaves open, its root and each nested one, and the checker
-  names each site left open: the count is whatever a run says, not whatever a release note said
-  once.
+- `agents_file_check.py`: a composed schema must refuse a property its bundle base does not name,
+  at the root and inside every object the base carries, and each location where nothing refuses one
+  is an error naming that location — `<root>`, `findings/0`, `checks_run/0`. Without the check,
+  bumping the bundle and changing nothing is a silent loss of enforcement, the failure this release
+  would otherwise ship. The question is asked of the schema rather than read off it: a structural
+  probe built from the base is validated, then validated again with one property added at one
+  location, and a location where nothing named that property is open. So the keyword a repository
+  reaches for is its own business — `unevaluatedProperties`, `additionalProperties`, a
+  `propertyNames` enum — and what is reported is where an instance is unguarded rather than which
+  subschema lacked a token. What is asked is asked of the base that is actually vendored, so a
+  repository stays green while it pins a bundle whose bases still close themselves and goes red
+  when it re-vendors — the moment the enforcement actually moves. From then on the count of what is
+  left to do is whatever a run says, not whatever a release note said once.
 - Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
-  into a vendored tree the manifest does **not** pin is a finding, not a shrug: it resolves, so no
-  other check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
+  into a vendored tree that **no** import pins is a finding, not a shrug: it resolves, so no other
+  check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
   pointer is resolved as well as its file, because `<base>#/properties/<name>/items` is now the
   documented way to close a nested object and a pointer that names nothing is a closer over
   nothing.

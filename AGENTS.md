@@ -71,12 +71,20 @@ python3 tools/agents_file_check.py     --root ../exeris-docs
 python3 tools/agents_render.py --check --root ../exeris-docs
 python3 tools/agents_bundle.py verify  --root ../exeris-docs
 python3 tools/agents_bundle.py digest  --from .
+
+# and the evals, driven by THIS branch's runner rather than the consumer's pinned copy — otherwise
+# the run only re-reports whichever version that repository is behind on. Copy into a scratch copy
+# of the consumer: the runner writes its report inside the tree it evaluates.
+cp bundle/evals/run.py <scratch>/.agents/vendor/exeris-agents-<pin>/evals/run.py
+(cd <scratch> && python3 .agents/vendor/exeris-agents-<pin>/evals/run.py \
+    --scenarios .agents/evals/scenarios.yaml --dry-run)
 ```
 
-Report the counts, and report a check that did not run as not run
+Report the counts **measured at the commit being reported**, not at whichever run happened first,
+and report a check that did not run as not run
 ([`bundle/policies/error-handling-and-fallback.md`](bundle/policies/error-handling-and-fallback.md)
 rule 1). A change to `bundle/` that a consumer's evals cover reruns them and the pull request names
-the run (schema rule 14).
+the run (schema rule 14) — a change to `bundle/schemas/` or to `evals/run.py` always covers them.
 
 ## Safety
 

@@ -60,6 +60,21 @@ def vendor_root(manifest: dict) -> str | None:
     return os.path.join(VENDOR, f"{imp['bundle']}-{imp['version']}")
 
 
+def vendor_roots(manifest: dict) -> list[str]:
+    """Every `.agents/vendor/<bundle>-<version>` the manifest pins.
+
+    `vendor_root()` above answers with the first import, which is right for what it is asked: a
+    `bundle:` prefix resolves against the one bundle whose policies a profile composes. Whether a
+    `$ref` lands in *a* pinned tree is a different question, and answering it with the first import
+    calls every other pinned bundle a tree the manifest does not pin.
+    """
+    roots = []
+    for imp in manifest.get("imports") or []:
+        if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
+            roots.append(os.path.join(VENDOR, f"{imp['bundle']}-{imp['version']}"))
+    return roots
+
+
 def resolve(kind: str, name: str, root: str | None) -> tuple[str | None, str | None]:
     """Return (path, error). `kind` is a directory under `.agents/` — policies, references.
 
