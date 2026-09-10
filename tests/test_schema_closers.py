@@ -228,7 +228,7 @@ def open_locations_for(composed: dict, **kwargs) -> list[str]:
         return open_locations(d)
     finally:
         _RUNS.pop(d, None)
-        shutil.rmtree(d)
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def custom(composed: dict, *, vendored: dict | None = None, pin: str = DEFAULT_PIN,
@@ -518,20 +518,27 @@ def test_the_handoff_object_counts_although_it_lives_in_another_file():
           closer_errors(handoffs=False), ["handoffs/0"])
 
 
-def test_a_base_referenced_somewhere_an_instance_never_meets_is_reported():
-    """The last branch that returned in silence. The probe is built from what applies at an
-    instance's root, so a `$ref` into a base parked anywhere else leaves the question unasked —
-    and unasked was indistinguishable from answered: no closer check and no message, on a schema
-    that may well carry an open contract."""
+def test_a_base_wrapped_under_a_property_is_measured_where_it_sits():
+    """Two rounds ago this was unmeasurable and then a warning, because the probe was built from
+    what applies at an instance's ROOT. The decision is generated from the schema now, so a base
+    wrapped under a property is an object at `verdict` and is asked the same question as any
+    other."""
     d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "properties": {"verdict": {"$ref": BASE}}})
+                "properties": {"verdict": {"allOf": [{"$ref": BASE}],
+                                           "properties": {"findings": {"items": {"allOf": [
+                                               {"$ref": BASE + "#/properties/findings/items"}],
+                                               "unevaluatedProperties": False}},
+                                               "checks_run": {"items": {"allOf": [
+                                                   {"$ref": BASE + "#/properties/checks_run/items"}],
+                                                   "unevaluatedProperties": False}},
+                                               "handoffs": {"items": {"allOf": [
+                                                   {"$ref": BASE + "#/properties/handoffs/items"}],
+                                                   "unevaluatedProperties": False}}}}}})
     try:
-        check("a base referenced away from the root is reported rather than skipped",
-              any("not where an instance meets" in w for w in warnings(d)), True)
-        check("as a warning: unmeasured is not the same as wrong, and an error here fires on a "
-              "repository that conforms",
-              any("not where an instance meets" in e for e in errors(d)), False)
+        check("a base referenced away from the root is measured where it sits: the decision is "
+              "generated from this schema, so the objects are wherever it puts them",
+              [l for l in open_locations(d)], ["<root>", "verdict"])
     finally:
         shutil.rmtree(d)
 
@@ -573,8 +580,9 @@ def test_two_bases_disagreeing_about_a_property_do_not_kill_the_run():
                vendored={f"{VENDORED}/schemas/other.base.schema.json": other})
     try:
         out = errors(d)          # raises AssertionError of its own if the checker crashed
-        check("the run survives and still reports the objects it can decide",
-              any(OPEN_AT in l for l in out), True)
+        check("the run survives, and the schema is reported as rejecting what was built for it — "
+              "no instance can satisfy two bases that disagree about one property",
+              any("rejects a decision built to satisfy it" in l for l in out), True)
     finally:
         shutil.rmtree(d)
 
@@ -591,7 +599,7 @@ def test_a_closer_that_refuses_the_base_itself_is_reported():
     try:
         out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
         check("a schema that rejects the base's own properties is reported",
-              any("refuses properties the base itself declares" in f for f in out), True)
+              any("rejects a decision built to satisfy it" in f for f in out), True)
     finally:
         shutil.rmtree(d)
 
@@ -609,7 +617,7 @@ def test_a_root_that_composes_through_another_file_is_reported():
                        "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"}]},
                       fh)
         check("a base composed through a file this check does not follow is reported",
-              any("not where an instance meets" in w for w in warnings(d)), True)
+              any("through" in w and "does not follow" in w for w in warnings(d)), True)
     finally:
         shutil.rmtree(d)
 
@@ -624,7 +632,8 @@ def test_an_object_two_levels_down_is_probed():
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/deep.base.schema.json"}],
          "unevaluatedProperties": False,
-         "properties": {"outer": {"unevaluatedProperties": False}}},
+         "properties": {"outer": {"allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/deep.base.schema.json#/properties/outer"}],
+                                  "unevaluatedProperties": False}}},
         vendored={f"{VENDORED}/schemas/deep.base.schema.json": deep})
     check("the object below the first level is named", out, ["outer/inner"])
 
@@ -683,8 +692,8 @@ def test_a_composition_below_the_root_that_is_correctly_closed_is_not_an_error()
     try:
         check("a correctly closed composition below the root is no error",
               [e.split("schema::", 1)[-1] for e in errors(d) if "schema::" in e], [])
-        check("and the reader is told the question was not asked",
-              any("not where an instance meets" in w for w in warnings(d)), True)
+        check("and it is measured rather than passed over: the wrapper is an object like any other",
+              "verdict" in open_locations(d), False)
     finally:
         shutil.rmtree(d)
 
@@ -700,8 +709,9 @@ def test_a_closer_parked_in_a_sibling_branch_is_reported():
                            "unevaluatedProperties": False}]})
     try:
         out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
-        check("the misplaced closer is reported",
-              any("inside an `allOf` branch beside" in f for f in out), True)
+        check("the misplaced closer is reported, as the rejection it causes",
+              any(f.startswith("rejects a decision built to satisfy it, at <root>") for f in out),
+              True)
     finally:
         shutil.rmtree(d)
     clean = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -709,7 +719,7 @@ def test_a_closer_parked_in_a_sibling_branch_is_reported():
     try:
         check("and the same keyword on the branch that carries the base is left alone — measured, "
               "a conforming decision passes it",
-              any("inside an `allOf` branch beside" in e for e in errors(clean)), False)
+              any("rejects a decision" in e for e in errors(clean)), False)
     finally:
         shutil.rmtree(clean)
 
@@ -726,7 +736,8 @@ def test_an_object_a_base_declares_behind_a_ref_is_probed():
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/outer.base.schema.json"}],
          "unevaluatedProperties": False,
-         "properties": {"h": {"items": {"unevaluatedProperties": False}}}},
+         "properties": {"h": {"items": {"allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/ref.base.schema.json"}],
+                                        "unevaluatedProperties": False}}}},
         vendored={f"{VENDORED}/schemas/outer.base.schema.json": outer,
                   f"{VENDORED}/schemas/ref.base.schema.json": referenced})
     check("the object behind the reference is measured", out, ["h/0/nested"])
@@ -782,7 +793,7 @@ def test_the_probe_says_where_it_stopped():
     """`depth` truncating in silence made an unmeasured location indistinguishable from a measured
     and closed one."""
     deep = {"type": "object", "properties": {"a": {"type": "object", "properties": {}}}}
-    for level in range(6):
+    for level in range(12):
         deep = {"type": "object", "properties": {f"l{level}": deep}}
     deep["$schema"] = "https://json-schema.org/draft/2020-12/schema"
     d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -790,8 +801,8 @@ def test_the_probe_says_where_it_stopped():
                 "unevaluatedProperties": False},
                vendored={f"{VENDORED}/schemas/deep.base.schema.json": deep})
     try:
-        check("the location the probe stopped at is named",
-              any("not measured at" in w and "depth bound" in w for w in warnings(d)), True)
+        check("the depth the generator stopped at is named",
+              any("depth bound" in w for w in warnings(d)), True)
     finally:
         shutil.rmtree(d)
 
@@ -812,7 +823,7 @@ def test_what_the_probe_declines_is_reported():
                vendored={f"{VENDORED}/schemas/odd.base.schema.json": odd})
     try:
         check("the construct it did not walk is named",
-              any("not measured at" in w and "patternProperties" in w for w in warnings(d)), True)
+              any("not measured" in w and "patternProperties" in w for w in warnings(d)), True)
     finally:
         shutil.rmtree(d)
 
@@ -855,8 +866,10 @@ def test_one_neighbour_referenced_twice_keeps_both_sets_of_locations():
         {"$schema": "https://json-schema.org/draft/2020-12/schema",
          "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/twice.base.schema.json"}],
          "unevaluatedProperties": False,
-         "properties": {"first": {"unevaluatedProperties": False},
-                        "second": {"unevaluatedProperties": False}}},
+         "properties": {"first": {"allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/nb.base.schema.json"}],
+                                  "unevaluatedProperties": False},
+                        "second": {"allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/nb.base.schema.json"}],
+                                   "unevaluatedProperties": False}}},
         vendored={f"{VENDORED}/schemas/twice.base.schema.json": twice,
                   f"{VENDORED}/schemas/nb.base.schema.json": neighbour})
     check("both occurrences keep their nested location", out, ["first/nested", "second/nested"])
@@ -893,17 +906,16 @@ def test_an_array_whose_item_schema_is_a_boolean_is_declined():
         shutil.rmtree(d)
 
 
-def test_a_root_composition_under_one_of_is_named_for_what_it_is():
-    """It fell into the branch that says the reference sits under a shape the repository owns,
-    which was simply untrue — the base is at the root, under a keyword whose applicability depends
-    on the instance."""
+def test_a_root_composition_under_one_of_is_measured_through_a_branch():
+    """Per-scope rules are written this way. Generating past the `oneOf` produced a decision no
+    branch accepts, so the schema was declined; one branch at a time, keeping the first that
+    validates, measures it instead — and the selection is verified like any other instance."""
     d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
                 "oneOf": [{"allOf": [{"$ref": BASE}], "unevaluatedProperties": False}]})
     try:
-        check("the keyword it is under is named",
-              any("under `oneOf`" in w for w in warnings(d)), True)
-        check("and it is not called a reference that sits elsewhere",
-              any("not where an instance meets" in w for w in warnings(d)), False)
+        check("a branch is selected and the composition measured through it — the branch closes "
+              "the root, and the objects inside it are reported",
+              ("<root>" in open_locations(d), "findings/0" in open_locations(d)), (False, True))
     finally:
         shutil.rmtree(d)
 
@@ -920,8 +932,9 @@ def test_a_closer_parked_in_a_branch_one_level_down_is_reported():
                      "unevaluatedProperties": False}]}}}})
     try:
         out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
-        check("the misplaced closer is caught at every level",
-              any("inside an `allOf` branch beside" in f for f in out), True)
+        check("caught by measurement, at the level it happens",
+              any(f.startswith("rejects a decision built to satisfy it, at findings/0")
+                  for f in out), True)
     finally:
         shutil.rmtree(d)
 
@@ -937,6 +950,56 @@ def test_a_refusal_of_one_name_shape_is_not_a_closed_object():
               "<root>" in open_locations(d), True)
     finally:
         _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+# The subschema-bearing vocabulary of draft 2020-12, written out here rather than derived, so that
+# a keyword the checker learns to ignore has to be added in two places by two different hands.
+SUBSCHEMA_KEYWORDS = {
+    "properties", "patternProperties", "additionalProperties", "propertyNames", "items",
+    "prefixItems", "additionalItems", "contains", "unevaluatedItems", "unevaluatedProperties",
+    "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "dependentSchemas", "$ref", "$defs",
+    "definitions",
+}
+
+
+def test_every_subschema_keyword_is_either_walked_or_declined():
+    """The check's promise is that it measures a stated set of shapes and says which ones it met
+    and left alone. That is only true while every keyword that can hold a subschema is in one list
+    or the other — and each of five review rounds found one that was in neither, silently."""
+    mod = checker_module()
+    classified = mod.HANDLED_KEYWORDS | mod.DECLINED_KEYWORDS
+    check("no subschema keyword is unclassified", sorted(SUBSCHEMA_KEYWORDS - classified), [])
+    check("and nothing is classified twice",
+          sorted(mod.HANDLED_KEYWORDS & mod.DECLINED_KEYWORDS), [])
+    check("nor classified without being a subschema keyword",
+          sorted(classified - SUBSCHEMA_KEYWORDS), [])
+
+
+def test_every_keyword_the_bundle_uses_is_one_the_generator_walks():
+    """The other direction, and the one that catches the next keyword: a base may only use shapes
+    the generator understands. A base reaching for `patternProperties` would make this fail, which
+    is the conversation to have before it ships rather than after a consumer's contract is
+    unmeasured."""
+    mod = checker_module()
+
+    def keywords(node):
+        if isinstance(node, dict):
+            yield from node
+            for value in node.values():
+                yield from keywords(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from keywords(value)
+
+    for name in sorted(os.listdir(SCHEMAS)):
+        with open(os.path.join(SCHEMAS, name), encoding="utf-8") as fh:
+            used = set(keywords(json.load(fh))) & SUBSCHEMA_KEYWORDS
+        # `if`/`then` are used to constrain what is already built, which the generator does not
+        # need to walk; what must not appear is a keyword that places an object somewhere the
+        # generated decision has none.
+        places_objects = used & (mod.DECLINED_KEYWORDS - {"if", "then", "else", "not", "anyOf",
+                                                          "oneOf", "contains", "dependentSchemas"})
+        check(f"{name} uses no shape the generator cannot build", sorted(places_objects), [])
 
 
 # ── what the schema check may read ────────────────────────────────────────────────────────────

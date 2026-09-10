@@ -391,6 +391,8 @@ def load_runner(path: str, name: str):
     return mod
 
 
+_ABSENT = object()
+
 VERDICT = {"agent": "fixture-reviewer", "decision": "PASS", "scope_class": "docs-only",
            "findings": [], "checks_run": [{"check": "vale", "result": "pass"}]}
 
@@ -426,10 +428,10 @@ def test_a_grader_that_cannot_build_its_registry_says_so():
     try:
         mod = load_runner(runner, "evalrun_noregistry")
         import jsonschema                             # noqa: F401 — see below
-        real = dict(sys.modules)
         # jsonschema is imported first, deliberately: it imports `referencing` itself, so stubbing
         # that out beforehand would fail jsonschema's own import and exercise the other branch.
         # This passed for the right reason only because the suite happens to run alphabetically.
+        was = sys.modules.get("referencing", _ABSENT)
         sys.modules["referencing"] = None            # force the ImportError branch
         try:
             out = mod.validate(VERDICT, composed)
@@ -438,7 +440,12 @@ def test_a_grader_that_cannot_build_its_registry_says_so():
                   False, True)
             return
         finally:
-            sys.modules.clear(); sys.modules.update(real)
+            # One entry back, not the whole module table: clearing `sys.modules` to undo a single
+            # stub takes every other module's identity with it.
+            if was is _ABSENT:
+                sys.modules.pop("referencing", None)
+            else:
+                sys.modules["referencing"] = was
         check("it says it could not validate rather than reporting a clean instance",
               bool(out) and "cannot validate" in out[0], True)
     finally:

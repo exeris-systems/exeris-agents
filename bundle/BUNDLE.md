@@ -39,8 +39,26 @@ closer at the root does not reach into an array's items: with `checks_run` left 
 may put anything inside a check entry however tightly the root is closed. A verdict composition
 closes four objects: its root, a `findings` item, a `checks_run` item and a `handoffs` item.
 
-That is the migration cost of vendoring 2.0.0, and it is the whole of it. Why the bases are open
-and where each closer belongs is written in each base's own `description`, next to the shape it
-describes; `agents_file_check.py` adds a property to a probe and names every location where
-nothing refused it, so the list of what is left to do comes from a run rather than from reading.
+A triage-result composition closes three — its root, a `validation_gates` item and a
+`secondary_handoffs` item — and a handoff composition closes one, its root. That is the migration
+cost of vendoring 2.0.0, and it is the whole of it: eight objects across the three schemas.
+`agents_file_check.py` builds a decision each schema accepts, adds a property to every object it
+carries, and names the ones that took it — so the list of what is left to do comes from a run
+rather than from reading.
+
+## What a graded failure looks like now
+
+One consequence has nothing to do with what you write and everything to do with what you will read.
+When a decision fails validation for any reason — a missing `reason`, a `decision` outside the
+enum — the report will also carry a line like:
+
+    <root>: Unevaluated properties are not allowed ('agent', 'checks_run', 'decision', 'findings',
+    'handoffs', 'scope_class' were unexpected)
+
+Those are your own required fields, and they are not the problem. A composition validates the
+decision through a `$ref` into the base; when anything inside that branch fails, the branch fails,
+and a failing subschema contributes no annotations — so the `unevaluatedProperties` above it sees
+nothing as evaluated and reports every property present. **Read the other errors first.** The
+unevaluated line disappears the moment the real failure is fixed, and a decision that validates
+never produces it.
 

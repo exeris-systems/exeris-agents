@@ -47,14 +47,23 @@ number.
   later reader would otherwise put back.
 - **What a consumer must add: one closer per object, not one per schema.**
   `"unevaluatedProperties": false` at the root of every schema that `$ref`s a base, and again in a
-  subschema over every object that base leaves open. A verdict composition closes four: its root,
-  a `findings` item, a `checks_run` item, and a `handoffs` item — the last declared in
-  `handoff.base.schema.json`, one file over, and open all the same. `unevaluatedProperties` stops
+  subschema over every object that base leaves open. Eight objects across the three schemas: a
+  verdict composition closes four — its root, a `findings` item, a `checks_run` item and a
+  `handoffs` item, the last declared in `handoff.base.schema.json` one file over and open all the
+  same — a triage-result composition closes three, its root, a `validation_gates` item and a
+  `secondary_handoffs` item, and a handoff composition closes its root. `unevaluatedProperties` stops
   at the object it sits in, so a root closer leaves every array item taking any property; measured,
   a composition closing only its root refuses a foreign property at the root and admits one in a
   check entry. An object the repository does not extend still needs a subschema of its own,
   carrying the `$ref` and the closer. `agents_file_check.py` names every object left open, so the
   work is enumerated rather than discovered.
+- **Every graded failure will carry a line naming your own fields as unexpected.** A composition
+  validates through a `$ref` into the base; when anything inside that branch fails, the branch
+  fails, and a failing subschema contributes no annotations — so an `unevaluatedProperties` above
+  it reports every property present. `<root>: Unevaluated properties are not allowed ('agent',
+  'checks_run', 'decision', …)` sits beside the real error in every failure report, at every
+  consumer, and it is not the problem: read the other errors first, and it goes when they do.
+  `BUNDLE.md` says so where a consumer meets it.
 - **The root closer can be added before the bump.** Over 1.4.0's closed base it changes no outcome:
   a conforming instance still validates and a foreign root property is still refused, by the base.
   An extension cannot be added early — 1.4.0's base refuses the added field, which is the whole
@@ -82,6 +91,15 @@ number.
   shape. Both see only the properties written beside them, so both reject everything the base
   declares while looking closed to a check that asks only whether a foreign property can get in. A
   conforming decision graded against such a schema is refused outright.
+- **The check builds a decision the schema accepts, and asks one question of it.** A conforming
+  instance is generated from the composed schema — `required`, `type`, `pattern`, `minLength`,
+  `minItems`, `enum`, `const` — validated against that schema, and only then is a property added at
+  each object it carries: still valid means the object is open. Nothing reads an error message,
+  counts a keyword or inspects a path, and a schema that rejects the decision built for it is
+  reported rather than measured, because a probe is evidence only when the instance conforms. That
+  subsumes a rule of its own: a closer parked inside an `allOf` branch, where it sees only the
+  properties named beside it, refuses every conforming decision — so it is caught by measurement,
+  at whatever depth it sits, instead of by a scan for the shape.
 - **The check names what it did not measure.** The probe understands a stated set of shapes —
   `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
   document that named them — and every construct it meets and does not walk is now a warning
