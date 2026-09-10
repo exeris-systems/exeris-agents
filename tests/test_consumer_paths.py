@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for two defects a consuming repository hits and this repository does not.
+"""Regression tests for defects a consuming repository hits and this repository does not.
 
-Both shipped in 1.1.0, both are silent, and both were found by running the tools against a second
-consumer rather than by reading them:
+It vendors nothing and grades nothing, so every case here needs a consumer built to find it. The
+first two shipped in 1.1.0, both silent, both found by running the tools against a second
+consumer rather than by reading them; the grader cases below were found the same way, against a
+real composed schema:
 
   1. `provider-owned` in the mapping spelling rule 7 requires — `{path: …, generated-region: …}` —
      was read with `set(...)`, which raises TypeError on an unhashable dict inside a bare
@@ -377,6 +379,102 @@ def test_a_base_ref_resolves_beside_the_base_that_names_it():
         check("a well-formed handoff validates", clean, [])
         check("and a handoff missing `reason` is a graded failure, so the base really applied",
               bool(bad) and "reason" in bad[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def grader_tree() -> tuple[str, str, str]:
+    """(repo, composed schema path, vendored runner path) — a consumer with the real bases."""
+    d = tempfile.mkdtemp(prefix="grader-")
+    vendor = os.path.join(d, ".agents", "vendor", "exeris-agents-2.0.0")
+    os.makedirs(os.path.join(d, ".git"))
+    shutil.copytree(SCHEMAS, os.path.join(vendor, "schemas"))
+    os.makedirs(os.path.join(vendor, "evals"))
+    shutil.copy(RUNNER, os.path.join(vendor, "evals", "run.py"))
+    composed = os.path.join(d, ".agents", "schemas", "verdict.schema.json")
+    write(composed, json.dumps({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [{"$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                  {"properties": {"agent": {"enum": ["fixture-reviewer"]}}}],
+        "unevaluatedProperties": False}))
+    return d, composed, os.path.join(vendor, "evals", "run.py")
+
+
+def load_runner(path: str, name: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+VERDICT = {"agent": "fixture-reviewer", "decision": "PASS", "scope_class": "docs-only",
+           "findings": [], "checks_run": [{"check": "vale", "result": "pass"}]}
+
+
+def test_a_reference_that_cannot_resolve_is_a_graded_failure():
+    """The failure class this release claims to have closed, by its likelier trigger: not a base
+    whose neighbour moved, but a `$ref` that names something which is not there. It reached the
+    caller as an exception, and `run()` catches nothing around `grade()`, so one bad reference in
+    one case ended the whole run with a traceback instead of failing that case."""
+    d, composed, runner = grader_tree()
+    try:
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": "../vendor/exeris-agents-2.0.0/schemas/gone.base.schema.json"}],
+            "unevaluatedProperties": False}))
+        mod = load_runner(runner, "evalrun_unresolvable")
+        try:
+            out = mod.validate(VERDICT, composed)
+        except BaseException as exc:            # SystemExit included: the guard exits the process
+            check(f"an unresolvable $ref is graded, not raised ({type(exc).__name__})", False, True)
+            return
+        check("it comes back as a failure the case can carry",
+              bool(out) and "resolve" in out[0].lower(), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_grader_that_cannot_build_its_registry_says_so():
+    """The fallback rebuilt the validator without the registry and without the location `$id` — the
+    two things that make a vendored `$ref` resolve — and returned its verdict as if nothing had
+    happened. A grader that quietly weakens is the failure this file has now fixed three times."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "evalrun_noregistry")
+        real = dict(sys.modules)
+        sys.modules["referencing"] = None            # force the ImportError branch
+        try:
+            out = mod.validate(VERDICT, composed)
+        except BaseException as exc:
+            check(f"a grader without a registry answers, it does not raise ({type(exc).__name__})",
+                  False, True)
+            return
+        finally:
+            sys.modules.clear(); sys.modules.update(real)
+        check("it says it could not validate rather than reporting a clean instance",
+              bool(out) and "cannot validate" in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_case_pointed_at_a_bundle_base_is_refused():
+    """From 2.0.0 a base refuses almost nothing on its own, so a case graded against one reports a
+    clean run over answers no repository would accept. The runner names it instead."""
+    d, composed, runner = grader_tree()
+    try:
+        write(os.path.join(d, ".agents", "evals", "scenarios.yaml"),
+              "version: 1\ndefaults:\n  schema_dir: ../schemas\n  fixture_dir: fixtures\n"
+              "cases:\n  - id: graded-against-a-base\n    agent: a\n    prompt: p\n"
+              "    expect:\n      schema: "
+              "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json\n")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report",
+                            os.path.join(d, "report.json"), "--scenarios",
+                            os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=d)
+        check("a case naming a vendored base is an error, not an `ok`",
+              ("ok    graded-against-a-base" in p.stdout, "base" in p.stdout.lower()),
+              (False, True))
     finally:
         shutil.rmtree(d)
 

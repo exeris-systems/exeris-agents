@@ -174,13 +174,34 @@ def validate(instance, schema_path: str) -> list[str]:
         return [f"missing required key '{k}' (shallow check: jsonschema not installed)"
                 for k in missing]
     schema = json.load(open(schema_path, encoding="utf-8"))
+    name = os.path.basename(schema_path)
+    # No silent fallback here. Rebuilding the validator without the registry and without the
+    # location `$id` drops the two things that make a vendored `$ref` resolve at all, and the
+    # grader that comes back checks a fraction of the contract while reporting like the whole one.
+    # Each half says which one is missing instead.
     try:
-        v = jsonschema.Draft202012Validator(located(schema, schema_path),
-                                            registry=file_registry(schema_path))
-    except (ImportError, TypeError):
-        v = jsonschema.Draft202012Validator(schema)
-    return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
-            for e in v.iter_errors(instance)]
+        registry = file_registry(schema_path)
+    except ImportError:
+        return [f"cannot validate {name}: `referencing` is not installed, so a `$ref` into the "
+                f"vendored bundle cannot be resolved and the grader would be checking the "
+                f"repository's own keywords and nothing the base carries "
+                f"(pip install jsonschema referencing)"]
+    try:
+        v = jsonschema.Draft202012Validator(located(schema, schema_path), registry=registry)
+    except TypeError as exc:
+        return [f"cannot validate {name}: this jsonschema does not take a reference registry "
+                f"({exc}); 4.18 and newer do, and without one a vendored `$ref` resolves to "
+                f"nothing"]
+    try:
+        return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
+                for e in v.iter_errors(instance)]
+    except Exception as exc:
+        # A reference that does not resolve is a defect in the schema or in the vendored tree, and
+        # it belongs to the case that named that schema. Raised, it left `grade()` and `run()`,
+        # neither of which catches anything, and ended the whole run — every later case unreported
+        # over one bad path. The same reason `build_prompt`'s missing fixture is recorded here.
+        return [f"cannot validate {name}: a `$ref` did not resolve ({type(exc).__name__}: {exc}). "
+                f"A vendored base is a file on disk, so this is a path that is not there"]
 
 
 def extract_json(raw: str):
@@ -243,6 +264,12 @@ def build_prompt(case: dict, fixture_dir: str) -> str:
         parts.append(f"\n--- {fixture} ---\n{open(path, encoding='utf-8').read().strip()}")
     parts.append("\nAnswer with the JSON object your response contract requires, and nothing else.")
     return "\n".join(p for p in parts if p)
+
+
+def vendored(path: str) -> bool:
+    """True for a schema inside `.agents/vendor/`, which makes it the bundle's and not this
+    repository's."""
+    return f"{os.sep}.agents{os.sep}vendor{os.sep}" in os.path.realpath(path) + os.sep
 
 
 def within_repo(path: str, what: str) -> str:
@@ -333,6 +360,15 @@ def main() -> int:
             print(f"ERROR {case['id']}: no expect.schema"); continue
         schema_path = within_repo(os.path.join(schema_dir, named),
                                   f"case '{case['id']}' expect.schema")
+        if vendored(schema_path):
+            entry |= {"status": "error", "failures": [
+                f"expect.schema names a bundle base ({named}). A base fixes the shape and leaves "
+                f"the vocabulary and every closer to the repository, so from 2.0.0 it accepts a "
+                f"foreign property anywhere and any value the repository's own enums exclude — a "
+                f"case graded against one passes on answers the repository refuses. Name the "
+                f"composed schema in .agents/schemas/ instead."]}
+            results.append(entry); failed += 1
+            print(f"ERROR {case['id']}: expect.schema names a bundle base"); continue
 
         # F5: a missing fixture is recorded like a missing schema. It used to raise out of
         # build_prompt and abort the whole run, so one typo in one case hid every later result.

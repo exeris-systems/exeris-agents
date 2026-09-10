@@ -180,6 +180,141 @@ def closer_errors(**shape) -> list[str]:
         shutil.rmtree(d)
 
 
+def custom(composed: dict, *, vendored: dict | None = None, pin: str = "2.0.0",
+           name: str = "verdict.schema.json") -> str:
+    """A consumer with a composed schema of the case's own making, and optionally its own bases.
+
+    The standard fixture above answers "does the rule hold for the real bundle". These cases ask
+    the harder question: what does the rule do when the tree is not the tidy one — a `$ref` into
+    the wrong vendored version, a closer parked somewhere that never applies, a property name a
+    JSON pointer has to escape.
+    """
+    d = tempfile.mkdtemp(prefix="closers-")
+    os.makedirs(os.path.join(d, ".git"))
+    os.makedirs(os.path.join(d, ".agents", "schemas"))
+    vendor = os.path.join(d, ".agents", "vendor", f"exeris-agents-{pin}")
+    shutil.copytree(SCHEMAS, os.path.join(vendor, "schemas"))
+    os.makedirs(os.path.join(vendor, "evals"))
+    shutil.copy(RUNNER, os.path.join(vendor, "evals", "run.py"))
+    for rel, doc in (vendored or {}).items():
+        path = os.path.join(d, ".agents", "vendor", rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+    with open(os.path.join(d, "AGENTS.md"), "w", encoding="utf-8") as fh:
+        fh.write("# fixture\n\nPoints at `.agents/` for the semantics.\n")
+    with open(os.path.join(d, ".agents", "manifest.yaml"), "w", encoding="utf-8") as fh:
+        fh.write(MANIFEST.replace("verdict.schema.json", name).replace("2.0.0", pin, 1)
+                 if pin != "2.0.0" else MANIFEST.replace("verdict.schema.json", name))
+    with open(os.path.join(d, ".agents", "schemas", name), "w", encoding="utf-8") as fh:
+        json.dump(composed, fh, indent=2)
+    return d
+
+
+def findings_for(repo: str) -> list[str]:
+    try:
+        return [l.split("schema::", 1)[-1] for l in errors(repo) if "schema::" in l]
+    finally:
+        shutil.rmtree(repo)
+
+
+OPEN_OBJECT = {"type": "object", "properties": {"a": {"type": "string"}}}
+
+
+# ── where the rule used to answer wrongly: silence one way, noise the other ───────────────────
+
+def test_a_ref_into_an_unpinned_vendored_tree_is_not_a_skip():
+    """The bump state. A repository re-pins its manifest and re-vendors, and until every schema's
+    `$ref` is retargeted the composition still names the old directory — which exists, so no
+    "target does not exist" fires. The closer rule used to answer that by recognising nothing at
+    all, so the one moment it is there for was the one moment it said nothing."""
+    old = "exeris-agents-1.4.0/schemas/verdict.base.schema.json"
+    out = findings_for(custom(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{old}"}]},
+        vendored={old: json.load(open(os.path.join(SCHEMAS, "verdict.base.schema.json"),
+                                      encoding="utf-8"))}))
+    check("composing over a vendored tree the manifest does not pin is reported",
+          any("does not pin" in f or "not the pinned" in f for f in out), True)
+    check("and the objects in it are still required to be closed",
+          sum(1 for f in out if "unevaluatedProperties" in f) > 0, True)
+
+
+def test_a_closer_in_a_dead_branch_does_not_launder_an_open_one():
+    """`$defs` is not applied to anything unless something references it. A closer parked there
+    was counted as closing the object for the whole document, so the live composition — the one
+    every instance is actually validated against — could be wide open with nothing red."""
+    out = findings_for(custom(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": BASE}, {"properties": {"agent": {"enum": ["r"]}}}],
+         "$defs": {"legacy": {"$ref": BASE, "unevaluatedProperties": False}}}))
+    check("the live root, which closes nothing, is reported",
+          any(f.startswith("the root composes") for f in out), True)
+
+
+def test_composing_one_object_is_not_ordered_to_close_the_rest():
+    """A repository may compose a single sub-object — a finding, for a schema about findings. The
+    requirement was computed per base FILE, so it was told to close a root, a check entry and a
+    handoff it never pulls in."""
+    out = findings_for(custom(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": BASE + "#/properties/findings/items"},
+                   {"properties": {"tag": {"enum": ["style"]}}}],
+         "unevaluatedProperties": False},
+        name="finding.schema.json"))
+    check("a schema that pulls in one object is asked to close that one and nothing else",
+          [f for f in out if "unevaluatedProperties" in f], [])
+
+
+def test_following_a_forwarding_ref_keeps_the_pointer():
+    """`handoffs` forwards into another file at a pointer. The walk dropped the pointer and
+    enumerated the whole target document, so objects the composition never names became work."""
+    other = "exeris-agents-2.0.0/schemas/other.base.schema.json"
+    out = findings_for(custom(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": "../vendor/" + other + "#/$defs/wanted"}],
+         "unevaluatedProperties": False},
+        vendored={other: {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                          "type": "object",
+                          "properties": {"unrelated": dict(OPEN_OBJECT)},
+                          "$defs": {"wanted": dict(OPEN_OBJECT)}}},
+        name="wanted.schema.json"))
+    check("only the object the pointer names is required",
+          [f for f in out if "unevaluatedProperties" in f], [])
+
+
+def test_a_property_name_that_a_pointer_must_escape_keeps_its_identity():
+    """One half built pointers raw and the other unescaped them, so a property named `a/b` was one
+    object to the requirement and another to the closure — and the two never met."""
+    odd = "exeris-agents-2.0.0/schemas/odd.base.schema.json"
+    ref = "../vendor/" + odd
+    out = findings_for(custom(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": ref},
+                   {"properties": {"a/b": {"$ref": ref + "#/properties/a~1b",
+                                           "unevaluatedProperties": False}}}],
+         "unevaluatedProperties": False},
+        vendored={odd: {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object", "properties": {"a/b": dict(OPEN_OBJECT)}}},
+        name="odd.schema.json"))
+    check("an escaped property name resolves to the same object on both sides",
+          [f for f in out if "unevaluatedProperties" in f], [])
+
+
+def test_a_ref_whose_pointer_does_not_resolve_is_reported():
+    """A `$ref` used to be checked as a file and never as a pointer. This release makes pointer
+    refs the documented way to close a nested object, so a typo in one is a closer that closes
+    nothing — and the file behind it exists, so nothing else notices."""
+    out = findings_for(custom(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": BASE}],
+         "unevaluatedProperties": False,
+         "properties": {"findings": {"items": {"$ref": BASE + "#/properties/nope",
+                                               "unevaluatedProperties": False}}}}))
+    check("a pointer that names nothing in the target is reported",
+          any("pointer" in f for f in out), True)
+
+
 # ── the grader has jsonschema, or it is grading nothing ───────────────────────────────────────
 
 def test_the_grader_can_actually_validate():

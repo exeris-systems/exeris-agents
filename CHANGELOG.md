@@ -69,9 +69,20 @@ number.
   its `$ref` resolves — into the vendored tree `_compose` already defines — rather than by a
   filename, so a repository that renames a schema does not quietly stop being checked, and both
   spellings of one object (`verdict.base#/properties/handoffs/items` and `handoff.base` itself)
-  count as closing it once. The objects are read out of the vendored base, so a repository still
-  pinning 1.4.0 stays green and goes red when it re-vendors — measured on a copy of `exeris-docs`:
-  0 findings on its current pin, 8 the moment 2.0.0 is vendored in.
+  count as closing it once. What is required is read out of the vendored base, so a repository
+  still pinning 1.4.0 stays green and goes red when it re-vendors — measured on a copy of
+  `exeris-docs`: 0 findings on its current pin, 8 the moment 2.0.0 is vendored in.
+- Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
+  into a vendored tree the manifest does **not** pin is a finding, not a shrug: it resolves, so no
+  other check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
+  pointer is resolved as well as its file, because `<base>#/properties/<name>/items` is now the
+  documented way to close a nested object and a pointer that names nothing is a closer over
+  nothing.
+- **The eval runner refuses a case whose `expect.schema` names a bundle base.** That was the
+  release's second piece of consumer work and it shipped as advice; advice is not a check, and the
+  closer rule got one. A base now accepts a foreign property anywhere and any value the
+  repository's own enums exclude, so a case graded against one passes on answers the repository
+  refuses. Point `expect.schema` at the composed schema in `.agents/schemas/`.
 - `tests/test_schema_closers.py`, run in CI: what a composition over the open bases refuses, what
   the bare base no longer does, what an unclosed object admits, and the checker's answer to every
   closer removed in turn. The instance cases are graded through `bundle/evals/run.py`'s own
@@ -79,6 +90,13 @@ number.
 
 ### Fixed
 
+- **A `$ref` that did not resolve ended the whole eval run.** It left `validate()` as an
+  exception, and neither `grade()` nor `run()` catches one, so a single bad path in a single case
+  took every later case's result with it. It is now the failure of the case that named that schema.
+- **The grader's fallback rebuilt itself without the reference registry and said nothing.** A
+  validator without the registry and without the location `$id` resolves no vendored `$ref` at all;
+  it reported like the whole contract while checking the repository's own keywords. Each half now
+  says which one is missing instead of degrading quietly.
 - **The eval grader raised instead of grading whenever a verdict carried a handoff.** `$ref`s were
   resolved against the composed schema's directory, so the base's own relative reference to
   `handoff.base.schema.json` was joined onto a relative base URI — and `urljoin` normalises the
@@ -87,12 +105,6 @@ number.
   a graded failure. The schema is now identified by the file it was read from, so each `$ref`
   resolves next to the file that names it. Latent since 1.0.0 and fixed here because this release
   makes that path the one every evaluation takes.
-
-### Changed
-
-- An eval case that named a base schema in `expect.schema` was validating against the shape that
-  now refuses nothing. Point it at the repository's composed schema: the base accepts a foreign
-  property anywhere, and a value outside any enum the repository added.
 
 ## [1.4.0] - 2026-09-09
 

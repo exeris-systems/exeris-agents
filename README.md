@@ -50,7 +50,9 @@ and a repository's schema narrows a base one instead of copying it:
     { "properties": {
         "agent": { "enum": ["my-repo-reviewer"] },
         "findings": { "items": {
-          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/findings/items",
+          "allOf": [
+            { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/findings/items" },
+            { "properties": { "tag": { "enum": ["style", "correctness"] } } } ],
           "unevaluatedProperties": false } },
         "checks_run": { "items": {
           "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/checks_run/items",
@@ -61,11 +63,17 @@ and a repository's schema narrows a base one instead of copying it:
   "unevaluatedProperties": false }
 ```
 
-One closer per object, and the base carries none: a base that closes itself cannot be extended, and
-each base's `description` says where its closers belong. `unevaluatedProperties` stops at the
-object it sits in — a closer at the root does not reach into an array's items — so a schema that
-closes only its root still accepts any property inside a finding, a check entry or a handoff.
-`agents_file_check.py` names every object a composition leaves open.
+That is the whole shape: the enum a repository narrows, the property it adds — `tag`, on a finding,
+which is what an open base is for — and one closer per object. The base carries none, because a
+base that closes itself cannot be extended, and each base's `description` says where its closers
+belong. `unevaluatedProperties` stops at the object it sits in: a closer at the root does not reach
+into an array's items, so a schema closing only its root still takes any property inside a finding,
+a check entry or a handoff.
+
+The other two compositions are the same exercise, smaller. `triage-result.schema.json` closes three
+objects — its root, a `validation_gates` item and a `secondary_handoffs` item — and
+`handoff.schema.json` closes one, its root. `agents_file_check.py` names every object a composition
+leaves open, so `--root .` is the migration list rather than a reading exercise.
 
 ## Verifying it
 

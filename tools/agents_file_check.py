@@ -447,47 +447,48 @@ def check_workflows(rep: Report, agents: set[str], skills: set[str]):
                           rule="workflow")
 
 
-def refs_in(node):
-    """Every $ref value anywhere in a schema."""
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if k == "$ref" and isinstance(v, str):
-                yield v
-            else:
-                yield from refs_in(v)
-    elif isinstance(node, list):
-        for v in node:
-            yield from refs_in(v)
+def escaped(token) -> str:
+    """One JSON-pointer token. `~` and `/` are escaped, or the pointer means another place."""
+    return str(token).replace("~", "~0").replace("/", "~1")
 
 
 def subschemas(node, pointer: str = ""):
-    """Every object node in a schema, with the JSON pointer that names it."""
+    """Every node in a schema, with the JSON pointer that names it.
+
+    The one tree walker. `refs_in()` stood beside this doing a subset of the same descent, and two
+    walkers over one document is two chances to disagree about what is in it.
+    """
     if isinstance(node, dict):
         yield pointer, node
         for k, v in node.items():
-            yield from subschemas(v, f"{pointer}/{k}")
+            yield from subschemas(v, f"{pointer}/{escaped(k)}")
     elif isinstance(node, list):
         for i, v in enumerate(node):
             yield from subschemas(v, f"{pointer}/{i}")
 
 
-def ref_target(ref: str, from_dir: str, vendor_root: str | None):
-    """`(path, pointer)` for a `$ref` that lands in the vendored bundle tree, else None.
+def ref_target(ref, from_dir: str, vendor_root: str | None):
+    """`(path, pointer, pinned)` for a `$ref` that lands in the vendored tree, else None.
 
     A composition is recognised by where its reference resolves, not by a filename: `.base.` in a
     target's name is a convention the bundle happens to follow, and a repository that renamed one
     would silently stop being checked. `_compose` owns the one definition of the vendored root, so
     the checker cannot disagree with the renderer about which tree the bundle's shapes live in.
-    With nothing pinned, `.agents/vendor/` still names that tree — an unpinned import is reported
-    by check_pinned_bundle, and a schema composing over it is no less a composition meanwhile.
+
+    `pinned` is false when the reference lands in a vendored directory that is not the pinned one.
+    That case used to return None — not a composition at all — which made this rule blind in the
+    single state it exists for: a bump, where the manifest has moved and a schema still names the
+    directory it moved from. That directory is usually still on disk, so nothing else reports it
+    either. An off-pin reference is a finding, and what it names is still checked.
     """
     if not isinstance(ref, str) or ref.startswith("#") or ref.startswith(("http://", "https://")):
         return None
     path, _, pointer = ref.partition("#")
     target = os.path.normpath(os.path.join(from_dir, path))
-    if _compose.contained(vendor_root or _compose.VENDOR, target) is None:
+    if _compose.contained(_compose.VENDOR, target) is None:
         return None
-    return target, pointer
+    pinned = vendor_root is None or _compose.contained(vendor_root, target) is not None
+    return target, pointer, pinned
 
 
 def node_at(doc, pointer: str):
@@ -509,21 +510,36 @@ def node_at(doc, pointer: str):
 INERT = {"$ref", "$schema", "$id", "title", "description", "$comment",
          "unevaluatedProperties", "additionalProperties"}
 
+# Where a subschema sits in a document without applying to anything: `$defs` holds shapes for
+# something else to reference. A closer parked there closes nothing.
+UNAPPLIED = ("/$defs/", "/definitions/")
+
+_PARSED: dict = {}
+
+
+def load_schema(path: str):
+    """Parsed once per file. The base walk runs again for every composed schema in the repository,
+    and the bundle's three bases were being re-read and re-parsed each time round."""
+    key = os.path.realpath(path)
+    if key not in _PARSED:
+        try:
+            with open(key, encoding="utf-8") as fh:
+                _PARSED[key] = json.load(fh)
+        except Exception:
+            _PARSED[key] = None    # a missing or broken target is reported as a bad $ref
+    return _PARSED[key]
+
+
+def applied(pointer: str) -> bool:
+    """Whether a subschema at this pointer is applied to an instance at all."""
+    return not any(seg in pointer + "/" for seg in UNAPPLIED)
+
 
 def alias(node) -> str | None:
     """The `$ref` of a node that only forwards, or None."""
     if isinstance(node, dict) and isinstance(node.get("$ref"), str) and not set(node) - INERT:
         return node["$ref"]
     return None
-
-
-def load_schema(path: str):
-    import json
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return None      # a missing or broken target is already reported as a bad $ref
 
 
 def site(path: str, pointer: str, vendor_root: str | None, seen=None):
@@ -548,54 +564,71 @@ def site(path: str, pointer: str, vendor_root: str | None, seen=None):
     return real, pointer
 
 
-def open_objects(path: str, vendor_root: str | None, seen=None):
-    """Every object a base leaves open, as normalised sites.
+def open_objects(path: str, pointer: str, vendor_root: str | None, seen=None):
+    """Every object left open at or under one site, as normalised sites.
 
-    An object is what the base declares with `"type": "object"`; open is one carrying neither
-    closer. The walk follows a forwarding `$ref` into another base file, because `handoffs` is an
-    object of the verdict contract even though it is declared one file over — and an object nobody
-    closes accepts any property whatever the root does.
+    Rooted at the object a composition actually pulls in, not at the top of the file that object
+    lives in: a schema composing `verdict.base#/properties/findings/items` owes a closer for that
+    object and whatever objects hang below it, and owes nothing for the rest of a document it
+    never names. An object is what the base declares with `"type": "object"`; open is one carrying
+    neither closer. A forwarding `$ref` is followed **with its pointer**, because `handoffs` is an
+    object of the verdict contract even though it is declared one file over.
     """
     seen = seen if seen is not None else set()
-    real = os.path.realpath(path)
-    if real in seen:
+    key = (os.path.realpath(path), pointer)
+    if key in seen:
         return []
-    seen.add(real)
+    seen.add(key)
     doc = load_schema(path)
-    if not isinstance(doc, dict):
+    start = doc if not pointer else node_at(doc, pointer)
+    if not isinstance(start, dict):
         return []
     found = []
-    for pointer, node in subschemas(doc):
+    for below, node in subschemas(start):
         if not isinstance(node, dict):
             continue
+        here = pointer + below
         ref = alias(node)
         if ref:
             onward = ref_target(ref, os.path.dirname(path), vendor_root)
-            if onward and onward[0] != path:
-                found += open_objects(onward[0], vendor_root, seen)
+            if onward:
+                found += open_objects(onward[0], onward[1], vendor_root, seen)
         elif node.get("type") == "object" and node.get("additionalProperties") is not False \
                 and node.get("unevaluatedProperties") is not False:
-            found.append(site(path, pointer, vendor_root))
+            found.append(site(path, here, vendor_root))
     return list(dict.fromkeys(found))
 
 
 def composed_over(schema, schema_dir: str, vendor_root: str | None):
-    """Which bundle objects this schema pulls in: site -> (closed?, where it says so)."""
-    pulled: dict = {}
+    """Every point at which this schema pulls a bundle object in.
+
+    One entry per application point, `(site, pointer, closed, pinned)` — not one verdict per
+    object. Closure used to be `any subschema anywhere in the document`, so a closer in a branch
+    that applies to nothing laundered the live composition that was open; each point now answers
+    for itself. A node's `allOf` branch that carries the reference is the same application point as
+    the node holding the `unevaluatedProperties`, so it is not counted twice.
+    """
+    found, counted = [], set()
     for pointer, node in subschemas(schema):
-        if not isinstance(node, dict):
+        if not isinstance(node, dict) or pointer in counted:
             continue
-        refs = [node.get("$ref")] + [b.get("$ref") for b in node.get("allOf") or []
-                                     if isinstance(b, dict)]
+        refs = [node["$ref"]] if isinstance(node.get("$ref"), str) else []
+        for i, branch in enumerate(node.get("allOf") or []):
+            if isinstance(branch, dict) and isinstance(branch.get("$ref"), str):
+                refs.append(branch["$ref"])
+                counted.add(f"{pointer}/allOf/{i}")
         closed = node.get("unevaluatedProperties") is False
         for ref in refs:
             target = ref_target(ref, schema_dir, vendor_root)
-            if not target:
-                continue
-            key = site(target[0], target[1], vendor_root)
-            was, where = pulled.get(key, (False, pointer))
-            pulled[key] = (was or closed, where if was or not closed else pointer)
-    return pulled
+            if target:
+                found.append((site(target[0], target[1], vendor_root), pointer, closed, target[2]))
+    return found
+
+
+def vendored_tree(path: str) -> str:
+    """The `.agents/vendor/<bundle>-<version>` a path sits in."""
+    rel = os.path.relpath(path, _compose.VENDOR)
+    return os.path.join(_compose.VENDOR, rel.split(os.sep)[0])
 
 
 def check_closers(rep: Report, rel: str, schema, schema_dir: str, vendor_root: str | None):
@@ -623,33 +656,43 @@ def check_closers(rep: Report, rel: str, schema, schema_dir: str, vendor_root: s
     pulled = composed_over(schema, schema_dir, vendor_root)
     if not pulled:
         return
-    # One report per object, not per base that reaches it: `handoffs` is an open object of the
-    # verdict base and the root object of the handoff base, and a composition closes it once.
-    required = dict.fromkeys(target for base in dict.fromkeys(path for path, _ in pulled)
-                             for target in open_objects(base, vendor_root))
+
+    for tree in dict.fromkeys(vendored_tree(target[0]) for target, _, _, pinned in pulled
+                              if not pinned):
+        rep.error(rel, f"composes over {tree}, which the manifest does not pin — the pin's digest "
+                       f"vouches for {os.path.relpath(vendor_root)} and for nothing else, and a "
+                       f"reference left on another vendored tree still resolves, so no other check "
+                       f"reports it. This is the state a half-finished bump is in (rules 8, 13)",
+                  rule="schema")
+
+    # A subschema under `$defs` is applied to nothing until something references it, so it can
+    # neither close an object nor be asked to.
+    live = [entry for entry in pulled if applied(entry[1])]
+    required = dict.fromkeys(found for target, _, _, _ in live
+                             for found in open_objects(target[0], target[1], vendor_root))
     for target in required:
-        closed, where = pulled.get(target, (False, None))
-        if closed:
-            continue
+        here = [entry for entry in live if entry[0] == target]
         named = os.path.relpath(target[0]) + ("#" + target[1] if target[1]
                                               else " (its root object)")
-        if where is None:
+        if not here:
             rep.error(rel, f"nothing here closes {named}, which the base leaves open — a "
                            f"composition closes every object it pulls in, and a closer at the "
                            f"root does not reach into an array's items. Add a subschema over "
                            f"that object carrying its `$ref` and `unevaluatedProperties: "
                            f"false` (rule 13)", rule="schema")
-        else:
-            rep.error(rel, f"{'the root' if not where else chr(39) + where + chr(39)} composes "
-                           f"{named} and carries no `unevaluatedProperties: false` — the closer "
-                           f"sees only what its own object composes, so it belongs in that "
-                           f"same object (rule 13)", rule="schema")
+            continue
+        for _, pointer, closed, _ in here:
+            if closed:
+                continue
+            where = "the root" if not pointer else f"'{pointer}'"
+            rep.error(rel, f"{where} composes {named} and carries no `unevaluatedProperties: "
+                           f"false` — the closer sees only what its own object composes, so it "
+                           f"belongs in that same object (rule 13)", rule="schema")
 
 
 def check_schemas(rep: Report, vendor_root: str | None = None):
     """rule 13 — the decision handoffs are real, valid JSON Schema, and a composition over a
     vendored base carries the closer the base leaves to it."""
-    import json
     d = os.path.join(".agents", "schemas")
     if not os.path.isdir(d):
         return
@@ -672,19 +715,33 @@ def check_schemas(rep: Report, vendor_root: str | None = None):
         # A relative $ref is how a repository narrows a vendored base without copying it. It is
         # also the thing that silently stops resolving when a bundle version is bumped and the
         # composing schema is not, so the target is checked as a file rather than assumed.
-        for ref in refs_in(schema):
-            # A fragment-only ref points inside this same document — local, offline, fine. It is a
-            # URL that is the problem: resolving one needs a fetch, and rule 8 forbids fetching.
-            if ref.startswith("#"):
+        for _, node in subschemas(schema):
+            ref = node.get("$ref") if isinstance(node, dict) else None
+            if not isinstance(ref, str):
                 continue
+            # A URL is the one that has to be refused: resolving one needs a fetch, and rule 8
+            # forbids fetching. A fragment-only ref points inside this same document.
             if ref.startswith(("http://", "https://")):
                 rep.error(rel, f"$ref '{ref}' is a URL — a vendored bundle resolves from the "
                                f"filesystem, and fetching one at validation time is what rule 8 "
                                f"forbids. Use a relative path into .agents/vendor/.", rule="schema")
                 continue
-            target = os.path.normpath(os.path.join(d, ref.split("#", 1)[0]))
-            if not os.path.exists(target):
-                rep.error(rel, f"$ref target does not exist: {ref}", rule="schema")
+            file_part, _, fragment = ref.partition("#")
+            if file_part:
+                target = os.path.normpath(os.path.join(d, file_part))
+                if not os.path.exists(target):
+                    rep.error(rel, f"$ref target does not exist: {ref}", rule="schema")
+                    continue
+                document = load_schema(target)
+            else:
+                document = schema
+            # And the pointer, which nothing checked. The file existing was taken for the whole
+            # answer, while this release makes `<file>#/properties/<name>/items` the documented way
+            # to close a nested object — a typo there is a closer over nothing, on a `$ref` whose
+            # file is right there.
+            if fragment.startswith("/") and node_at(document, fragment) is None:
+                rep.error(rel, f"$ref '{ref}' names a pointer that does not resolve in "
+                               f"{file_part or 'this document'}", rule="schema")
         check_closers(rep, rel, schema, d, vendor_root)
         if Validator is None:
             rep.warning(rel, "jsonschema is not installed; only JSON syntax was checked",
