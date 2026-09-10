@@ -93,21 +93,36 @@ number.
 
 ### Fixed
 
-- **A `$ref` that did not resolve ended the whole eval run.** It left `validate()` as an
-  exception, and neither `grade()` nor `run()` catches one, so a single bad path in a single case
-  took every later case's result with it. It is now the failure of the case that named that schema.
+- **An eval run no longer ends on one bad reference — third statement, and the first two were
+  wrong.** The first fix made a base's own relative `$ref` resolve next to the base rather than
+  next to the composed schema, which is why a verdict carrying a handoff had been ending the run
+  with `Unresolvable` since 1.0.0: `urljoin` normalises the leading `../` away when the base URI is
+  itself relative, so the second hop landed in a directory no repository has. That was written up
+  here as the failure class closed. It was not: any *other* unresolvable reference still left
+  `validate()` as an exception, and neither `grade()` nor `run()` catches one, so a single bad path
+  still took every later case's result with it. The second fix caught `Exception` and this entry
+  said so again — and `within_repo()` refuses a path that leaves the checkout by calling
+  `sys.exit`, which raises `SystemExit`, which is not an `Exception`. So the guard protecting the
+  runner was killing the run it protected, through the branch the fix had just declared closed.
+  Three outcomes are now distinguished and each has a test: a reference that resolves to nothing, a
+  path refused for leaving the repository, and any other failure, which says it was the grader that
+  failed and names what raised. The history is here rather than tidied away because this release's
+  argument is that a claim nothing re-measures is worth less than a run.
+- **Every failure was reported as a `$ref` that did not resolve.** The catch-all told each case the
+  same story, path and all, whatever had actually gone wrong — a grader that misnames a failure
+  sends its reader to the wrong file.
+- **A schema declaring its own `$id` never got the location that makes its references resolve.**
+  `located()` supplies the file a schema was read from as its identifier, and it deferred whenever
+  the schema already carried one. A repository that gives its schema an `$id`, as JSON Schema
+  invites, then had every relative `$ref` joined onto that identifier instead of onto the file, and
+  the failure surfaced as a missing file — pointing the reader at the vendored tree rather than at
+  the identifier that had redirected them. The file wins now: rule 8 lets a reference resolve from
+  the filesystem and nowhere else, so where the document is *is* what its references are relative
+  to.
 - **The grader's fallback rebuilt itself without the reference registry and said nothing.** A
   validator without the registry and without the location `$id` resolves no vendored `$ref` at all;
   it reported like the whole contract while checking the repository's own keywords. Each half now
   says which one is missing instead of degrading quietly.
-- **The eval grader raised instead of grading whenever a verdict carried a handoff.** `$ref`s were
-  resolved against the composed schema's directory, so the base's own relative reference to
-  `handoff.base.schema.json` was joined onto a relative base URI — and `urljoin` normalises the
-  leading `../` away, landing in a directory that does not exist. Every verdict or triage result
-  with a non-empty `handoffs` / `secondary_handoffs` ended the run with `Unresolvable` rather than
-  a graded failure. The schema is now identified by the file it was read from, so each `$ref`
-  resolves next to the file that names it. Latent since 1.0.0 and fixed here because this release
-  makes that path the one every evaluation takes.
 
 ## [1.4.0] - 2026-09-09
 

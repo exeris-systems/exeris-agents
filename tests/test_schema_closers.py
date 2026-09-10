@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""The closer moved from the base to the composition — agents-md-schema.md rule 13.
+"""The closer moved from the base to the composition.
+
+Rule 13 makes the files in `.agents/schemas/` what a decision conforms to and says nothing about
+where a `$ref` sits or what closes an object; that a composition must refuse what the base does not
+name is this bundle's own contract, written in each base's `description` and in `CHANGELOG.md`.
 
 A base that closes itself cannot be extended. `additionalProperties: false` refuses an added
 field, and `unevaluatedProperties: false` in the base refuses it just as flatly, because that
@@ -495,6 +499,22 @@ def test_an_object_the_composition_never_mentions_is_named_the_same_way():
 def test_the_handoff_object_counts_although_it_lives_in_another_file():
     check("a shape the base pulls in by `$ref` is one of its objects",
           closer_errors(handoffs=False), ["handoffs/0"])
+
+
+def test_a_base_referenced_somewhere_an_instance_never_meets_is_reported():
+    """The last branch that returned in silence. The probe is built from what applies at an
+    instance's root, so a `$ref` into a base parked anywhere else leaves the question unasked —
+    and unasked was indistinguishable from answered: no closer check and no message, on a schema
+    that may well carry an open contract."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"verdict": {"$ref": BASE}}})
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a base referenced away from the root is reported rather than skipped",
+              any("not where an instance meets" in f for f in out), True)
+    finally:
+        shutil.rmtree(d)
 
 
 # ── one case per cause of the walker this check used to be ────────────────────────────────────

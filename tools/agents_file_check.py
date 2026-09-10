@@ -693,8 +693,19 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
         probe.update(instance)
         locations += [l for l in found if l not in locations]
     if not composes:
-        # Nothing of the bundle's is pulled in where an instance meets it. A `$ref` deeper inside a
-        # shape this repository owns is out of scope and says so, rather than being half-checked.
+        # Nothing of the bundle's applies where an instance meets this schema, so the probe has no
+        # root to stand on and the question cannot be asked. Asked-and-answered and never-asked
+        # used to look identical from outside — a clean run either way — which is the shape this
+        # check spent three rounds removing from everywhere else.
+        elsewhere = any(ref_target(node["$ref"], os.path.dirname(schema_path), roots)
+                        for node in subschemas(schema) if isinstance(node.get("$ref"), str))
+        if elsewhere:
+            rep.error(rel, "references a bundle base, but not where an instance meets this schema "
+                           "— the reference sits under a shape this repository owns, so whether a "
+                           "property the base does not name is refused cannot be measured here and "
+                           "has not been. Compose the base at the root, which is the shape "
+                           "README.md documents and every base's `description` assumes, or move "
+                           "that reference into a schema of its own", rule="schema")
         return
 
     try:
@@ -713,13 +724,16 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
         rep.error(rel, f"an instance may carry any property at {where(location)} — one was added "
                        f"there and nothing in this schema refused it, so the object takes whatever "
                        f"the base does not name. Close it: the base closes nothing, and a closer "
-                       f"at the root does not reach into an array's items (rule 13)",
-                  rule="schema")
+                       f"at the root does not reach into an array's items. Rule 13 makes this file "
+                       f"what a decision conforms to; that the closers are yours is this bundle's "
+                       f"contract, in the base's own `description`", rule="schema")
 
 
 def check_schemas(rep: Report, roots=()):
-    """rule 13 — the decision handoffs are real, valid JSON Schema, and a composition over a
-    vendored base carries the closer the base leaves to it."""
+    """The schema files a decision conforms to are real, valid JSON Schema — rule 13 — and each
+    reference in them resolves. That a composition over a vendored base must refuse what the base
+    does not name is this bundle's own contract rather than a clause of the standard, and it is
+    written in each base's `description`; rule 13 is what makes these files the contract at all."""
     d = os.path.join(".agents", "schemas")
     if not os.path.isdir(d):
         return
@@ -789,7 +803,7 @@ def check_schemas(rep: Report, roots=()):
                            f"pin's digest vouches for the tree it names and for nothing else, and "
                            f"a reference into another vendored tree still resolves, so no other "
                            f"check reports it. This is the state a half-finished bump is in "
-                           f"(rules 8, 13)", rule="schema")
+                           f"(rule 8)", rule="schema")
         if Validator is None:
             rep.warning(rel, f"{missing} is not installed; only JSON syntax was checked",
                         rule="schema")
