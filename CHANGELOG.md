@@ -70,8 +70,11 @@ number.
   filename, so a repository that renames a schema does not quietly stop being checked, and both
   spellings of one object (`verdict.base#/properties/handoffs/items` and `handoff.base` itself)
   count as closing it once. What is required is read out of the vendored base, so a repository
-  still pinning 1.4.0 stays green and goes red when it re-vendors — measured on a copy of
-  `exeris-docs`: 0 findings on its current pin, 8 the moment 2.0.0 is vendored in.
+  stays green while it pins a bundle whose bases still close themselves and goes red when it
+  re-vendors — the moment the enforcement actually moves. From then on a schema composing over a
+  base closes every object that base leaves open, its root and each nested one, and the checker
+  names each site left open: the count is whatever a run says, not whatever a release note said
+  once.
 - Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
   into a vendored tree the manifest does **not** pin is a finding, not a shrug: it resolves, so no
   other check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s

@@ -223,21 +223,59 @@ OPEN_OBJECT = {"type": "object", "properties": {"a": {"type": "string"}}}
 
 # ── where the rule used to answer wrongly: silence one way, noise the other ───────────────────
 
+STALE = "exeris-agents-1.4.0/schemas/verdict.base.schema.json"
+
+
+def stray(closed_base: bool) -> str:
+    """A repository mid-bump: the manifest pins 2.0.0, the schema still names the tree it left.
+
+    `closed_base` is what the old tree holds. A bundle whose bases still close themselves leaves
+    nothing for the closer rule to say, which is the case that has to be heard from anyway.
+    """
+    base = ({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "additionalProperties": False, "properties": {"agent": {"type": "string"}}}
+            if closed_base else
+            json.load(open(os.path.join(SCHEMAS, "verdict.base.schema.json"), encoding="utf-8")))
+    return custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                   "allOf": [{"$ref": f"../vendor/{STALE}"}]},
+                  vendored={STALE: base})
+
+
+def off_pin(out: list[str]) -> list[str]:
+    return [f for f in out if "does not pin" in f]
+
+
 def test_a_ref_into_an_unpinned_vendored_tree_is_not_a_skip():
     """The bump state. A repository re-pins its manifest and re-vendors, and until every schema's
     `$ref` is retargeted the composition still names the old directory — which exists, so no
     "target does not exist" fires. The closer rule used to answer that by recognising nothing at
     all, so the one moment it is there for was the one moment it said nothing."""
-    old = "exeris-agents-1.4.0/schemas/verdict.base.schema.json"
-    out = findings_for(custom(
-        {"$schema": "https://json-schema.org/draft/2020-12/schema",
-         "allOf": [{"$ref": f"../vendor/{old}"}]},
-        vendored={old: json.load(open(os.path.join(SCHEMAS, "verdict.base.schema.json"),
-                                      encoding="utf-8"))}))
+    out = findings_for(stray(closed_base=False))
     check("composing over a vendored tree the manifest does not pin is reported",
-          any("does not pin" in f or "not the pinned" in f for f in out), True)
-    check("and the objects in it are still required to be closed",
+          len(off_pin(out)), 1)
+    check("and the objects behind it are still required to be closed — an instance is validated "
+          "against them whichever tree they were reached through",
           sum(1 for f in out if "unevaluatedProperties" in f) > 0, True)
+
+
+def test_a_stray_reference_is_heard_from_with_nothing_else_wrong():
+    """The case that moved the report out of the closer check. The old tree's bases still close
+    themselves, so the closer rule has nothing to say about this schema at all — and a repository
+    whose reference points at a tree its pin does not vouch for should not need a second defect
+    before anything tells it."""
+    out = findings_for(stray(closed_base=True))
+    check("the stray reference is reported on its own", len(off_pin(out)), 1)
+    check("and it is the only thing reported", len(out), 1)
+
+
+def test_a_stray_reference_is_reported_once_beside_a_closure_problem():
+    """Two checks now touch the same reference. The one that judges references reports it; the one
+    that judges closure uses it and says nothing about it."""
+    out = findings_for(stray(closed_base=False))
+    check("one annotation for the stray tree, not one per check that noticed",
+          len(off_pin(out)), 1)
+    check("and the closure findings are still there beside it",
+          len([f for f in out if "unevaluatedProperties" in f]) > 0, True)
 
 
 def test_a_closer_in_a_dead_branch_does_not_launder_an_open_one():

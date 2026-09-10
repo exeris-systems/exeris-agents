@@ -602,11 +602,17 @@ def open_objects(path: str, pointer: str, vendor_root: str | None, seen=None):
 def composed_over(schema, schema_dir: str, vendor_root: str | None):
     """Every point at which this schema pulls a bundle object in.
 
-    One entry per application point, `(site, pointer, closed, pinned)` — not one verdict per
-    object. Closure used to be `any subschema anywhere in the document`, so a closer in a branch
-    that applies to nothing laundered the live composition that was open; each point now answers
-    for itself. A node's `allOf` branch that carries the reference is the same application point as
-    the node holding the `unevaluatedProperties`, so it is not counted twice.
+    One entry per application point, `(site, pointer, closed)` — not one verdict per object.
+    Closure used to be `any subschema anywhere in the document`, so a closer in a branch that
+    applies to nothing laundered the live composition that was open; each point now answers for
+    itself. A node's `allOf` branch that carries the reference is the same application point as the
+    node holding the `unevaluatedProperties`, so it is not counted twice.
+
+    Whether a reference lands in the pinned tree is not asked here. It is a property of the
+    reference, and `check_schemas` asks the two questions beside it — does the target exist, does
+    its pointer resolve. What this function does with an off-pin reference is follow it: the
+    objects behind it are the objects an instance is validated against, whichever tree they were
+    reached through, so they are still required to be closed.
     """
     found, counted = [], set()
     for pointer, node in subschemas(schema):
@@ -621,7 +627,7 @@ def composed_over(schema, schema_dir: str, vendor_root: str | None):
         for ref in refs:
             target = ref_target(ref, schema_dir, vendor_root)
             if target:
-                found.append((site(target[0], target[1], vendor_root), pointer, closed, target[2]))
+                found.append((site(target[0], target[1], vendor_root), pointer, closed))
     return found
 
 
@@ -657,18 +663,10 @@ def check_closers(rep: Report, rel: str, schema, schema_dir: str, vendor_root: s
     if not pulled:
         return
 
-    for tree in dict.fromkeys(vendored_tree(target[0]) for target, _, _, pinned in pulled
-                              if not pinned):
-        rep.error(rel, f"composes over {tree}, which the manifest does not pin — the pin's digest "
-                       f"vouches for {os.path.relpath(vendor_root)} and for nothing else, and a "
-                       f"reference left on another vendored tree still resolves, so no other check "
-                       f"reports it. This is the state a half-finished bump is in (rules 8, 13)",
-                  rule="schema")
-
     # A subschema under `$defs` is applied to nothing until something references it, so it can
     # neither close an object nor be asked to.
     live = [entry for entry in pulled if applied(entry[1])]
-    required = dict.fromkeys(found for target, _, _, _ in live
+    required = dict.fromkeys(found for target, _, _ in live
                              for found in open_objects(target[0], target[1], vendor_root))
     for target in required:
         here = [entry for entry in live if entry[0] == target]
@@ -681,7 +679,7 @@ def check_closers(rep: Report, rel: str, schema, schema_dir: str, vendor_root: s
                            f"that object carrying its `$ref` and `unevaluatedProperties: "
                            f"false` (rule 13)", rule="schema")
             continue
-        for _, pointer, closed, _ in here:
+        for _, pointer, closed in here:
             if closed:
                 continue
             where = "the root" if not pointer else f"'{pointer}'"
@@ -715,6 +713,12 @@ def check_schemas(rep: Report, vendor_root: str | None = None):
         # A relative $ref is how a repository narrows a vendored base without copying it. It is
         # also the thing that silently stops resolving when a bundle version is bumped and the
         # composing schema is not, so the target is checked as a file rather than assumed.
+        # Three questions about one reference, asked where a reference is judged: does the target
+        # exist, does its pointer resolve, and does it land in the tree the manifest pins. An
+        # off-pin tree is reported once however many references reach it — it is one fact with one
+        # fix, retargeting this schema, and a composition closing four objects against a stale tree
+        # would otherwise answer for it four times.
+        off_pin = []
         for _, node in subschemas(schema):
             ref = node.get("$ref") if isinstance(node, dict) else None
             if not isinstance(ref, str):
@@ -742,6 +746,15 @@ def check_schemas(rep: Report, vendor_root: str | None = None):
             if fragment.startswith("/") and node_at(document, fragment) is None:
                 rep.error(rel, f"$ref '{ref}' names a pointer that does not resolve in "
                                f"{file_part or 'this document'}", rule="schema")
+            landed = ref_target(ref, d, vendor_root)
+            if landed and not landed[2]:
+                off_pin.append(vendored_tree(landed[0]))
+        for tree in dict.fromkeys(off_pin):
+            rep.error(rel, f"composes over {tree}, which the manifest does not pin — the pin's "
+                           f"digest vouches for {os.path.relpath(vendor_root)} and for nothing "
+                           f"else, and a reference into another vendored tree still resolves, so "
+                           f"no other check reports it. This is the state a half-finished bump is "
+                           f"in (rules 8, 13)", rule="schema")
         check_closers(rep, rel, schema, d, vendor_root)
         if Validator is None:
             rep.warning(rel, "jsonschema is not installed; only JSON syntax was checked",
