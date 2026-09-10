@@ -479,6 +479,67 @@ def test_a_case_pointed_at_a_bundle_base_is_refused():
         shutil.rmtree(d)
 
 
+def test_a_composed_schema_that_declares_its_own_id_still_resolves():
+    """`located()` supplies the file a schema was read from as its `$id`, which is what makes a
+    relative `$ref` into the vendored tree resolve. It declined to do so when the schema already
+    declared one — and a repository that gives its schema an `$id`, as JSON Schema invites, then
+    has every `$ref` joined onto that identifier instead of onto the file. The failure arrives as a
+    missing file, which points the reader at the vendored tree rather than at the `$id`."""
+    d, composed, runner = grader_tree()
+    try:
+        body = json.load(open(composed, encoding="utf-8"))
+        write(composed, json.dumps({"$id": "https://exeris.example/schemas/verdict", **body}))
+        mod = load_runner(runner, "evalrun_ownid")
+        out = mod.validate(VERDICT, composed)
+        check("a schema with its own `$id` validates against the vendored base all the same",
+              out, [])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_ref_leaving_the_checkout_fails_the_case_rather_than_the_run():
+    """`within_repo()` refuses by exiting the process — right for a CLI argument read once at
+    startup, wrong inside a grader, where it takes every later case with it. `except Exception`
+    does not catch `SystemExit`, so this was still the failure class `### Fixed` claims to close."""
+    d, composed, runner = grader_tree()
+    try:
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": "../../../../../../etc/passwd"}]}))
+        mod = load_runner(runner, "evalrun_escape")
+        try:
+            out = mod.validate(VERDICT, composed)
+        except BaseException as exc:
+            check(f"a $ref out of the checkout is graded, not exited ({type(exc).__name__})",
+                  False, True)
+            return
+        check("and the failure says the reference left the repository",
+              bool(out) and "outside the repository" in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_failure_that_is_not_about_a_path_is_not_reported_as_one():
+    """The catch-all told every case the same story — a `$ref` that did not resolve, a path that is
+    not there. A grader that misnames what went wrong sends its reader to the wrong file."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "evalrun_mislabel")
+
+        class Exploding(dict):
+            def __contains__(self, key): raise RuntimeError("not a path problem at all")
+
+        try:
+            out = mod.validate(Exploding(), composed)
+        except BaseException as exc:
+            check(f"an unexpected failure is caught ({type(exc).__name__})", False, True)
+            return
+        check("and it is not dressed up as a missing file",
+              bool(out) and "path that is not there" not in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
 def test_a_policy_nothing_composes_is_reported():
     """rule 5's unchecked direction. The forward one — a profile naming a policy that does not
     resolve — is an error. The reverse was invisible: on disk, in the manifest, composed by nobody.

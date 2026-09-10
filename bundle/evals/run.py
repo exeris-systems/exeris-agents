@@ -92,14 +92,21 @@ def load_yaml(path: str):
 def located(schema: dict, schema_path: str) -> dict:
     """The schema, carrying the file it was read from as its `$id`.
 
-    Nothing on disk carries one: an `$id` in a vendored base would make its canonical identifier a
-    URL to fetch or register, which is the whole reason the bases do without. But a validator with
-    no `$id` starts from an empty base URI, and every `$ref` then resolves relative to relative —
-    where the join is not the join anyone means. See `resolvable_from()`. The identifier is
-    supplied here, at read time, out of where the file actually is: it names a location, never
-    something to retrieve.
+    Nothing in the bundle carries one: an `$id` in a vendored base would make its canonical
+    identifier a URL to fetch or register, which is the whole reason the bases do without. But a
+    validator with no `$id` starts from an empty base URI, and every `$ref` then resolves relative
+    to relative — where the join is not the join anyone means. See `resolvable_from()`. The
+    identifier is supplied here, at read time, out of where the file actually is: it names a
+    location, never something to retrieve.
+
+    The file wins over an `$id` the schema declares, and that is deliberate. A repository may give
+    its schema an identifier — JSON Schema invites it — and every relative `$ref` in a vendored
+    layout is still written relative to the file, because that is the only thing rule 8 lets a
+    reference resolve from. Deferring to a declared `$id` sent those references off to join a URL
+    the tree knows nothing about; the failure then arrived as a missing file, pointing the reader
+    at the vendored tree instead of at the identifier that redirected them.
     """
-    if not isinstance(schema, dict) or "$id" in schema:
+    if not isinstance(schema, dict):
         return schema
     return {**schema, "$id": resolvable_from(schema_path)}
 
@@ -192,16 +199,38 @@ def validate(instance, schema_path: str) -> list[str]:
         return [f"cannot validate {name}: this jsonschema does not take a reference registry "
                 f"({exc}); 4.18 and newer do, and without one a vendored `$ref` resolves to "
                 f"nothing"]
+    # Whatever goes wrong here belongs to the case that named this schema. Raised, it leaves
+    # `grade()` and `run()`, neither of which catches anything, and ends the whole run — every
+    # later case unreported over one bad path. The same reason `build_prompt`'s missing fixture is
+    # recorded rather than thrown. Three outcomes, because a grader that misnames what went wrong
+    # sends its reader to the wrong file.
     try:
         return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
                 for e in v.iter_errors(instance)]
+    except SystemExit as exc:
+        # `within_repo()` refuses by exiting: right for a CLI argument read once at startup, fatal
+        # here, where `except Exception` does not catch it and the run dies mid-case.
+        return [f"cannot validate {name}: a `$ref` resolved outside the repository and was refused "
+                f"({exc}). Paths are repository-relative by design"]
     except Exception as exc:
-        # A reference that does not resolve is a defect in the schema or in the vendored tree, and
-        # it belongs to the case that named that schema. Raised, it left `grade()` and `run()`,
-        # neither of which catches anything, and ended the whole run — every later case unreported
-        # over one bad path. The same reason `build_prompt`'s missing fixture is recorded here.
-        return [f"cannot validate {name}: a `$ref` did not resolve ({type(exc).__name__}: {exc}). "
-                f"A vendored base is a file on disk, so this is a path that is not there"]
+        if isinstance(exc, unresolvable()):
+            return [f"cannot validate {name}: a `$ref` did not resolve ({exc}). A vendored base is "
+                    f"a file on disk, so this is a path that is not there"]
+        return [f"cannot validate {name}: the grader failed on this instance "
+                f"({type(exc).__name__}: {exc})"]
+
+
+def unresolvable() -> tuple:
+    """The exception classes that mean a reference went nowhere.
+
+    jsonschema wraps referencing's `Unresolvable` and subclasses it, so one class covers both; the
+    empty tuple keeps the caller honest where `referencing` is not importable at all.
+    """
+    try:
+        from referencing.exceptions import Unresolvable
+        return (Unresolvable,)
+    except ImportError:
+        return ()
 
 
 def extract_json(raw: str):
