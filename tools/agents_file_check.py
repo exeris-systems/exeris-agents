@@ -20,7 +20,7 @@ covers its six concerns in order, whether a rule is encoded as the right kind of
 whether a reference is linked rather than copied.
 """
 from __future__ import annotations
-import argparse, copy, io, json, os, re, sys
+import argparse, copy, io, json, math, os, re, sys
 sys.path.insert(0, os.path.dirname(__file__))
 import _compose
 from _common import Report, read_frontmatter
@@ -574,13 +574,6 @@ def vendored_tree(path: str) -> str:
     return os.path.join(_compose.VENDOR, rel.split(os.sep)[0])
 
 
-# The properties injected to ask whether a location refuses one. Two, of deliberately different
-# name shapes: a refusal that only rejects the SHAPE of a name — a `propertyNames` pattern of
-# `^[a-z_]+$` — refuses the hyphenated one and takes the plain one, and reading either refusal as
-# "closed"
-# would call that schema closed while ordinary undeclared properties walk in. Both must be refused.
-# Long and ugly on purpose: neither may be a name a schema declares or a `patternProperties`
-# expects.
 # ── the closer rule: build a decision the schema accepts, then try to add a property ───────────
 #
 # Everything here rests on one thing: the instance is CONFORMING. The check spent five review
@@ -609,6 +602,16 @@ CANDIDATE_STRINGS = ("a", "abc", "human", "abc-def", "a.md#1", "ABC", "ABC_DEF",
 # a sixth review round.
 HANDLED_KEYWORDS = frozenset({"properties", "items", "prefixItems", "$ref", "allOf",
                               "$defs", "definitions"})
+
+# And the assertions. A keyword the generator does not satisfy is DECLINED where it appears —
+# never ignored, because an ignored assertion produces a value the schema refuses and turns a
+# conforming repository red. `uniqueItems` counts as honoured by never being violated: the
+# generator declines an array it would have to pad with copies rather than padding it.
+HONOURED_ASSERTIONS = frozenset({"type", "required", "enum", "const", "pattern", "minLength",
+                                 "maxLength", "minItems", "maxItems", "uniqueItems", "minimum",
+                                 "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"})
+DECLINED_ASSERTIONS = frozenset({"format", "minProperties", "maxProperties", "dependentRequired",
+                                 "minContains", "maxContains"})
 DECLINED_KEYWORDS = frozenset({"additionalItems", "patternProperties", "additionalProperties",
                                "propertyNames", "anyOf", "oneOf", "not", "if", "then", "else",
                                "dependentSchemas", "contains", "unevaluatedItems",
@@ -657,20 +660,22 @@ def resolved_ref(ref: str, document, base_dir: str, roots):
     return None, document, base_dir, f"a reference outside the bundle ('{ref}')"
 
 
-def applying(parts, roots, seen=frozenset()):
+def applying(parts, roots):
     """Every subschema that applies to one value, as `(node, document, directory)`.
 
     A `$ref` brings in what it names **and keeps its siblings**: `{"$ref": …, "properties": {…}}`
     declares both, and reading only the target lost the second. `allOf` branches apply for the same
-    reason. Cycles stop at the ancestors of a node rather than at everything visited, so one
-    neighbour referenced from two properties is expanded at both.
+    reason. Each entry carries the ancestors it was reached through, so a cycle stops while one
+    neighbour referenced from two properties is still expanded at both — a single visited-set for
+    the whole walk silently dropped the second.
     """
-    out, declined, stack = [], [], list(parts)
+    out, declined = [], []
+    stack = [(node, document, base_dir, frozenset()) for node, document, base_dir in parts]
     while stack:
-        node, document, base_dir = stack.pop(0)
-        if not isinstance(node, dict) or id(node) in seen:
+        node, document, base_dir, ancestors = stack.pop(0)
+        if not isinstance(node, dict) or id(node) in ancestors:
             continue
-        seen = seen | {id(node)}
+        below = ancestors | {id(node)}
         out.append((node, document, base_dir))
         ref = node.get("$ref")
         if isinstance(ref, str):
@@ -678,10 +683,35 @@ def applying(parts, roots, seen=frozenset()):
             if refusal:
                 declined.append(refusal)
             elif target is not None:
-                stack.append((target, onward, directory))
+                stack.append((target, onward, directory, below))
         for branch in node.get("allOf") or []:
-            stack.append((branch, document, base_dir))
+            stack.append((branch, document, base_dir, below))
     return out, declined
+
+
+def quantifier(pattern: str, i: int):
+    """`(how many times, where the pattern continues)` for whatever follows an atom.
+
+    `{3}` and `{2,4}` were read a character at a time, so `^ADR-[0-9]{3}$` produced `ADR-0` and
+    `^[A-Z]{2,4}$` produced `A,4` — a built string that does not match the pattern it was built
+    from, which the caller then reports as a value it could not construct or, worse, uses.
+    """
+    if i >= len(pattern):
+        return 1, i
+    if pattern[i] in "+*":
+        return 1, i + 1
+    if pattern[i] == "?":
+        return 0, i + 1
+    if pattern[i] == "{":
+        close = pattern.find("}", i)
+        if close < 0:
+            return None, i
+        counts = pattern[i + 1:close].split(",")
+        try:
+            return max(1, int(counts[0])) if counts[0] else 1, close + 1
+        except ValueError:
+            return None, i
+    return 1, i
 
 
 def from_pattern(pattern: str):
@@ -692,7 +722,7 @@ def from_pattern(pattern: str):
     narrow a path or a name — `^templates/[A-Z-]+-TEMPLATE\\.md$` is a real one — and anything it
     cannot build is declined rather than guessed at.
     """
-    out, i, depth = [], 0, 0
+    out, i = [], 0
     while i < len(pattern):
         ch = pattern[i]
         if ch in "^$":
@@ -709,13 +739,10 @@ def from_pattern(pattern: str):
                 (c for c in inside if c.isalnum()), None)
             if pick is None:
                 return None
-            if close + 1 < len(pattern) and pattern[close + 1] in "+*?{":
-                i = close + 2
-                while i < len(pattern) and pattern[i - 1] == "{" and pattern[i] != "}":
-                    i += 1
-            else:
-                i = close + 1
-            out.append(pick)
+            repeat, i = quantifier(pattern, close + 1)
+            if repeat is None:
+                return None
+            out.append(pick * repeat)
         elif ch == "(":
             end, level = i, 0
             for j in range(i, len(pattern)):
@@ -759,9 +786,32 @@ def a_string(parts):
 
 
 def a_number(parts, integer: bool):
-    low = max([n["minimum"] for n, _, _ in parts if isinstance(n.get("minimum"), (int, float))]
-              or [0])
-    return int(low) if integer else float(low)
+    """A number every part accepts, or None and the reason.
+
+    `minimum` alone was honoured and the rest — `exclusiveMinimum`, `maximum`,
+    `exclusiveMaximum`, `multipleOf` — were neither satisfied nor declined, so an out-of-range
+    value reached the schema and came back as an error against a repository that had done nothing
+    wrong.
+    """
+    def declared(keyword):
+        return [n[keyword] for n, _, _ in parts if isinstance(n.get(keyword), (int, float))
+                and not isinstance(n.get(keyword), bool)]
+
+    step = 1 if integer else 1e-9
+    low = max(declared("minimum") + [e + step for e in declared("exclusiveMinimum")] + [0])
+    high = min(declared("maximum") + [e - step for e in declared("exclusiveMaximum")]
+               + [float("inf")])
+    value = int(low) if integer else float(low)
+    for multiple in declared("multipleOf"):
+        if multiple > 0:
+            factor = math.ceil(value / multiple)
+            value = factor * multiple
+            value = int(value) if integer else float(value)
+    if value > high:
+        return None, (f"a number in {low}..{high}"
+                      + (" that is a multiple of " + ", ".join(str(m) for m in declared("multipleOf"))
+                         if declared("multipleOf") else ""))
+    return value, None
 
 
 def kind_of(parts) -> str:
@@ -782,45 +832,55 @@ def kind_of(parts) -> str:
     return "object"
 
 
-def build(parts, roots, depth: int = 8):
+def build(parts, roots, depth: int = 8, at=()):
     """`(value, declined)` — a value built to satisfy every subschema that applies.
 
-    Best effort by design: what it produces is checked against the schema before anything is
-    concluded from it, so a wrong guess here becomes a refusal to measure and never a wrong
-    verdict. `declined` names the constructs it walked past, so "not measured" is a line a reader
-    sees rather than an absence they infer.
+    Two lists come back beside the value. `declined` is `(location, reason)` for everything the
+    reader should hear about — a construct not walked, an assertion not satisfied, a value not
+    built. `unbuilt` is the subset that is a missing VALUE: those locations are pruned from the
+    instance and not probed, while a construct left unwalked costs a warning and nothing else.
+    Conflating them skipped the very object the reader was being warned about.
+
+    A location is what makes a decline cost one property rather than the schema. That is
+    the difference between costing one property and costing the schema. A pattern this cannot
+    construct used to end the measurement — "no decision could be built" — and an object three
+    levels away went unreported although the run knew perfectly well what was wrong with it. Now
+    the location is dropped from the instance, the rest is measured, and the location is named.
+
+    Best effort by design, and checked: what it produces is validated against the schema before
+    anything is concluded from it, so a wrong guess becomes a refusal to measure and never a wrong
+    verdict.
     """
-    parts, declined = applying(parts, roots)
+    parts, refusals = applying(parts, roots)
+    declined, unbuilt = [(at, why) for why in refusals], []
     if depth <= 0:
-        return {}, declined + ["the depth bound"]
+        return None, declined + [(at, "the depth bound")], [at]
     if not parts:
-        return {}, declined
+        return {}, declined, unbuilt
 
     for node, _, _ in parts:
         for keyword in sorted(DECLINED_KEYWORDS & set(node)):
             value = node[keyword]
             if keyword in ("patternProperties", "propertyNames", "additionalItems",
                            "unevaluatedItems"):
-                # These place or constrain values the generator cannot name: a property matching a
-                # pattern, an element past the ones declared. Always reported where they appear.
-                declined.append(f"`{keyword}`")
+                declined.append((at, f"`{keyword}`"))
             elif keyword in ("additionalProperties", "unevaluatedProperties"):
                 if object_ish(value):
-                    declined.append(f"`{keyword}` as a schema")
+                    declined.append((at, f"`{keyword}` as a schema"))
             elif introduces_shape(value):
-                # A branch that only tightens what is already built — the bases' own `if`/`then`
-                # over `findings` and `decision` — introduces no object and is not reported.
-                declined.append(f"`{keyword}`")
+                declined.append((at, f"`{keyword}`"))
+        for keyword in sorted(DECLINED_ASSERTIONS & set(node)):
+            declined.append((at, f"`{keyword}`, which this generator does not satisfy"))
 
     for node, _, _ in parts:
         if "const" in node:
-            return node["const"], declined
+            return node["const"], declined, unbuilt
     enums = [n["enum"] for n, _, _ in parts if isinstance(n.get("enum"), list) and n["enum"]]
     if enums:
         shared = [v for v in enums[0] if all(v in other for other in enums[1:])]
         if not shared:
-            return enums[0][0], declined + ["an enum no branch shares"]
-        return shared[0], declined
+            return None, declined + [(at, "a value every `enum` accepts")], [at]
+        return shared[0], declined, unbuilt
 
     kind = kind_of(parts)
     if kind == "object":
@@ -831,10 +891,13 @@ def build(parts, roots, depth: int = 8):
             for name in node.get("required") or []:
                 declared.setdefault(name, [])
         for name, subs in declared.items():
-            below, refusals = build(subs, roots, depth - 1) if subs else ({}, [])
-            value[name] = below
-            declined += [f"{r} under '{name}'" for r in refusals]
-        return value, declined
+            below, refused, unmade = (build(subs, roots, depth - 1, at + (name,)) if subs
+                                      else ({}, [], []))
+            declined += refused
+            unbuilt += unmade
+            if below is not None:
+                value[name] = below
+        return value, declined, unbuilt
     if kind == "array":
         positions, tail = [], []
         for node, document, base_dir in parts:
@@ -846,33 +909,93 @@ def build(parts, roots, depth: int = 8):
             if isinstance(node.get("items"), dict):
                 tail.append((node["items"], document, base_dir))
             elif "items" in node:
-                declined.append("an array whose item schema is not a schema object")
+                declined.append((at, "an array whose item schema is not a schema object"))
         built = []
-        for subs in positions:
-            below, refusals = build(subs, roots, depth - 1)
-            built.append(below)
-            declined += refusals
+        for index, subs in enumerate(positions):
+            below, refused, unmade = build(subs, roots, depth - 1, at + (index,))
+            declined += refused
+            unbuilt += unmade
+            built.append({} if below is None else below)
         # An element of `items` as well as the prefix positions: with both declared, `items` covers
         # everything past the prefix, and building only the prefix left that shape unmeasured.
         if tail:
-            below, refusals = build(tail, roots, depth - 1)
-            built.append(below)
-            declined += refusals
+            below, refused, unmade = build(tail, roots, depth - 1, at + (len(built),))
+            declined += refused
+            unbuilt += unmade
+            if below is not None:
+                built.append(below)
         low = max([n.get("minItems", 0) for n, _, _ in parts] or [0])
-        while len(built) < max(low, 1):
-            built.append(copy.deepcopy(built[-1]) if built else {})
+        unique = any(n.get("uniqueItems") is True for n, _, _ in parts)
+        if len(built) < low:
+            if unique or not built:
+                # Padding with copies violates `uniqueItems`, and an array with nothing to build
+                # from would be padded with an object the schema never declared. Either way the
+                # array is what could not be built, not the schema's fault.
+                return None, declined + [(at, f"an array of {low} elements this generator cannot "
+                                              f"make distinct" if unique else
+                                              f"an array of {low} elements with no item schema")], \
+                    unbuilt + [at]
+            while len(built) < low:
+                built.append(copy.deepcopy(built[-1]))
         high = min([n.get("maxItems", 1 << 20) for n, _, _ in parts] or [1 << 20])
-        return built[:high] if len(built) > high else built, declined
+        return (built[:high] if len(built) > high else built), declined, unbuilt
     if kind == "string":
         text, refusal = a_string(parts)
-        return (text if text is not None else ""), declined + ([refusal] if refusal else [])
+        if text is None:
+            return None, declined + [(at, refusal)], unbuilt + [at]
+        return text, declined, unbuilt
     if kind in ("integer", "number"):
-        return a_number(parts, kind == "integer"), declined
+        number, refusal = a_number(parts, kind == "integer")
+        if number is None:
+            return None, declined + [(at, refusal)], unbuilt + [at]
+        return number, declined, unbuilt
     if kind == "boolean":
-        return True, declined
+        return True, declined, unbuilt
     if kind == "null":
-        return None, declined
-    return {}, declined + [f"a value of type '{kind}'"]
+        return None, declined, unbuilt + [at]        # `null` is a value; pruning it keeps it out
+    return None, declined + [(at, f"a value of type '{kind}'")], unbuilt + [at]
+
+
+def prune(instance, locations):
+    """The instance with the values that could not be built removed.
+
+    Absence validates wherever the value was optional, which is what lets the rest of the decision
+    be measured. Where it was required the instance fails and the schema is declined whole — that
+    is the one case where a schema-wide decline is the honest answer.
+    """
+    out = copy.deepcopy(instance)
+    for location in sorted(locations, key=len, reverse=True):
+        if not location:
+            continue
+        node = out
+        for step in location[:-1]:
+            if isinstance(node, dict) and step in node:
+                node = node[step]
+            elif isinstance(node, list) and isinstance(step, int) and step < len(node):
+                node = node[step]
+            else:
+                node = None
+                break
+        last = location[-1]
+        if isinstance(node, dict) and last in node:
+            del node[last]
+        elif isinstance(node, list) and isinstance(last, int) and last < len(node):
+            node.pop(last)
+    return out
+
+
+def caused_by_pruning(path, missing) -> bool:
+    """Whether one validation error is this check's own doing rather than the schema's.
+
+    An error at or under something that could not be built, or on the object a removed property
+    was required by. Anything else is the schema refusing a decision built to satisfy it.
+    """
+    for location in missing:
+        if tuple(path[:len(location)]) == location:
+            return True
+        if location[:len(path)] == tuple(path) and len(location) == len(path) + 1:
+            return True
+    return False
 
 
 def probe_validator(schema, schema_path: str):
@@ -890,7 +1013,15 @@ def probe_validator(schema, schema_path: str):
 
 
 def where(location) -> str:
-    return "<root>" if not location else "/".join(str(step) for step in location)
+    """An instance location, with the separator escaped out of a step that contains it.
+
+    A property named `a/b~c` read exactly like a nested path. The same defect was fixed once in
+    JSON pointers and came back in instance paths, so the escaping is the pointer one: `~0` for a
+    tilde, `~1` for a slash.
+    """
+    if not location:
+        return "<root>"
+    return "/".join(str(step).replace("~", "~0").replace("/", "~1") for step in location)
 
 
 def object_locations(instance, path=()):
@@ -972,54 +1103,72 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
         return
 
     parts = [(schema, schema, here)]
-    instance, declined = build(parts, roots)
-    for what in dict.fromkeys(declined):
-        rep.warning(rel, f"not measured: {what}. An object introduced there is not built into the "
-                         f"decision this check probes, so whether this schema refuses a property "
-                         f"the base does not name is unknown for it", rule="schema")
     try:
+        # Inside the guard: a base carrying `{"type": "string", "minLength": "3"}` — a string where
+        # an int belongs, which nothing validates because a vendored base never goes through
+        # `check_schema` — raised out of the generator before `rep.emit()`, and every finding in
+        # the repository went with it.
         validator = probe_validator(schema, schema_path)
-        errors = sorted(validator.iter_errors(instance),
-                        key=lambda e: (len(e.absolute_path), str(e.absolute_path)))
+        instance, declined, missing = build(parts, roots)
+        candidate = prune(instance, missing)
+        errors = list(validator.iter_errors(candidate))
+        if errors:
+            # A `oneOf` or `anyOf` at the root is a real composition — per-scope rules are written
+            # that way — and generating past it produces a decision no branch accepts. One branch
+            # at a time, keeping the first that validates.
+            for branch in branches_of(parts, roots):
+                alternative, alternative_declined, alternative_missing = build(
+                    parts + [branch], roots)
+                pruned = prune(alternative, alternative_missing)
+                if validator.is_valid(pruned):
+                    instance, declined, missing = alternative, alternative_declined, \
+                        alternative_missing
+                    candidate, errors = pruned, []
+                    break
     except Exception as exc:
-        rep.error(rel, f"composes over a bundle base and could not be validated, so nothing about "
-                       f"what it refuses was measured ({type(exc).__name__}: {exc})", rule="schema")
+        rep.error(rel, f"composes over a bundle base and could not be measured at all "
+                       f"({type(exc).__name__}: {exc})", rule="schema")
         return
 
+    # Reported after the retry, and from the instance that was actually probed: a decline from an
+    # attempt that was abandoned describes nothing the reader can act on.
+    for location, what in dict.fromkeys(declined):
+        rep.warning(rel, f"not measured at {where(location)}: {what}. The value was left out of "
+                         f"the decision this check probes, so whether this schema refuses a "
+                         f"property the base does not name is unknown there", rule="schema")
+
     if errors:
-        # A `oneOf` or `anyOf` at the root is a real composition — per-scope rules are written that
-        # way — and generating past it produces a decision no branch accepts. One branch at a time,
-        # keeping the first that validates: a selection, not a merge, and still verified before
-        # anything is concluded from it.
-        for branch in branches_of(parts, roots):
-            alternative, alternative_declined = build(parts + [branch], roots)
-            if validator.is_valid(alternative):
-                instance, declined, errors = alternative, alternative_declined, []
-                break
-    if errors and declined:
-        # The generator already said it could not build part of this decision, so the rejection
-        # below is as likely to be its own as the schema's — and an error here fails a repository
-        # that conforms. What can be said is that nothing was measured.
-        first = errors[0]
-        rep.warning(rel, f"no decision could be built that this schema accepts — it was refused at "
-                         f"{where(tuple(first.absolute_path))}: {first.message}. With a value this "
-                         f"check could not construct, that is its own limit as much as the "
-                         f"schema's, so nothing about what this schema refuses was measured",
-                    rule="schema")
-        return
-    if errors:
-        first = errors[0]
-        rep.error(rel, f"rejects a decision built to satisfy it, at "
-                       f"{where(tuple(first.absolute_path))}: {first.message}. Nothing about what "
-                       f"this schema refuses was measured, because a probe is only evidence when "
-                       f"the instance conforms. A closer inside an `allOf` branch does this — it "
-                       f"sees only the properties named beside it — and so does a narrowing this "
-                       f"check could not satisfy", rule="schema")
+        ours = [e for e in errors if caused_by_pruning(tuple(e.absolute_path), missing)]
+        if len(ours) == len(errors):
+            # Everything that failed is downstream of a value this check could not build, and the
+            # root is one of them: nothing can be measured here, and saying the schema rejects a
+            # conforming decision would be blaming it for this check's limits.
+            first = errors[0]
+            rep.warning(rel, f"no decision could be built that this schema accepts — refused at "
+                             f"{where(tuple(first.absolute_path))}: {first.message}. With a value "
+                             f"this check could not construct, that is its own limit as much as "
+                             f"the schema's, so nothing here was measured", rule="schema")
+            return
+        # The root `unevaluatedProperties` line is an artefact of a failing `$ref` branch — the one
+        # `BUNDLE.md` tells readers to skip — so quoting `errors[0]` after sorting by depth quoted
+        # exactly the line that says nothing. The real ones come first, and more than one is shown.
+        real = [e for e in errors
+                if not (e.validator == "unevaluatedProperties" and not list(e.absolute_path))]
+        shown = (real or errors)[:2]
+        rep.error(rel, "rejects a decision built to satisfy it: "
+                       + "; ".join(f"at {where(tuple(e.absolute_path))}: {e.message}"
+                                   for e in shown)
+                       + ". Nothing about what this schema refuses was measured, because a probe "
+                         "is only evidence when the instance conforms. A closer inside an `allOf` "
+                         "branch does this — it sees only the properties named beside it — and so "
+                         "does a narrowing this check could not satisfy", rule="schema")
         return
 
-    for location in object_locations(instance):
+    for location in object_locations(candidate):
+        if caused_by_pruning(location, missing):
+            continue
         accepted = [name for name in PROBE_PROPERTIES
-                    if validator.is_valid(carrying(instance, location, name))]
+                    if validator.is_valid(carrying(candidate, location, name))]
         if not accepted:
             continue
         rep.error(rel, f"an instance may carry any property at {where(location)} — a decision this "

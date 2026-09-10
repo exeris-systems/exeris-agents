@@ -170,7 +170,8 @@ def refusals(instance: dict, *, schema: str = COMPOSED, **shape) -> list[str]:
     try:
         return grader(d).validate(instance, os.path.join(d, schema))
     finally:
-        shutil.rmtree(d)
+        _RUNS.pop(d, None)
+        shutil.rmtree(d, ignore_errors=True)
 
 
 _RUNS: dict = {}
@@ -219,7 +220,8 @@ def closer_errors(**shape) -> list[str]:
     try:
         return open_locations(d)
     finally:
-        shutil.rmtree(d)
+        _RUNS.pop(d, None)                 # or a recovered mkdtemp name reads another run's result
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def open_locations_for(composed: dict, **kwargs) -> list[str]:
@@ -711,8 +713,8 @@ def test_a_closer_parked_in_a_sibling_branch_is_reported():
     try:
         out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
         check("the misplaced closer is reported, as the rejection it causes",
-              any(f.startswith("rejects a decision built to satisfy it, at <root>") for f in out),
-              True)
+              any(f.startswith("rejects a decision built to satisfy it") and "at <root>" in f
+                  for f in out), True)
     finally:
         shutil.rmtree(d)
     clean = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -934,7 +936,7 @@ def test_a_closer_parked_in_a_branch_one_level_down_is_reported():
     try:
         out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
         check("caught by measurement, at the level it happens",
-              any(f.startswith("rejects a decision built to satisfy it, at findings/0")
+              any(f.startswith("rejects a decision built to satisfy it") and "at findings/0" in f
                   for f in out), True)
     finally:
         shutil.rmtree(d)
@@ -961,6 +963,28 @@ SUBSCHEMA_KEYWORDS = {
     "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "dependentSchemas", "$ref", "$defs",
     "definitions",
 }
+
+
+ASSERTION_KEYWORDS = {
+    "type", "required", "enum", "const", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "pattern", "format", "minItems",
+    "maxItems", "uniqueItems", "minContains", "maxContains", "minProperties", "maxProperties",
+    "dependentRequired",
+}
+
+
+def test_every_assertion_keyword_is_either_satisfied_or_declined():
+    """The subschema vocabulary told the check where to look; this one tells it how to build a
+    value, and an assertion neither satisfied nor declined is what turns a conforming repository
+    red — a value that violates it reaches the schema and comes back as the schema's fault.
+    Written out here rather than derived, so a keyword takes two hands to classify."""
+    mod = checker_module()
+    classified = mod.HONOURED_ASSERTIONS | mod.DECLINED_ASSERTIONS
+    check("no assertion keyword is unclassified", sorted(ASSERTION_KEYWORDS - classified), [])
+    check("and nothing is classified twice",
+          sorted(mod.HONOURED_ASSERTIONS & mod.DECLINED_ASSERTIONS), [])
+    check("nor classified without being an assertion keyword",
+          sorted(classified - ASSERTION_KEYWORDS), [])
 
 
 def test_every_subschema_keyword_is_either_walked_or_declined():
@@ -1012,7 +1036,9 @@ def test_a_narrowed_pattern_is_built_rather_than_declined():
     for pattern, expected in ((r"^templates/[A-Z-]+-TEMPLATE\.md$", "templates/A-TEMPLATE.md"),
                               (r"^[a-z0-9]+(-[a-z0-9]+)*$", "a"),
                               (r"^[^\s#]+#[A-Za-z0-9.§-]+$", "a#A"),
-                              (r"^[A-Z][A-Z0-9_]*$", "AA")):
+                              (r"^[A-Z][A-Z0-9_]*$", "AA"),
+                              (r"^ADR-[0-9]{3}$", "ADR-000"),
+                              (r"^[A-Z]{2,4}$", "AA")):
         built = mod.from_pattern(pattern)
         check(f"built for {pattern}", (built, bool(built and re.search(pattern, built))),
               (expected, True))
@@ -1035,6 +1061,138 @@ def test_a_value_the_generator_cannot_build_is_a_warning_not_a_verdict():
               any("rejects a decision built to satisfy it" in e for e in errs), False)
         check("and the reader is told nothing was measured, and why",
               any("no decision could be built" in w or "not measured" in w for w in warns), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+# ── what a value this check cannot build costs ────────────────────────────────────────────────
+
+UNBUILDABLE = "(?=.*a)(?=.*b)^[ab]{2}$"        # two lookaheads; the generator does not solve these
+
+
+def test_an_unbuildable_value_costs_its_own_location_and_nothing_else():
+    """The rule. An optional property with a pattern this cannot construct used to end the
+    measurement — "no decision could be built" — while the run knew perfectly well that `handoffs`
+    was wide open three properties away. The value is dropped, the rest is measured, and the
+    location is named."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE},
+                          {"properties": {
+                              "note": {"type": "string", "pattern": UNBUILDABLE},
+                              "findings": {"items": {"allOf": [
+                                  {"$ref": BASE + "#/properties/findings/items"}],
+                                  "unevaluatedProperties": False}},
+                              "checks_run": {"items": {"allOf": [
+                                  {"$ref": BASE + "#/properties/checks_run/items"}],
+                                  "unevaluatedProperties": False}}}}],
+                "unevaluatedProperties": False})
+    try:
+        check("the location that could not be built is named",
+              any("not measured at note" in w for w in warnings(d)), True)
+        check("and the object left open elsewhere is still reported",
+              open_locations(d), ["handoffs/0"])
+        check("with no verdict about the schema itself",
+              any("rejects a decision" in e for e in errors(d)), False)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_schema_wide_decline_is_only_for_a_root_that_cannot_be_built():
+    """The other half of the rule: when what cannot be built is REQUIRED, removing it leaves an
+    instance the schema refuses, and there is nothing left to measure. That is the one case where
+    declining the whole schema is the honest answer."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE},
+                          {"properties": {"scope_class": {"pattern": UNBUILDABLE}}}]})
+    try:
+        check("the schema is declined whole",
+              any("no decision could be built" in w for w in warnings(d)), True)
+        check("and it is not called a schema that rejects a conforming decision",
+              any("rejects a decision" in e for e in errors(d)), False)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_an_array_that_cannot_be_padded_is_declined_not_invented():
+    """`minItems: 2` with `uniqueItems: true` was padded with a deep copy of the last element — a
+    duplicate, refused by the schema, reported as a hard error against a repository that did what
+    the migration asks. An array with no item schema at all was padded with `{}`, an object the
+    schema never declares."""
+    for name, base, reason in (
+            ("uniqueItems", {"type": "object", "properties": {"tags": {
+                "type": "array", "minItems": 2, "uniqueItems": True,
+                "items": {"type": "object", "properties": {"a": {"type": "string"}}}}}},
+             "make distinct"),
+            ("no item schema", {"type": "object", "properties": {
+                "anything": {"type": "array", "minItems": 1}}}, "no item schema")):
+        base["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+        d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/arr.base.schema.json"}],
+                    "unevaluatedProperties": False},
+                   vendored={f"{VENDORED}/schemas/arr.base.schema.json": base})
+        try:
+            check(f"{name}: declined rather than built wrong",
+                  any(reason in w for w in warnings(d)), True)
+            check(f"{name}: and no error against the repository",
+                  [e.split("schema::", 1)[-1] for e in errors(d) if "schema::" in e], [])
+        finally:
+            _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_the_numeric_family_is_satisfied_not_ignored():
+    """`minimum` was honoured and `exclusiveMinimum`, `maximum`, `exclusiveMaximum` and
+    `multipleOf` were neither satisfied nor declined, so a value outside the range reached the
+    schema and came back as the schema's fault."""
+    base = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+            "properties": {"score": {"type": "integer", "exclusiveMinimum": 3, "maximum": 20,
+                                     "multipleOf": 5},
+                           "inner": {"type": "object", "properties": {"a": {"type": "string"}}}}}
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/num.base.schema.json"}],
+                "unevaluatedProperties": False},
+               vendored={f"{VENDORED}/schemas/num.base.schema.json": base})
+    try:
+        check("the number is built inside every bound", open_locations(d), ["inner"])
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_base_that_is_not_valid_json_schema_does_not_end_the_run():
+    """A vendored base never goes through `check_schema` — only a repository's own schemas do — so
+    `{"type": "string", "minLength": "3"}` reached the generator, raised, and took every other
+    finding in the repository with it before the report was written."""
+    broken = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+              "properties": {"odd": {"type": "string", "minLength": "3"}}}
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/broken.base.schema.json"}],
+                "unevaluatedProperties": False},
+               vendored={f"{VENDORED}/schemas/broken.base.schema.json": broken})
+    try:
+        out = errors(d)                     # raises of its own if the checker crashed
+        check("the run survives and says what happened",
+              any("could not be measured at all" in e or "no decision could be built" in e
+                  for e in out + warnings(d)), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_the_error_quoted_is_not_the_annotation_artefact():
+    """Errors were sorted by depth and the first quoted, which is systematically the root
+    `unevaluatedProperties` line — the one `BUNDLE.md` tells readers to skip. Here the real failure
+    is at `findings/0` and the root line is the artefact beside it; where that line is the only
+    error, as it is for a closer mis-parked at the root, it is the finding and is quoted."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE}], "unevaluatedProperties": False,
+                "properties": {"findings": {"items": {"allOf": [
+                    {"$ref": BASE + "#/properties/findings/items"},
+                    {"properties": {"tag": {"type": "string"}},
+                     "unevaluatedProperties": False}]}}}})
+    try:
+        quoted = [e.split("schema::", 1)[-1] for e in errors(d) if "rejects a decision" in e]
+        check("the rejection is reported", len(quoted), 1)
+        check("and it leads with the failure, not with the root's unevaluated line",
+              quoted[0].split("; ")[0].startswith("rejects a decision built to satisfy it: at "
+                                                  "findings/0"), True)
     finally:
         _RUNS.pop(d, None); shutil.rmtree(d)
 
@@ -1167,8 +1325,9 @@ def test_a_base_that_closes_what_it_forwards():
 
 def test_a_property_name_a_pointer_would_have_to_escape():
     """Cause: one half built JSON pointers raw and the other unescaped them, so `a/b~c` was one
-    object to the requirement and another to the closure. There are no pointers here now — a
-    location is where it is in the instance."""
+    object to the requirement and another to the closure. The locations are instance paths now, and
+    the same ambiguity came back in them — a property named `a/b~c` read exactly like a nested
+    path — so a step containing the separator is escaped the way a pointer escapes it."""
     odd = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
            "properties": {"a/b~c": {"type": "object", "properties": {"x": {"type": "string"}}}}}
     out = open_locations_for(
@@ -1176,7 +1335,8 @@ def test_a_property_name_a_pointer_would_have_to_escape():
          "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/odd.base.schema.json"}],
          "unevaluatedProperties": False},
         vendored={f"{VENDORED}/schemas/odd.base.schema.json": odd})
-    check("the location is named as an instance carries it", out, ["a/b~c"])
+    check("a separator inside a name is escaped, so the location cannot be read as a path",
+          out, ["a~1b~0c"])
 
 
 def test_a_shape_reached_through_another_base_file():

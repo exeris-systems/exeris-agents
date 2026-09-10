@@ -105,6 +105,13 @@ number.
   the reason, at warning level: a value this check could not construct is its own limit as much as
   the schema's, and failing a conforming repository over it is the mistake the level protects
   against.
+- **A value the check cannot build costs one location, not the schema.** The generator says where
+  it could not construct something; that value is left out of the decision, the rest is measured,
+  and the location is named. Declining the whole schema is now reserved for a root that cannot be
+  built at all — where what could not be constructed was required, so nothing conforming remains.
+  Every assertion keyword is either satisfied or declined by name, partitioned like the subschema
+  vocabulary and with the same two-hands test behind it, because an assertion neither satisfied nor
+  declined produces a value the schema refuses and reports that as the schema's fault.
 - **The check names what it did not measure.** The probe understands a stated set of shapes —
   `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
   document that named them — and every construct it meets and does not walk is now a warning
