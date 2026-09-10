@@ -470,7 +470,9 @@ def ref_target(ref, from_dir: str, roots):
     import, not the first one, or a repository pinning two bundles is told the second is a stray.
     No pinned tree at all means nothing is pinned: a manifest whose import is missing its version
     yields no roots, and reading that as "everything counts as pinned" turned the check off in the
-    state most likely to need it.
+    state most likely to need it. `roots` of None is the third state — the manifest did not parse,
+    so what it pins is unknown and every reference would otherwise be called a stray while the real
+    finding, the YAML error, is already reported.
     """
     if not isinstance(ref, str) or ref.startswith("#") or ref.startswith(("http://", "https://")):
         return None
@@ -478,12 +480,20 @@ def ref_target(ref, from_dir: str, roots):
     target = os.path.normpath(os.path.join(from_dir, path))
     if _compose.contained(_compose.VENDOR, target) is None:
         return None
-    pinned = any(_compose.contained(r, target) for r in roots)
+    pinned = roots is None or any(_compose.contained(r, target) for r in roots)
     return target, pointer, pinned
 
 
 def node_at(doc, pointer: str):
-    """The node a JSON pointer names, or None."""
+    """The node a JSON pointer names, or None.
+
+    A fragment that does not begin with `/` is a plain-name anchor, not a pointer. Splitting one
+    yielded an empty path, the loop never ran, and the whole document came back as though the
+    anchor had named it — so a probe was built from a base's root while the reference named
+    something inside it.
+    """
+    if pointer and not pointer.startswith("/"):
+        return None
     node = doc
     for part in pointer.split("/")[1:]:
         part = part.replace("~1", "/").replace("~0", "~")
@@ -533,8 +543,13 @@ def load_schema(path: str):
 
 
 def vendored_tree(path: str) -> str:
-    """The `.agents/vendor/<bundle>-<version>` a path sits in."""
-    rel = os.path.relpath(path, _compose.VENDOR)
+    """The `.agents/vendor/<bundle>-<version>` a path sits in.
+
+    Named from the resolved path, because containment was decided on the resolved path: a
+    reference reaching the tree through a symlink is textually somewhere else entirely, and
+    naming it from the text produced `.agents/vendor/..`.
+    """
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(_compose.VENDOR))
     return os.path.join(_compose.VENDOR, rel.split(os.sep)[0])
 
 
@@ -572,7 +587,7 @@ def applies_at_the_root(schema):
     return out
 
 
-def probe_for(node, depth: int = 5):
+def probe_for(node, base_dir: str, roots, depth: int = 5, seen=None):
     """A structural instance of one base object, and the locations it puts an object at.
 
     `{}` for a property that holds an object, `[{}]` for an array of them, and the same again for
@@ -586,25 +601,46 @@ def probe_for(node, depth: int = 5):
     wrong here costs a location that gets skipped by `WRONG_KIND` a moment later, while being
     clever about which properties are "really" objects is how the previous mechanism lost them.
 
-    Two shapes are still out of reach, and no base uses either: an object reachable only through
-    `patternProperties` (the probe would have to invent a name matching the pattern) or through an
-    object-valued `additionalProperties`. `depth` bounds literal nesting; a `$ref` is not followed
-    here, the validator resolves those.
+    A `$ref` into the bundle is followed, because a base declares part of its shape one file over —
+    `handoffs` is `handoff.base`, and an object that base declared would otherwise have no probe
+    location at all. Two shapes stay out of reach, and no base uses either: an object reachable
+    only through `patternProperties` (the probe would have to invent a name matching the pattern)
+    or through an object-valued `additionalProperties`.
+
+    Returns `(instance, locations, stopped)`. `stopped` names the locations where `depth` ran out
+    with objects still below them — unmeasured, and said so, rather than reported as neither open
+    nor closed.
     """
-    instance, locations = {}, []
+    seen = seen if seen is not None else set()
+    instance, locations, stopped = {}, [], []
     for name, sub in (node.get("properties") or {}).items():
         if not isinstance(sub, dict):
             continue
         array = sub.get("items") if "items" in sub or "prefixItems" in sub else None
         below = array if isinstance(array, dict) else sub
-        nested, deeper = probe_for(below, depth - 1) if depth > 0 else ({}, [])
-        if array is not None:
-            instance[name], here = [nested], (name, 0)
+        here = (name, 0) if array is not None else (name,)
+        onward = base_dir
+        target = ref_target(below.get("$ref"), base_dir, roots) if isinstance(below, dict) else None
+        if target:
+            key = (os.path.realpath(target[0]), target[1])
+            if key in seen:
+                below = {}
+            else:
+                seen.add(key)
+                document = load_schema(target[0])
+                resolved = document if not target[1] else node_at(document, target[1])
+                below = resolved if isinstance(resolved, dict) else {}
+                onward = os.path.dirname(target[0])
+        if depth > 0:
+            nested, deeper, deep_stops = probe_for(below, onward, roots, depth - 1, seen)
         else:
-            instance[name], here = nested, (name,)
+            nested, deeper = {}, []
+            deep_stops = [()] if (below.get("properties") if isinstance(below, dict) else None) else []
+        instance[name] = [nested] if array is not None else nested
         locations.append(here)
         locations += [here + l for l in deeper]
-    return instance, locations
+        stopped += [here + l for l in deep_stops]
+    return instance, locations, stopped
 
 
 def probe_validator(schema, schema_path: str):
@@ -725,18 +761,27 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
         doc = load_schema(target[0])
         node = doc if not target[1] else node_at(doc, target[1])
         if not isinstance(node, dict):
+            # A fragment this check cannot resolve into a node — a plain-name `$anchor`, or a
+            # pointer into a document that did not parse. The reference is real, so the schema is
+            # still probed for what the other references bring, and what this one names is not
+            # measured and says so.
+            rep.warning(rel, f"`$ref` '{ref}' names something this check cannot resolve into an "
+                             f"object, so the shape behind it was not measured", rule="schema")
             continue
-        instance, found = probe_for(node)
+        instance, found, stopped = probe_for(node, os.path.dirname(target[0]), roots)
         # Two bases at the root may declare the same property with different shapes — an object in
         # one, an array in the other. The first to declare it fixes the probe's shape there, and
         # only its locations are kept: mixing them left a location naming an index into a value
         # that is no longer a list, and the walk into it raised out of the whole run.
         for name, value in instance.items():
             owner.setdefault(name, ref)
-            if owner[name] == ref:
-                probe.setdefault(name, value)
+            probe.setdefault(name, value)
         locations += [l for l in found
                       if l and owner.get(l[0]) == ref and l not in locations]
+        for l in stopped:
+            rep.warning(rel, f"the probe stopped at {where(l)}: objects nested below it were not "
+                             f"measured, so whether they refuse a property the base does not name "
+                             f"is unknown", rule="schema")
     if not composes:
         # Nothing of the bundle's applies where an instance meets this schema, so the probe has no
         # root to stand on and the question cannot be asked. Asked-and-answered and never-asked
@@ -760,14 +805,45 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
                 elsewhere = True
                 break
         if elsewhere:
-            rep.error(rel, "references a bundle base, but not where an instance meets this schema "
-                           "— the reference sits under a shape this repository owns, or in a file "
-                           "this root names, so whether a property the base does not name is "
-                           "refused cannot be measured here and has not been. Compose the base at "
-                           "the root, which is the shape README.md documents and every base's "
-                           "`description` assumes, or move that reference into a schema of its "
-                           "own", rule="schema")
+            # A warning, not an error: measured, a composition that pulls the base in below the
+            # root can be correct at every level — closed at the root, at the wrapper and at each
+            # item — and calling that an error fires where the repository conforms, which the
+            # changelog's own MINOR rule forbids. Probing at the reference site instead would mean
+            # deriving instance locations from the composition's structure: the walker the probe
+            # replaced. So the honest report is that the question was not asked.
+            rep.warning(rel, "references a bundle base, but not where an instance meets this schema "
+                             "— the reference sits under a shape this repository owns, or in a "
+                             "file this root names, so whether a property the base does not name "
+                             "is refused was not measured here. Compose the base at the root, "
+                             "which is the shape README.md documents and every base's "
+                             "`description` assumes, or move that reference into a schema of "
+                             "its own — this check measures a composition at the root", rule="schema")
         return
+
+    # A closer inside an `allOf` branch sees only what that branch composes. Where a DIFFERENT
+    # branch of the same `allOf` carries the base, the closer never sees what the base declares, so
+    # every conforming decision is rejected for carrying it — and the probe cannot tell that from a
+    # correct closer, because a probe fails the base's own `required` and a failing branch
+    # contributes no annotations either way. Measured: this shape refuses a conforming verdict with
+    # `<root>: Unevaluated properties are not allowed ('checks_run', 'decision', …)`. The same
+    # keyword on the branch that carries the reference is a different shape and is left alone: it
+    # sees the base's own annotations, and a conforming decision passes it.
+    for node in applies_at_the_root(schema):
+        branches = [b for b in node.get("allOf") or [] if isinstance(b, dict)]
+        carriers = [b for b in branches
+                    if ref_target(b.get("$ref"), os.path.dirname(schema_path), roots)]
+        if not carriers:
+            continue
+        for branch in branches:
+            if branch in carriers:
+                continue
+            if branch.get("unevaluatedProperties") is False or \
+                    branch.get("additionalProperties") is False:
+                rep.error(rel, "a closer sits inside an `allOf` branch beside the one that pulls "
+                               "the base in, where it sees only the properties named in that same "
+                               "branch — so every decision carrying what the base declares is "
+                               "refused. Move it onto the object that holds the `allOf`",
+                          rule="schema")
 
     try:
         validator = probe_validator(schema, schema_path)
@@ -789,22 +865,33 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
                                f"is `unevaluatedProperties: false`, in the object that pulls the "
                                f"base in", rule="schema")
 
-        for location in [()] + locations:
-            if any(at == location and keyword in WRONG_KIND for at, keyword in before):
-                continue
-            if names_the_probe(validator, carrying(probe, location)):
-                continue
-            rep.error(rel, f"an instance may carry any property at {where(location)} — one was "
-                           f"added there and nothing in this schema refused it, so the object "
-                           f"takes whatever the base does not name. Close it: the base closes "
-                           f"nothing, and a closer at the root does not reach into an array's "
-                           f"items. Rule 13 makes this file what a decision conforms to; that the "
-                           f"closers are yours is this bundle's contract, in the base's own "
-                           f"`description`", rule="schema")
     except Exception as exc:
         rep.error(rel, f"composes over a bundle base but could not be decided, so whether it "
                        f"closes what the base leaves open is unknown ({type(exc).__name__}: "
                        f"{exc})", rule="schema")
+        return
+
+    # One location at a time. Wrapping the whole loop meant a failure part-way through emitted
+    # concrete findings for the locations already measured and a catch-all for everything after —
+    # five things to fix, read as the whole list, while seven were never asked.
+    for location in [()] + locations:
+        if any(at == location and keyword in WRONG_KIND for at, keyword in before):
+            continue
+        try:
+            refused = names_the_probe(validator, carrying(probe, location))
+        except Exception as exc:
+            rep.error(rel, f"whether {where(location)} refuses a property the base does not name "
+                           f"could not be decided ({type(exc).__name__}: {exc})", rule="schema")
+            continue
+        if refused:
+            continue
+        rep.error(rel, f"an instance may carry any property at {where(location)} — one was "
+                       f"added there and nothing in this schema refused it, so the object "
+                       f"takes whatever the base does not name. Close it: the base closes "
+                       f"nothing, and a closer at the root does not reach into an array's "
+                       f"items. Rule 13 makes this file what a decision conforms to; that the "
+                       f"closers are yours is this bundle's contract, in the base's own "
+                       f"`description`", rule="schema")
 
 
 def check_schemas(rep: Report, roots=()):
@@ -830,10 +917,16 @@ def check_schemas(rep: Report, roots=()):
             continue
         rel = os.path.relpath(os.path.join(d, f))
         rep.checked += 1
-        try:
-            schema = json.load(open(os.path.join(d, f), encoding="utf-8"))
-        except Exception as e:
-            rep.error(rel, f"not valid JSON ({type(e).__name__}: {e})", rule="schema")
+        schema = load_schema(os.path.join(d, f))
+        if schema is None:
+            # Through the cache, so a schema a neighbour also `$ref`s is parsed once and the handle
+            # is closed; the read is repeated only here, on the error path, to name what is wrong.
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    json.load(fh)
+                rep.error(rel, "is not readable as JSON from this checkout", rule="schema")
+            except Exception as e:
+                rep.error(rel, f"not valid JSON ({type(e).__name__}: {e})", rule="schema")
             continue
         if not f.endswith(".schema.json"):
             rep.error(rel, "a schema file is named <name>.schema.json", rule="schema")
@@ -1240,12 +1333,15 @@ def main():
                                   "a skill lives at .agents/skills/<name>/SKILL.md", rule="skill-path")
         manifest_path = os.path.join(".agents", "manifest.yaml")
         declared_v2 = False
+        manifest_parsed = False
         manifest_data: dict = {}
         if os.path.exists(manifest_path):
             import yaml
             try:
-                manifest_data = yaml.safe_load(open(manifest_path, encoding="utf-8")) or {}
+                with open(manifest_path, encoding="utf-8") as fh:
+                    manifest_data = yaml.safe_load(fh) or {}
                 declared_v2 = str(manifest_data.get("version")) == "2"
+                manifest_parsed = True
             except Exception:
                 # check_manifest reports the parse failure properly further down; this early read
                 # exists only to know which severity the v2 rules carry.
@@ -1269,7 +1365,9 @@ def main():
             check_profile(os.path.join(profiles, name), rep, declared_v2, ctx)
         check_no_lowercase_agent_md(rep, declared_v2)
         check_workflows(rep, profile_names, skill_names)
-        check_schemas(rep, _compose.vendor_roots(manifest_data))
+        # None, not an empty list, when the manifest did not parse: what it pins is unknown, and
+        # calling every correctly-targeted reference a stray buries the finding that matters.
+        check_schemas(rep, _compose.vendor_roots(manifest_data) if manifest_parsed else None)
 
         manifest: dict = {}
         if os.path.exists(manifest_path):

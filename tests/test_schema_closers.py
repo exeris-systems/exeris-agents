@@ -52,7 +52,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKER = os.path.join(ROOT, "tools", "agents_file_check.py")
 RUNNER = os.path.join(ROOT, "bundle", "evals", "run.py")
 SCHEMAS = os.path.join(ROOT, "bundle", "schemas")
-VENDORED = "exeris-agents-2.0.0"
+DEFAULT_PIN = "2.0.0"
+VENDORED = f"exeris-agents-{DEFAULT_PIN}"
 BASE = f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"
 
 MANIFEST = f"""\
@@ -171,6 +172,14 @@ def refusals(instance: dict, *, schema: str = COMPOSED, **shape) -> list[str]:
         shutil.rmtree(d)
 
 
+def warnings(repo: str) -> list[str]:
+    """The checker's warning annotations — what it could not measure, as against what it refuses."""
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
+    proc = subprocess.run([sys.executable, CHECKER, "--root", repo], capture_output=True,
+                          text=True, env=env)
+    return [l for l in proc.stdout.splitlines() if l.startswith("::warning")]
+
+
 def errors(repo: str) -> list[str]:
     """The checker's error annotations, after asserting it ran at all."""
     env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
@@ -207,7 +216,7 @@ def open_locations_for(composed: dict, **kwargs) -> list[str]:
         shutil.rmtree(d)
 
 
-def custom(composed: dict, *, vendored: dict | None = None, pin: str = "2.0.0",
+def custom(composed: dict, *, vendored: dict | None = None, pin: str = DEFAULT_PIN,
            name: str = "verdict.schema.json", manifest: str | None = None) -> str:
     """A consumer with a composed schema of the case's own making, and optionally its own bases.
 
@@ -231,9 +240,8 @@ def custom(composed: dict, *, vendored: dict | None = None, pin: str = "2.0.0",
     with open(os.path.join(d, "AGENTS.md"), "w", encoding="utf-8") as fh:
         fh.write("# fixture\n\nPoints at `.agents/` for the semantics.\n")
     with open(os.path.join(d, ".agents", "manifest.yaml"), "w", encoding="utf-8") as fh:
-        body = manifest or MANIFEST
-        fh.write(body.replace("verdict.schema.json", name) if pin == "2.0.0"
-                 else body.replace("verdict.schema.json", name).replace("2.0.0", pin, 1))
+        body = (manifest or MANIFEST).replace("verdict.schema.json", name)
+        fh.write(body.replace(DEFAULT_PIN, pin, 1))
     with open(os.path.join(d, ".agents", "schemas", name), "w", encoding="utf-8") as fh:
         json.dump(composed, fh, indent=2)
     return d
@@ -510,9 +518,11 @@ def test_a_base_referenced_somewhere_an_instance_never_meets_is_reported():
                 "type": "object",
                 "properties": {"verdict": {"$ref": BASE}}})
     try:
-        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
         check("a base referenced away from the root is reported rather than skipped",
-              any("not where an instance meets" in f for f in out), True)
+              any("not where an instance meets" in w for w in warnings(d)), True)
+        check("as a warning: unmeasured is not the same as wrong, and an error here fires on a "
+              "repository that conforms",
+              any("not where an instance meets" in e for e in errors(d)), False)
     finally:
         shutil.rmtree(d)
 
@@ -589,9 +599,8 @@ def test_a_root_that_composes_through_another_file_is_reported():
             json.dump({"$schema": "https://json-schema.org/draft/2020-12/schema",
                        "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"}]},
                       fh)
-        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
         check("a base composed through a file this check does not follow is reported",
-              any("not where an instance meets" in f for f in out), True)
+              any("not where an instance meets" in w for w in warnings(d)), True)
     finally:
         shutil.rmtree(d)
 
@@ -640,6 +649,140 @@ def test_a_malformed_pin_does_not_switch_the_off_pin_check_off():
     try:
         out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
         check("a reference into a tree nothing pins is reported", len(off_pin(out)), 1)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_composition_below_the_root_that_is_correctly_closed_is_not_an_error():
+    """An envelope wrapping the composition under `properties.verdict`, closed at the root, at the
+    wrapper and at each items level: a conforming decision validates and a foreign property is
+    refused at every level. The check cannot measure it from the root, and saying so is a warning —
+    an error here fires where the repository was already conforming, which the changelog's own
+    MINOR rule forbids."""
+    def closed(pointer):
+        return {"allOf": [{"$ref": BASE + pointer}], "unevaluatedProperties": False}
+    inner = {"allOf": [{"$ref": BASE},
+                       {"properties": {
+                           "agent": {"enum": ["r"]},
+                           "findings": {"items": closed("#/properties/findings/items")},
+                           "checks_run": {"items": closed("#/properties/checks_run/items")},
+                           "handoffs": {"items": closed("#/properties/handoffs/items")}}}],
+             "unevaluatedProperties": False}
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                "properties": {"verdict": inner}, "unevaluatedProperties": False},
+               name="envelope.schema.json")
+    try:
+        check("a correctly closed composition below the root is no error",
+              [e.split("schema::", 1)[-1] for e in errors(d) if "schema::" in e], [])
+        check("and the reader is told the question was not asked",
+              any("not where an instance meets" in w for w in warnings(d)), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_closer_parked_in_a_sibling_branch_is_reported():
+    """`unevaluatedProperties: false` inside the branch beside the one carrying the base sees only
+    that branch's own properties, so every conforming decision is refused for carrying what the
+    base declares. The probe cannot tell it from a correct closer — both refuse the probe property
+    — so the shape is named instead."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE},
+                          {"properties": {"agent": {"enum": ["r"]}},
+                           "unevaluatedProperties": False}]})
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("the misplaced closer is reported",
+              any("inside an `allOf` branch beside" in f for f in out), True)
+    finally:
+        shutil.rmtree(d)
+    clean = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "allOf": [{"$ref": BASE, "unevaluatedProperties": False}]})
+    try:
+        check("and the same keyword on the branch that carries the base is left alone — measured, "
+              "a conforming decision passes it",
+              any("inside an `allOf` branch beside" in e for e in errors(clean)), False)
+    finally:
+        shutil.rmtree(clean)
+
+
+def test_an_object_a_base_declares_behind_a_ref_is_probed():
+    """`handoffs` items are `handoff.base`, one file over. The probe stopped at the file boundary,
+    so an object that base declares had no location and its openness was never measured."""
+    referenced = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                  "properties": {"nested": {"type": "object",
+                                            "properties": {"a": {"type": "string"}}}}}
+    outer = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "properties": {"h": {"items": {"$ref": "ref.base.schema.json"}}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/outer.base.schema.json"}],
+         "unevaluatedProperties": False,
+         "properties": {"h": {"items": {"unevaluatedProperties": False}}}},
+        vendored={f"{VENDORED}/schemas/outer.base.schema.json": outer,
+                  f"{VENDORED}/schemas/ref.base.schema.json": referenced})
+    check("the object behind the reference is measured", out, ["h/0/nested"])
+
+
+def test_a_manifest_that_does_not_parse_does_not_make_every_reference_a_stray():
+    """No vendor roots means "nothing is pinned" only when the manifest was read. When it was not,
+    what it pins is unknown — and telling the reader to retarget schemas whose targets are exactly
+    right buries the YAML error that is the actual finding."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE}], "unevaluatedProperties": False},
+               manifest="version: 2\n  broken: [\n")
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("no off-pin finding against an unreadable manifest", off_pin(out), [])
+        check("and the manifest itself is reported",
+              any("not valid YAML" in e for e in errors(d)), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_tree_reached_through_a_symlink_is_named_by_where_it_lands():
+    """Containment was decided on the resolved path and the name was taken from the text, so a
+    reference through a symlink was reported as composing over `.agents/vendor/..`."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": "../lib/schemas/verdict.base.schema.json"}],
+                "unevaluatedProperties": False})
+    try:
+        stale = os.path.join(d, ".agents", "vendor", "exeris-agents-1.4.0")
+        shutil.copytree(os.path.join(d, ".agents", "vendor", VENDORED), stale)
+        os.symlink(stale, os.path.join(d, ".agents", "lib"))
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("the tree is named by where the reference lands",
+              [f.split(",")[0] for f in off_pin(out)],
+              ["composes over .agents/vendor/exeris-agents-1.4.0"])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_an_anchor_fragment_is_not_read_as_the_whole_document():
+    """`#agentRef` is a plain-name anchor, not a pointer. Splitting it produced an empty path, so
+    the document itself came back and the probe was built from a base's root while the reference
+    named something inside it."""
+    mod = checker_module()
+    check("an anchor resolves to nothing this check can probe",
+          mod.node_at({"$defs": {"agentRef": {"type": "string"}}}, "agentRef"), None)
+    check("and a pointer still resolves",
+          mod.node_at({"$defs": {"agentRef": {"type": "string"}}}, "/$defs/agentRef"),
+          {"type": "string"})
+
+
+def test_the_probe_says_where_it_stopped():
+    """`depth` truncating in silence made an unmeasured location indistinguishable from a measured
+    and closed one."""
+    deep = {"type": "object", "properties": {"a": {"type": "object", "properties": {}}}}
+    for level in range(6):
+        deep = {"type": "object", "properties": {f"l{level}": deep}}
+    deep["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/deep.base.schema.json"}],
+                "unevaluatedProperties": False},
+               vendored={f"{VENDORED}/schemas/deep.base.schema.json": deep})
+    try:
+        check("the location the probe stopped at is named",
+              any("the probe stopped at" in w for w in warnings(d)), True)
     finally:
         shutil.rmtree(d)
 

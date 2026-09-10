@@ -75,12 +75,18 @@ number.
   repository stays green while it pins a bundle whose bases still close themselves and goes red
   when it re-vendors — the moment the enforcement actually moves. From then on the count of what is
   left to do is whatever a run says, not whatever a release note said once.
-- **A closer that refuses everything is reported too.** `additionalProperties: false` in a sibling
-  `allOf` branch is the obvious migration move and the one each base's `description` warns against:
-  it sees only the properties named beside it, so it rejects everything the base declares while
-  looking closed to a check that asks only whether a foreign property can get in. A conforming
-  decision graded against such a schema is refused outright, and the checker now says so at the
-  location it happens.
+- **A closer that refuses everything is reported too.** Either spelling: `additionalProperties:
+  false` beside the base, which the probe catches because that keyword's verdict does not depend on
+  a branch that failed, and `unevaluatedProperties: false` inside the `allOf` branch next to the
+  one carrying the base, which no probe can tell from a correct closer and which is named by its
+  shape. Both see only the properties written beside them, so both reject everything the base
+  declares while looking closed to a check that asks only whether a foreign property can get in. A
+  conforming decision graded against such a schema is refused outright.
+- A composition that pulls the base in below an instance's root — under a wrapper, or through
+  another file — is reported as **not measured**, at warning level. It can be entirely correct, and
+  measuring it would mean deriving instance locations from the composition's own structure, which
+  is the walker the probe replaced. What is unknown says it is unknown, and does not fail a build
+  that was conforming.
 - Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
   into a vendored tree that **no** import pins is a finding, not a shrug: it resolves, so no other
   check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s

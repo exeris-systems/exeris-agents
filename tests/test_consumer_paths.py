@@ -341,26 +341,9 @@ def test_a_base_ref_resolves_beside_the_base_that_names_it():
     directory no repository has. So a verdict carrying a handoff raised `Unresolvable` out of the
     grader, and a grader that raises reports nothing at all: not a failed case, a lost run.
     """
-    import importlib.util
-    d = tempfile.mkdtemp(prefix="baseref-")
+    d, composed, runner = grader_tree()
     try:
-        vendor = os.path.join(d, ".agents", "vendor", "exeris-agents-2.0.0")
-        os.makedirs(os.path.join(d, ".git"))
-        shutil.copytree(SCHEMAS, os.path.join(vendor, "schemas"))
-        os.makedirs(os.path.join(vendor, "evals"))
-        shutil.copy(RUNNER, os.path.join(vendor, "evals", "run.py"))
-        base = "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"
-        composed = os.path.join(d, ".agents", "schemas", "verdict.schema.json")
-        write(composed, json.dumps({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "allOf": [{"$ref": base},
-                      {"properties": {"agent": {"enum": ["fixture-reviewer"]}}}],
-            "unevaluatedProperties": False}))
-
-        spec = importlib.util.spec_from_file_location(
-            "evalrun_baseref", os.path.join(vendor, "evals", "run.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = load_runner(runner, "evalrun_baseref")
 
         def verdict(handoff):
             return {"agent": "fixture-reviewer", "decision": "PASS", "scope_class": "docs-only",

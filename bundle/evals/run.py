@@ -166,6 +166,12 @@ def validate(instance, schema_path: str) -> list[str]:
             schema = json.load(fh)
     except Exception as exc:
         return [f"cannot validate {name}: the schema itself is not readable JSON ({exc})"]
+    if not isinstance(schema, dict):
+        # `true` and `false` are legal JSON Schema, and an array is not but parses. The fallback
+        # below asks the document for `.get`, which is an AttributeError out of the grader and one
+        # more way to end a run — the same class as the three above.
+        return [f"cannot validate {name}: the schema is {type(schema).__name__}, not an object, so "
+                f"there is nothing here to validate against"]
     try:
         import jsonschema
     except ImportError:
