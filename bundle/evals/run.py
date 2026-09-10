@@ -157,10 +157,18 @@ def file_registry(schema_path: str):
 def validate(instance, schema_path: str) -> list[str]:
     """Schema conformance. Falls back to a shallow required-keys check when jsonschema is absent,
     and says which it did — a grader that silently weakens is worse than one that is missing."""
+    name = os.path.basename(schema_path)
+    # Read first, and guarded: an unparseable composed schema raised out of the grader and ended
+    # the run, which is the class three entries of this release's `### Fixed` are about. `main()`
+    # checks that the file exists and never that it parses.
+    try:
+        with open(schema_path, encoding="utf-8") as fh:
+            schema = json.load(fh)
+    except Exception as exc:
+        return [f"cannot validate {name}: the schema itself is not readable JSON ({exc})"]
     try:
         import jsonschema
     except ImportError:
-        schema = json.load(open(schema_path, encoding="utf-8"))
         # A composed schema declares its `required` inside the `allOf` branches, not at the top
         # level — the base's branch is a `$ref` this fallback cannot follow, but a repository's own
         # branch is inline and readable. Collect what IS reachable before giving up.
@@ -174,14 +182,11 @@ def validate(instance, schema_path: str) -> list[str]:
             # repository's enums — carries no top-level `required`, so this branch validated ZERO
             # fields and returned "valid". That is a grader silently weakening to nothing, which
             # this function's own docstring says is worse than one that is missing. Say so instead.
-            return [f"cannot validate {os.path.basename(schema_path)}: jsonschema is not installed "
-                    f"and the schema declares no top-level `required` to fall back on "
-                    f"(pip install jsonschema)"]
+            return [f"cannot validate {name}: jsonschema is not installed and the schema "
+                    f"declares no top-level `required` to fall back on (pip install jsonschema)"]
         missing = [k for k in required if k not in (instance or {})]
         return [f"missing required key '{k}' (shallow check: jsonschema not installed)"
                 for k in missing]
-    schema = json.load(open(schema_path, encoding="utf-8"))
-    name = os.path.basename(schema_path)
     # No silent fallback here. Rebuilding the validator without the registry and without the
     # location `$id` drops the two things that make a vendored `$ref` resolve at all, and the
     # grader that comes back checks a fraction of the contract while reporting like the whole one.
@@ -389,16 +394,6 @@ def main() -> int:
             print(f"ERROR {case['id']}: no expect.schema"); continue
         schema_path = within_repo(os.path.join(schema_dir, named),
                                   f"case '{case['id']}' expect.schema")
-        if vendored(schema_path):
-            entry |= {"status": "error", "failures": [
-                f"expect.schema names a bundle base ({named}). A base fixes the shape and leaves "
-                f"the vocabulary and every closer to the repository, so from 2.0.0 it accepts a "
-                f"foreign property anywhere and any value the repository's own enums exclude — a "
-                f"case graded against one passes on answers the repository refuses. Name the "
-                f"composed schema in .agents/schemas/ instead."]}
-            results.append(entry); failed += 1
-            print(f"ERROR {case['id']}: expect.schema names a bundle base"); continue
-
         # F5: a missing fixture is recorded like a missing schema. It used to raise out of
         # build_prompt and abort the whole run, so one typo in one case hid every later result.
         try:
@@ -412,6 +407,18 @@ def main() -> int:
             entry |= {"status": "error", "failures": [f"schema not found: {schema_path}"]}
             results.append(entry); failed += 1
             print(f"ERROR {case['id']}: schema not found"); continue
+        # After the existence check, not before it: a path under `.agents/vendor/` that is not
+        # there is a typo, and telling its author to name the composed schema instead sends them
+        # to fix the wrong thing.
+        if vendored(schema_path):
+            entry |= {"status": "error", "failures": [
+                f"expect.schema names a bundle base ({named}). A base fixes the shape and leaves "
+                f"the vocabulary and every closer to the repository, so from 2.0.0 it accepts a "
+                f"foreign property anywhere and any value the repository's own enums exclude — a "
+                f"case graded against one passes on answers the repository refuses. Name the "
+                f"composed schema in .agents/schemas/ instead."]}
+            results.append(entry); failed += 1
+            print(f"ERROR {case['id']}: expect.schema names a bundle base"); continue
         if a.dry_run:
             entry["status"] = "resolved"
             results.append(entry)

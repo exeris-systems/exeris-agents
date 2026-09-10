@@ -27,6 +27,10 @@ the version is chosen.
 | `hooks/bin/dispatch.py` | A version-free shim, copied by the renderer to `.agents/hooks/bin/dispatch.py`. It reads the pin from `manifest.yaml` and hands off to the `hook.py` above, so the rendered command never carries a version and a stale adapter still finds the current tree. | every rendered vendor hook config |
 | `evals/run.py`, `evals/eval-rubric.md` | The runtime-independent eval runner and the rubric for its prose residue. | `.agents/evals/scenarios.yaml` |
 
+Not vendored, and deliberately: `tools/` — the renderer, the checker and this materialiser. They
+run in CI from a checkout of the bundle repository at a pinned ref. Copying executable tooling into
+every repository is the duplication the bundle exists to remove.
+
 ## What a schema here costs you
 
 From 2.0.0 these bases refuse nothing on their own. A base that closes itself cannot be extended,
@@ -40,6 +44,3 @@ and where each closer belongs is written in each base's own `description`, next 
 describes; `agents_file_check.py` adds a property to a probe and names every location where
 nothing refused it, so the list of what is left to do comes from a run rather than from reading.
 
-Not vendored, and deliberately: `tools/` — the renderer, the checker and this materialiser. They
-run in CI from a checkout of the bundle repository at a pinned ref. Copying executable tooling into
-every repository is the duplication the bundle exists to remove.

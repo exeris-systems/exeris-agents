@@ -540,6 +540,53 @@ def test_a_failure_that_is_not_about_a_path_is_not_reported_as_one():
         shutil.rmtree(d)
 
 
+def test_an_unparseable_schema_fails_the_case_rather_than_the_run():
+    """`json.load` on the composed schema sat outside every guard in `validate()`, and `main()`
+    checks that the file exists without ever checking that it parses. Both branches read it — the
+    jsonschema one and the shallow fallback — so a repository with one broken schema lost the whole
+    run, which is the class three of this release's `### Fixed` entries are about."""
+    d, composed, runner = grader_tree()
+    try:
+        write(composed, "{ this is not json")
+        mod = load_runner(runner, "evalrun_unparseable")
+        for label, stub in (("with jsonschema", False), ("without jsonschema", True)):
+            real = dict(sys.modules)
+            if stub:
+                sys.modules["jsonschema"] = None
+            try:
+                out = mod.validate({}, composed)
+            except BaseException as exc:
+                check(f"{label}: an unparseable schema is graded ({type(exc).__name__})",
+                      False, True)
+                return
+            finally:
+                sys.modules.clear(); sys.modules.update(real)
+            check(f"{label}: it says the schema itself will not parse",
+                  bool(out) and "not readable JSON" in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_path_that_is_not_there_is_a_typo_not_a_base():
+    """The vendored-base refusal ran before the existence check, so a case naming
+    `.../verdikt.base.schema.json` was told to name the composed schema instead — advice about the
+    wrong problem."""
+    d, composed, runner = grader_tree()
+    try:
+        write(os.path.join(d, ".agents", "evals", "scenarios.yaml"),
+              "version: 1\ndefaults:\n  schema_dir: ../schemas\n  fixture_dir: fixtures\n"
+              "cases:\n  - id: typo\n    agent: a\n    prompt: p\n    expect:\n      schema: "
+              "../vendor/exeris-agents-2.0.0/schemas/verdikt.base.schema.json\n")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report",
+                            os.path.join(d, "report.json"), "--scenarios",
+                            os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=d)
+        check("the missing file is what the case is told about",
+              ("schema not found" in p.stdout, "names a bundle base" in p.stdout), (True, False))
+    finally:
+        shutil.rmtree(d)
+
+
 def test_a_policy_nothing_composes_is_reported():
     """rule 5's unchecked direction. The forward one — a profile naming a policy that does not
     resolve — is an error. The reverse was invisible: on disk, in the manifest, composed by nobody.

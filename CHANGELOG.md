@@ -75,6 +75,12 @@ number.
   repository stays green while it pins a bundle whose bases still close themselves and goes red
   when it re-vendors — the moment the enforcement actually moves. From then on the count of what is
   left to do is whatever a run says, not whatever a release note said once.
+- **A closer that refuses everything is reported too.** `additionalProperties: false` in a sibling
+  `allOf` branch is the obvious migration move and the one each base's `description` warns against:
+  it sees only the properties named beside it, so it rejects everything the base declares while
+  looking closed to a check that asks only whether a foreign property can get in. A conforming
+  decision graded against such a schema is refused outright, and the checker now says so at the
+  location it happens.
 - Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
   into a vendored tree that **no** import pins is a finding, not a shrug: it resolves, so no other
   check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
@@ -106,8 +112,12 @@ number.
   runner was killing the run it protected, through the branch the fix had just declared closed.
   Three outcomes are now distinguished and each has a test: a reference that resolves to nothing, a
   path refused for leaving the repository, and any other failure, which says it was the grader that
-  failed and names what raised. The history is here rather than tidied away because this release's
-  argument is that a claim nothing re-measures is worth less than a run.
+  failed and names what raised. A fourth path was found in review after all three: the composed
+  schema's own `json.load` sat outside every guard, in both branches, so a repository with one
+  unparseable schema still lost the run — `main()` checks that the file exists and never that it
+  parses. It is read inside the guard now. The history is here rather than tidied away because this
+  release's argument is that a claim nothing re-measures is worth less than a run, and this
+  particular claim has needed four.
 - **The checker read a `$ref` target before deciding it was allowed to.** `load_schema` opened
   whatever path it was handed; what stopped it leaving the checkout was `ref_target()`, two modules
   away, which every caller happened to go through. Measured on a direct call, it read and parsed a
@@ -117,6 +127,10 @@ number.
   repository is reported rather than surfacing as a target that does not exist or a pointer that
   does not resolve. Raised by SonarCloud as path injection, which as reported was a false positive:
   the sanitiser was real, it was just in another module — and so was the defect.
+- **A case naming a path that is not there was told it had named a bundle base.** The refusal ran
+  before the existence check, so a typo under `.agents/vendor/` was answered with advice about
+  composed schemas. And a `$ref` target that exists but does not parse was reported as a pointer
+  that does not resolve, sending the reader to the pointer rather than to the file.
 - **Every failure was reported as a `$ref` that did not resolve.** The catch-all told each case the
   same story, path and all, whatever had actually gone wrong — a grader that misnames a failure
   sends its reader to the wrong file.

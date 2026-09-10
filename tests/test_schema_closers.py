@@ -517,6 +517,133 @@ def test_a_base_referenced_somewhere_an_instance_never_meets_is_reported():
         shutil.rmtree(d)
 
 
+def test_no_base_declares_a_closer_of_its_own():
+    """The release's own claim, re-measured against all three files rather than one. `### Breaking`
+    says no object in any base declares `additionalProperties` or `unevaluatedProperties`; only the
+    verdict base was ever measured, and restoring one to `triage-result.base` would have shipped
+    green while silently taking every consumer's ability to extend a gate."""
+    def keywords(node):
+        """Every key in every object of a document — the keys, not the prose: each base's
+        `description` names both closers on purpose."""
+        if isinstance(node, dict):
+            yield from node
+            for value in node.values():
+                yield from keywords(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from keywords(value)
+
+    for name in sorted(os.listdir(SCHEMAS)):
+        with open(os.path.join(SCHEMAS, name), encoding="utf-8") as fh:
+            declared = set(keywords(json.load(fh)))
+        check(f"{name} declares no closer of its own",
+              sorted(declared & {"additionalProperties", "unevaluatedProperties"}), [])
+
+
+def test_two_bases_disagreeing_about_a_property_do_not_kill_the_run():
+    """One base declares `findings` an object, the other an array. The probe took one shape and the
+    locations kept both, so the walk into the value raised `KeyError` out of `check_closers` — and
+    `rep.emit()` never ran, so a crash reached CI as zero annotations rather than as a failure."""
+    other = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+             "properties": {"findings": {"type": "object",
+                                         "properties": {"a": {"type": "string"}}}}}
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/other.base.schema.json"},
+                          {"$ref": BASE}],
+                "unevaluatedProperties": False},
+               vendored={f"{VENDORED}/schemas/other.base.schema.json": other})
+    try:
+        out = errors(d)          # raises AssertionError of its own if the checker crashed
+        check("the run survives and still reports the objects it can decide",
+              any(OPEN_AT in l for l in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_closer_that_refuses_the_base_itself_is_reported():
+    """`additionalProperties: false` in a sibling branch is the obvious migration move and the one
+    each base's `description` warns against: it sees only the properties named beside it, so it
+    refuses everything the base declares. Asking only whether a property can get IN reads that as
+    closed — the probe property is refused along with all the rest."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE},
+                          {"properties": {"agent": {"enum": ["r"]}},
+                           "additionalProperties": False}]})
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a schema that rejects the base's own properties is reported",
+              any("refuses properties the base itself declares" in f for f in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_root_that_composes_through_another_file_is_reported():
+    """`{"$ref": "inner.json"}` at the root, with the base composed one file over: `applies_at_the
+    _root` stops at a file boundary, so the schema was neither probed nor reported."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$ref": "../core/inner.json"})
+    try:
+        core = os.path.join(d, ".agents", "core")
+        os.makedirs(core)
+        with open(os.path.join(core, "inner.json"), "w", encoding="utf-8") as fh:
+            json.dump({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                       "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"}]},
+                      fh)
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a base composed through a file this check does not follow is reported",
+              any("not where an instance meets" in f for f in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_an_object_two_levels_down_is_probed():
+    """The probe read one level of a base, so an object nested inside another was never asked."""
+    deep = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+            "properties": {"outer": {"type": "object",
+                                     "properties": {"inner": {"type": "object",
+                                                              "properties": {"a": {"type": "string"}}}}}}}
+    out = open_locations_for(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema",
+         "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/deep.base.schema.json"}],
+         "unevaluatedProperties": False,
+         "properties": {"outer": {"unevaluatedProperties": False}}},
+        vendored={f"{VENDORED}/schemas/deep.base.schema.json": deep})
+    check("the object below the first level is named", out, ["outer/inner"])
+
+
+def test_a_ref_target_that_is_not_readable_json_says_so():
+    """It was reported as a pointer that does not resolve, which sends the reader to the pointer
+    rather than to the file that will not parse."""
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "properties": {"x": {"$ref": "notjson.schema.json#/$defs/thing"}}})
+    try:
+        with open(os.path.join(d, ".agents", "schemas", "notjson.schema.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("this is not json\n")
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("the file is named as the thing to look at",
+              any("not readable JSON" in f for f in out), True)
+        check("and it is not called a pointer that does not resolve",
+              any("pointer that does not resolve" in f for f in out), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_malformed_pin_does_not_switch_the_off_pin_check_off():
+    """`vendor_roots()` skips an import missing its version, so a malformed pin left no roots at
+    all — and "no roots" was read as "everything is pinned", turning the check off in the state it
+    exists for."""
+    no_version = MANIFEST.replace("    version: 2.0.0\n", "")
+    d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
+                "allOf": [{"$ref": BASE}], "unevaluatedProperties": False},
+               manifest=no_version)
+    try:
+        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
+        check("a reference into a tree nothing pins is reported", len(off_pin(out)), 1)
+    finally:
+        shutil.rmtree(d)
+
+
 # ── what the schema check may read ────────────────────────────────────────────────────────────
 
 def checker_module():
