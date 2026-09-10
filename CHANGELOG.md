@@ -99,7 +99,12 @@ number.
   reported rather than measured, because a probe is evidence only when the instance conforms. That
   subsumes a rule of its own: a closer parked inside an `allOf` branch, where it sees only the
   properties named beside it, refuses every conforming decision — so it is caught by measurement,
-  at whatever depth it sits, instead of by a scan for the shape.
+  at whatever depth it sits, instead of by a scan for the shape. A repository's own narrowing
+  pattern is built rather than guessed at where it can be — literal runs, escapes, a class with a
+  quantifier, the first alternative of a group — and where it cannot, the schema is declined with
+  the reason, at warning level: a value this check could not construct is its own limit as much as
+  the schema's, and failing a conforming repository over it is the mistake the level protects
+  against.
 - **The check names what it did not measure.** The probe understands a stated set of shapes —
   `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
   document that named them — and every construct it meets and does not walk is now a warning

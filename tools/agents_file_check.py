@@ -684,12 +684,71 @@ def applying(parts, roots, seen=frozenset()):
     return out, declined
 
 
+def from_pattern(pattern: str):
+    """A string built to match a simple pattern, or None.
+
+    Not a regular-expression solver: literal runs, escaped characters, a character class with a
+    quantifier, and the first alternative of a group. That covers what a repository writes to
+    narrow a path or a name — `^templates/[A-Z-]+-TEMPLATE\\.md$` is a real one — and anything it
+    cannot build is declined rather than guessed at.
+    """
+    out, i, depth = [], 0, 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch in "^$":
+            i += 1
+        elif ch == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i + 1] if pattern[i + 1] not in "dwsDWS" else "a")
+            i += 2
+        elif ch == "[":
+            close = pattern.find("]", i + 1)
+            if close < 0:
+                return None
+            inside = pattern[i + 1:close]
+            pick = "a" if inside.startswith("^") else next(
+                (c for c in inside if c.isalnum()), None)
+            if pick is None:
+                return None
+            if close + 1 < len(pattern) and pattern[close + 1] in "+*?{":
+                i = close + 2
+                while i < len(pattern) and pattern[i - 1] == "{" and pattern[i] != "}":
+                    i += 1
+            else:
+                i = close + 1
+            out.append(pick)
+        elif ch == "(":
+            end, level = i, 0
+            for j in range(i, len(pattern)):
+                level += (pattern[j] == "(") - (pattern[j] == ")")
+                if level == 0:
+                    end = j
+                    break
+            group = pattern[i + 1:end].split("|")[0].lstrip("?:")
+            if end + 1 < len(pattern) and pattern[end + 1] in "*?":
+                i = end + 2                       # an optional group contributes nothing
+                continue
+            built = from_pattern(group)
+            if built is None:
+                return None
+            out.append(built)
+            i = end + 1 + (1 if end + 1 < len(pattern) and pattern[end + 1] == "+" else 0)
+        elif ch in ".+*?{}":
+            if ch == ".":
+                out.append("a")
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def a_string(parts):
     """A string every part accepts, or None and the reason."""
     patterns = [n.get("pattern") for n, _, _ in parts if isinstance(n.get("pattern"), str)]
     low = max([n.get("minLength", 0) for n, _, _ in parts] or [0])
     high = min([n.get("maxLength", 1 << 20) for n, _, _ in parts] or [1 << 20])
-    for candidate in CANDIDATE_STRINGS:
+    built = [from_pattern(p) for p in patterns] if patterns else []
+    for candidate in [b for b in built if b] + list(CANDIDATE_STRINGS):
         for text in (candidate, candidate + "a" * max(0, low - len(candidate)), "a" * low):
             if not (low <= len(text) <= high):
                 continue
@@ -937,6 +996,17 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
             if validator.is_valid(alternative):
                 instance, declined, errors = alternative, alternative_declined, []
                 break
+    if errors and declined:
+        # The generator already said it could not build part of this decision, so the rejection
+        # below is as likely to be its own as the schema's — and an error here fails a repository
+        # that conforms. What can be said is that nothing was measured.
+        first = errors[0]
+        rep.warning(rel, f"no decision could be built that this schema accepts — it was refused at "
+                         f"{where(tuple(first.absolute_path))}: {first.message}. With a value this "
+                         f"check could not construct, that is its own limit as much as the "
+                         f"schema's, so nothing about what this schema refuses was measured",
+                    rule="schema")
+        return
     if errors:
         first = errors[0]
         rep.error(rel, f"rejects a decision built to satisfy it, at "

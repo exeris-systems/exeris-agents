@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -1000,6 +1001,42 @@ def test_every_keyword_the_bundle_uses_is_one_the_generator_walks():
         places_objects = used & (mod.DECLINED_KEYWORDS - {"if", "then", "else", "not", "anyOf",
                                                           "oneOf", "contains", "dependentSchemas"})
         check(f"{name} uses no shape the generator cannot build", sorted(places_objects), [])
+
+
+def test_a_narrowed_pattern_is_built_rather_than_declined():
+    """A repository narrows a path or a name with a pattern — `exeris-docs` writes
+    `^templates/[A-Z-]+-TEMPLATE\\.md$` — and a generator that cannot satisfy it measures nothing at
+    all for that schema. Literal runs, escapes, a class with a quantifier and the first alternative
+    of a group are built; anything else is declined."""
+    mod = checker_module()
+    for pattern, expected in ((r"^templates/[A-Z-]+-TEMPLATE\.md$", "templates/A-TEMPLATE.md"),
+                              (r"^[a-z0-9]+(-[a-z0-9]+)*$", "a"),
+                              (r"^[^\s#]+#[A-Za-z0-9.§-]+$", "a#A"),
+                              (r"^[A-Z][A-Z0-9_]*$", "AA")):
+        built = mod.from_pattern(pattern)
+        check(f"built for {pattern}", (built, bool(built and re.search(pattern, built))),
+              (expected, True))
+
+
+def test_a_value_the_generator_cannot_build_is_a_warning_not_a_verdict():
+    """The failure mode this pair exists to prevent: the generator declines a value, carries on
+    with a placeholder, the schema rejects the placeholder, and a repository that conforms is told
+    it rejects a conforming decision. A rejection after a decline is this check's own limit as much
+    as the schema's, and says so."""
+    impossible = {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                  "allOf": [{"$ref": BASE},
+                            {"properties": {"scope_class": {"pattern": "(?=.*a)(?=.*b)^[ab]{2}$"}}}],
+                  "unevaluatedProperties": False}
+    d = custom(impossible)
+    try:
+        errs = [e.split("schema::", 1)[-1] for e in errors(d) if "schema::" in e]
+        warns = [w.split("schema::", 1)[-1] for w in warnings(d) if "schema::" in w]
+        check("it is not called a schema that rejects a conforming decision",
+              any("rejects a decision built to satisfy it" in e for e in errs), False)
+        check("and the reader is told nothing was measured, and why",
+              any("no decision could be built" in w or "not measured" in w for w in warns), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
 
 
 # ── what the schema check may read ────────────────────────────────────────────────────────────
