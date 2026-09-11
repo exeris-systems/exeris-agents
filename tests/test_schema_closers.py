@@ -1699,5 +1699,52 @@ def test_a_check_that_raises_becomes_a_finding_and_the_report_is_still_written()
     check("and the report is written", any(l.startswith("## agents_file_check") for l in lines), True)
 
 
+def test_this_check_failing_on_one_schema_is_a_warning_and_the_one_declared_false_green():
+    """(c) The one false green this release chooses, written down as one. A schema on which this
+    check itself raises — a validator that cannot be built, a walker meeting what it did not
+    expect — is reported as not measured, naming the exception, at warning level: only what is
+    measured is an error, and nothing here was. So a repository whose composed schema is wide
+    open AND makes this check fail is not red. Driven directly, with the probe's validator
+    raising, because no particular crash has to be known in advance; the pinned-import check is
+    switched off so the exit code answers for the schema rule alone. The guard above every check
+    (the test before this one) is the other half: the checker failing as a whole is still red."""
+    import contextlib
+    import io
+    mod = checker_module()
+    wide_open = {"$schema": DRAFT, "allOf": [{"$ref": BASE}]}
+    d = custom(wide_open)
+
+    def raising(schema, schema_path):
+        raise RuntimeError("the probe's validator could not be built")
+
+    mod.probe_validator = raising
+    mod.check_pinned_bundle = lambda *a, **k: None
+    out, argv, here = io.StringIO(), sys.argv, os.getcwd()
+    sys.argv = [CHECKER, "--root", d]
+    summary = os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    try:
+        with contextlib.redirect_stdout(out):
+            try:
+                mod.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+    finally:
+        sys.argv = argv
+        os.chdir(here)
+        if summary is not None:
+            os.environ["GITHUB_STEP_SUMMARY"] = summary
+        shutil.rmtree(d)
+    lines = out.getvalue().splitlines()
+    check("the failure is a warning naming the exception, and says nothing was measured",
+          any(l.startswith("::warning") and "RuntimeError" in l and "this check failed on it" in l
+              for l in lines), True)
+    check("no object of a schema this check failed on is called open — or closed",
+          [l for l in lines if l.startswith("::error")], [])
+    check("and the run is green: the false green this rule chooses, declared here", code, 0)
+    check("while the same schema, measured, is red at every object",
+          open_locations_for(wide_open), ["<root>", "checks_run/0", "findings/0", "handoffs/0"])
+
+
 if __name__ == "__main__":
     main(globals())

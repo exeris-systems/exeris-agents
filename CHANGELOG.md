@@ -146,7 +146,10 @@ number.
   the keywords apart by the shape of the refusal's path was fixed once for each, and the sixth
   shape was the one the fix did not know. The guess is gone rather than improved: unmeasured says
   it is unmeasured. The same holds for this check failing on one schema — it reports that it
-  failed there and what it could not measure, rather than a verdict.
+  failed there and what it could not measure, rather than a verdict. That is the one false green
+  this rule chooses: a schema that is wide open and also makes this check raise is not red, and
+  `tests/test_schema_closers.py` says so in as many words, so that it is a decision on record and
+  not a gap found later. The checker failing as a whole is still red.
 - **The probe is fair to a name rule.** `patternProperties: {"^exeris": false}` refused every
   probe name — all three began with `exeris` — and the root was reported closed while any other
   name walked in. A closer refuses undeclared names, not names that look a certain way, so the
