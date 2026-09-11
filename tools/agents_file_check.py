@@ -448,14 +448,21 @@ def check_workflows(rep: Report, agents: set[str], skills: set[str]):
 
 
 def subschemas(node):
-    """Every node in a schema. The one tree walker."""
-    if isinstance(node, dict):
-        yield node
-        for v in node.values():
-            yield from subschemas(v)
-    elif isinstance(node, list):
-        for v in node:
-            yield from subschemas(v)
+    """Every node in a schema, in document order. The one tree walker.
+
+    Iterative, because a schema is an input: one nested past the interpreter's recursion limit
+    raised out of here, in the middle of `check_schemas`, and the run ended with no report. The
+    validator's own metaschema check still recurses and still raises on such a file — inside a
+    guard, as a finding against that file.
+    """
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            yield node
+            stack.extend(reversed(list(node.values())))
+        elif isinstance(node, list):
+            stack.extend(reversed(node))
 
 
 def ref_target(ref, from_dir: str, roots):
@@ -583,12 +590,34 @@ def vendored_tree(path: str) -> str:
 # failing branch contributes no annotations, and from there nothing downstream can be read
 # straight. So the instance is generated to satisfy the schema, VERIFIED against it, and the
 # question becomes one boolean: add a property, is it still valid.
+#
+# The validator sees the whole schema; the generator walks a stated subset of it. Three things
+# follow from that gap, and each has one answer here rather than a patch per keyword:
+#
+#   * a value the generator built may be refused through a keyword it did not walk or satisfy — a
+#     `then` requiring a property it never built, a `contains` it never aimed at. The refusal's
+#     schema path says which keyword it came through, so a refusal through one the generator does
+#     not honour is this check's own limit, reported as not measured, and only a refusal through
+#     keywords it did honour is the schema rejecting a conforming decision;
+#   * an object may be left unbuilt where a keyword the generator does not walk would put one. It
+#     is never probed, and the construct and the object are named;
+#   * a probe name may be refused for its SHAPE. A closer refuses undeclared names, not names that
+#     look a certain way, so the probe uses names no name rule at that object refuses, and says so
+#     when it has none.
 
-# Three name shapes — hyphenated, underscored, plain letters — because a `propertyNames` rule
-# refuses a name for its SHAPE, not for being undeclared, and one shape refused proves nothing about
-# the others. Any of them getting in means the object takes what the base does not name.
+# Several name shapes — hyphenated, underscored, plain letters, capitalised, with a digit, one
+# letter — because a `propertyNames` or `patternProperties` rule refuses a name for its shape, not
+# for being undeclared, and one shape refused proves nothing about the others. The probe uses the
+# ones no rule at the object refuses; any of them getting in means the object takes what the base
+# does not name.
 PROBE_PROPERTIES = ("exeris-closer-probe-property", "exeris_closer_probe_two",
-                    "exerisclosercandidate")
+                    "exerisclosercandidate", "ExerisProbeProperty", "zz9probe", "q")
+
+# And several value shapes under each name. A closer refuses an undeclared NAME whatever stands
+# under it; `additionalProperties: {"type": "integer"}` refuses a string for its type and lets
+# every number in, and one string refused read as a closed object. An object is closed only when
+# every name is refused with every value.
+PROBE_VALUES = ("probe", 7, 1.5, True, None, {}, [])
 
 # Candidate strings, tried in order against whatever `pattern`, `minLength` and `maxLength` apply.
 # A generator that solves regular expressions is a different program; these cover the shapes the
@@ -599,8 +628,9 @@ CANDIDATE_STRINGS = ("a", "abc", "human", "abc-def", "a.md#1", "ABC", "ABC_DEF",
 # The 2020-12 keywords that can hold a subschema, and what this check does with each. Every one is
 # either walked by the generator or declined by name where it appears — `tests/test_schema_
 # closers.py` fails if a keyword is in neither, so the next keyword is caught by CI rather than by
-# a sixth review round.
-HANDLED_KEYWORDS = frozenset({"properties", "items", "prefixItems", "$ref", "allOf",
+# a sixth review round. `$dynamicRef` is walked like `$ref`: it resolves the same way until its
+# fragment names a dynamic anchor, and a composition written with it is a composition.
+HANDLED_KEYWORDS = frozenset({"properties", "items", "prefixItems", "$ref", "$dynamicRef", "allOf",
                               "$defs", "definitions"})
 
 # And the assertions. A keyword the generator does not satisfy is DECLINED where it appears —
@@ -612,58 +642,110 @@ HONOURED_ASSERTIONS = frozenset({"type", "required", "enum", "const", "pattern",
                                  "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"})
 DECLINED_ASSERTIONS = frozenset({"format", "minProperties", "maxProperties", "dependentRequired",
                                  "minContains", "maxContains"})
+# Not walked when a value is built. Two of them are honoured later, when the probe chooses a
+# name: `patternProperties` and `propertyNames` refuse names for their shape, and the probe uses
+# names they do not refuse. The branching ones are compared with what the generator did build,
+# and reported where they would put something it did not.
 DECLINED_KEYWORDS = frozenset({"additionalItems", "patternProperties", "additionalProperties",
                                "propertyNames", "anyOf", "oneOf", "not", "if", "then", "else",
                                "dependentSchemas", "contains", "unevaluatedItems",
                                "unevaluatedProperties"})
 
+# The keywords that hold a subschema over what the properties do not name; an object under one
+# is not built, and is declared as such.
+SCHEMA_VALUED = frozenset({"additionalProperties", "unevaluatedProperties", "unevaluatedItems"})
+# Keywords followed in a schema path by a NAME rather than a keyword — a property, a pattern, a
+# definition. Reading the name as a keyword would make a property called `anyOf` a blind spot.
+NAMED_BY_KEY = frozenset({"properties", "patternProperties", "dependentSchemas", "$defs",
+                          "definitions"})
+REFERENCE_KEYWORDS = ("$ref", "$dynamicRef")
+
 
 def object_ish(node) -> bool:
-    """Whether a subschema could describe an object with properties of its own."""
-    return isinstance(node, dict) and bool(
-        {"properties", "items", "prefixItems", "$ref", "patternProperties"} & set(node)
-        or node.get("type") == "object")
+    """Whether a subschema could describe an object with properties of its own.
 
-
-def introduces_shape(node) -> bool:
-    """Whether anything inside could put an object where the generated instance has none.
-
-    A branch that only constrains what is already there — the bases' own `if`/`then` over
-    `findings` and `decision` — introduces nothing, and declining it would put warnings on every
-    composition in the ecosystem and teach the reader to skip them.
+    A declared `type` decides; without one, the keywords that only make sense of an object do —
+    including a reference, which names a shape this cannot see from here, and a branch whose
+    alternatives could each be one.
     """
-    for sub in subschemas(node):
-        if not isinstance(sub, dict):
-            continue
-        if "patternProperties" in sub or object_ish(sub.get("additionalProperties")):
+    if not isinstance(node, dict):
+        return False
+    declared = node.get("type")
+    if declared == "object" or (isinstance(declared, list) and "object" in declared):
+        return True
+    if declared is not None:
+        return False
+    if {"properties", "patternProperties", "required", "items", "prefixItems"} & set(node) \
+            or any(True for _ in references_of(node)):
+        return True
+    for keyword in ("allOf", "anyOf", "oneOf", "then", "else"):
+        value = node.get(keyword)
+        if any(object_ish(sub) for sub in (value if isinstance(value, list) else [value])):
             return True
-        if any(object_ish(v) for v in (sub.get("properties") or {}).values()):
-            return True
+    return any(object_ish(sub) for sub in (node.get("dependentSchemas") or {}).values())
+
+
+def references_of(node):
+    """`(keyword, target)` for each reference a schema object carries."""
+    if isinstance(node, dict):
+        for keyword in REFERENCE_KEYWORDS:
+            if isinstance(node.get(keyword), str):
+                yield keyword, node[keyword]
+
+
+def resolved_ref(ref: str, document, base_dir: str):
+    """`(node, document, directory, declined)` for one reference.
+
+    Followed: a fragment inside the document that named it, and a file inside the checkout — a
+    vendored base, a neighbour under `.agents/schemas/`, a wrapper of the repository's own. That is
+    what the validator resolves too, so the generator and the validator now read the same tree.
+    Declined by name: a URL, a path leaving the checkout, a file that is not a schema object, and a
+    fragment naming an anchor rather than a pointer — a `$dynamicRef` to a dynamic anchor resolves
+    through the dynamic scope, which this does not model.
+    """
+    if "://" in ref:
+        return None, document, base_dir, f"a reference this check does not fetch ('{ref}')"
+    path, _, pointer = ref.partition("#")
+    if pointer and not pointer.startswith("/"):
+        return None, document, base_dir, f"a reference to a named anchor ('{ref}')"
+    if path:
+        target = os.path.normpath(os.path.join(base_dir, path))
+        onward = load_schema(target)                # None outside the checkout, or unreadable
+        if not isinstance(onward, dict):
+            return None, document, base_dir, f"a reference that names no readable schema ('{ref}')"
+        document, base_dir = onward, os.path.dirname(target)
+    node = node_at(document, pointer) if pointer else document
+    if not isinstance(node, dict):
+        return None, document, base_dir, f"a reference that names no object ('{ref}')"
+    return node, document, base_dir, None
+
+
+def reaches_bundle(schema, here: str, roots, seen=None) -> bool:
+    """Whether a schema composes a bundle base: a reference into the vendored tree, at any depth,
+    directly or through a file of the repository's own. Recognised by where a reference resolves,
+    never by a filename."""
+    seen = set() if seen is None else seen
+    for node in subschemas(schema):
+        for _, ref in references_of(node):
+            if ref_target(ref, here, roots):
+                return True
+            if ref.startswith("#") or "://" in ref:
+                continue
+            through = os.path.normpath(os.path.join(here, ref.partition("#")[0]))
+            if through in seen:
+                continue
+            seen.add(through)
+            document = load_schema(through)
+            if isinstance(document, dict) and reaches_bundle(document, os.path.dirname(through),
+                                                              roots, seen):
+                return True
     return False
 
 
-def resolved_ref(ref: str, document, base_dir: str, roots):
-    """`(node, document, directory, declined)` for one `$ref`: into the bundle, or inside the
-    document that named it. Anything else is declined by name rather than followed."""
-    target = ref_target(ref, base_dir, roots)
-    if target:
-        onward = load_schema(target[0])
-        node = onward if not target[1] else node_at(onward, target[1])
-        if not isinstance(node, dict):
-            return None, document, base_dir, f"a reference that names no object ('{ref}')"
-        return node, onward, os.path.dirname(target[0]), None
-    if ref.startswith("#"):
-        node = node_at(document, ref[1:])
-        if not isinstance(node, dict):
-            return None, document, base_dir, f"a fragment that names no object ('{ref}')"
-        return node, document, base_dir, None
-    return None, document, base_dir, f"a reference outside the bundle ('{ref}')"
-
-
-def applying(parts, roots):
+def applying(parts):
     """Every subschema that applies to one value, as `(node, document, directory)`.
 
-    A `$ref` brings in what it names **and keeps its siblings**: `{"$ref": …, "properties": {…}}`
+    A reference brings in what it names **and keeps its siblings**: `{"$ref": …, "properties": {…}}`
     declares both, and reading only the target lost the second. `allOf` branches apply for the same
     reason. Each entry carries the ancestors it was reached through, so a cycle stops while one
     neighbour referenced from two properties is still expanded at both — a single visited-set for
@@ -677,9 +759,8 @@ def applying(parts, roots):
             continue
         below = ancestors | {id(node)}
         out.append((node, document, base_dir))
-        ref = node.get("$ref")
-        if isinstance(ref, str):
-            target, onward, directory, refusal = resolved_ref(ref, document, base_dir, roots)
+        for _, ref in references_of(node):
+            target, onward, directory, refusal = resolved_ref(ref, document, base_dir)
             if refusal:
                 declined.append(refusal)
             elif target is not None:
@@ -687,6 +768,81 @@ def applying(parts, roots):
         for branch in node.get("allOf") or []:
             stack.append((branch, document, base_dir, below))
     return out, declined
+
+
+def parts_of_property(applied, name: str):
+    """The subschemas that apply to one property of an object the parts describe."""
+    return [(sub, document, base_dir) for node, document, base_dir in applied
+            for n, sub in (node.get("properties") or {}).items() if n == name]
+
+
+def parts_of_items(applied):
+    """The subschemas that apply to some element of an array the parts describe."""
+    out = []
+    for node, document, base_dir in applied:
+        if isinstance(node.get("items"), dict):
+            out.append((node["items"], document, base_dir))
+        for item in node.get("prefixItems") or []:
+            if isinstance(item, dict):
+                out.append((item, document, base_dir))
+    return out
+
+
+def novel(branch, parts, depth: int = 6):
+    """What a branch the generator does not walk would put where the decision has nothing.
+
+    The first such thing, named — a property no part applying there declares, an object under
+    names that cannot be enumerated — or None when the branch only constrains what is already
+    built. That is the difference between the bases' own `if`/`then` over `findings`, which
+    introduces nothing and must not put a warning on every composition in the ecosystem, and a
+    `then` that requires a property the generator never built, whose object is never probed.
+    Compared structurally, level by level, against the parts that apply at each level.
+    """
+    node, document, base_dir = branch
+    if depth <= 0 or not isinstance(node, dict):
+        return None
+    applied, _ = applying(parts)
+    names: set = set()
+    for part, _, _ in applied:
+        names.update(part.get("properties") or {})
+        names.update(part.get("required") or [])
+    expanded, _ = applying([branch])
+    for sub, doc, where_ in expanded:
+        wanted = list(sub.get("properties") or {}) + list(sub.get("required") or [])
+        for more in (sub.get("dependentRequired") or {}).values():
+            wanted += list(more) if isinstance(more, list) else []
+        for name in wanted:
+            if name not in names:
+                return f"a property '{name}'"
+        for name, below in (sub.get("properties") or {}).items():
+            found = novel((below, doc, where_), parts_of_property(applied, name), depth - 1)
+            if found:
+                return found
+        for pattern, below in (sub.get("patternProperties") or {}).items():
+            if object_ish(below):
+                return f"an object under `patternProperties` '{pattern}'"
+        if object_ish(sub.get("additionalProperties")):
+            return "an object under `additionalProperties`"
+        for key in ("items", "contains"):
+            if isinstance(sub.get(key), dict):
+                found = novel((sub[key], doc, where_), parts_of_items(applied), depth - 1)
+                if found:
+                    return found
+        for item in sub.get("prefixItems") or []:
+            found = novel((item, doc, where_), parts_of_items(applied), depth - 1)
+            if found:
+                return found
+        for key in ("anyOf", "oneOf", "then", "else"):
+            value = sub.get(key)
+            for below in (value if isinstance(value, list) else [value]):
+                found = novel((below, doc, where_), parts, depth - 1)
+                if found:
+                    return found
+        for below in (sub.get("dependentSchemas") or {}).values():
+            found = novel((below, doc, where_), parts, depth - 1)
+            if found:
+                return found
+    return None
 
 
 def quantifier(pattern: str, i: int):
@@ -832,55 +988,100 @@ def kind_of(parts) -> str:
     return "object"
 
 
-def build(parts, roots, depth: int = 8, at=()):
-    """`(value, declined)` — a value built to satisfy every subschema that applies.
+class Probe:
+    """What one attempt at building a decision learned beside the value.
 
-    Two lists come back beside the value. `declined` is `(location, reason)` for everything the
-    reader should hear about — a construct not walked, an assertion not satisfied, a value not
-    built. `unbuilt` is the subset that is a missing VALUE: those locations are pruned from the
-    instance and not probed, while a construct left unwalked costs a warning and nothing else.
-    Conflating them skipped the very object the reader was being warned about.
+    Three lists, because they cost different things. `declined` is what the reader hears about —
+    a construct not walked, a reference not followed, a value not built. `unbuilt` is the subset
+    that is a missing VALUE: pruned from the instance and not probed. A location built without a
+    part the generator could not follow is neither: kept, and probed — the validator saw the
+    whole schema, so a probe on an instance it accepted is sound. `names` is the name rules at
+    each object, which the probe must be fair to. Conflating the first two skipped the very
+    object the reader was being warned about.
+    """
 
-    A location is what makes a decline cost one property rather than the schema. That is
-    the difference between costing one property and costing the schema. A pattern this cannot
-    construct used to end the measurement — "no decision could be built" — and an object three
-    levels away went unreported although the run knew perfectly well what was wrong with it. Now
-    the location is dropped from the instance, the rest is measured, and the location is named.
+    def __init__(self):
+        self.declined: list = []
+        self.unbuilt: list = []
+        self.names: dict = {}
+
+
+def build(parts, probe: Probe, depth: int = 8, at=()):
+    """A value built to satisfy every subschema that applies, or None where none could be.
+
+    A location is what makes a decline cost one property rather than the schema. A pattern this
+    cannot construct used to end the measurement — "no decision could be built" — and an object
+    three levels away went unreported although the run knew perfectly well what was wrong with it.
+    Now the location is dropped from the instance, the rest is measured, and the location is named.
 
     Best effort by design, and checked: what it produces is validated against the schema before
     anything is concluded from it, so a wrong guess becomes a refusal to measure and never a wrong
     verdict.
     """
-    parts, refusals = applying(parts, roots)
-    declined, unbuilt = [(at, why) for why in refusals], []
+    parts, refusals = applying(parts)
+    for why in refusals:
+        probe.declined.append((at, f"{why} was not followed, so what it declares was not built "
+                                   f"here; the values are built from the rest, and the validator "
+                                   f"still sees all of it"))
     if depth <= 0:
-        return None, declined + [(at, "the depth bound")], [at]
+        probe.declined.append((at, "the depth bound stopped the generator, so nothing below "
+                                   "this location was built or probed"))
+        probe.unbuilt.append(at)
+        return None
     if not parts:
-        return {}, declined, unbuilt
+        return {}
 
-    for node, _, _ in parts:
+    # What the generator does not walk, and where each would put something it did not build.
+    # `if` selects and `not` forbids; neither puts anything in a decision. `propertyNames` is
+    # honoured when the probe picks a name.
+    for node, document, base_dir in parts:
         for keyword in sorted(DECLINED_KEYWORDS & set(node)):
             value = node[keyword]
-            if keyword in ("patternProperties", "propertyNames", "additionalItems",
-                           "unevaluatedItems"):
-                declined.append((at, f"`{keyword}`"))
-            elif keyword in ("additionalProperties", "unevaluatedProperties"):
+            if keyword == "patternProperties":
+                for pattern, sub in (value.items() if isinstance(value, dict) else []):
+                    if object_ish(sub):
+                        probe.declined.append((at, f"an object under `patternProperties` "
+                                                   f"'{pattern}', which this generator does not "
+                                                   f"build, so it was never probed"))
+            elif keyword in SCHEMA_VALUED or keyword == "additionalItems":
                 if object_ish(value):
-                    declined.append((at, f"`{keyword}` as a schema"))
-            elif introduces_shape(value):
-                declined.append((at, f"`{keyword}`"))
-        for keyword in sorted(DECLINED_ASSERTIONS & set(node)):
-            declined.append((at, f"`{keyword}`, which this generator does not satisfy"))
+                    probe.declined.append((at, f"`{keyword}` as a schema — an object under it "
+                                               f"is not built, so it was never probed"))
+            elif keyword in ("anyOf", "oneOf"):
+                for sub in (value if isinstance(value, list) else []):
+                    found = novel((sub, document, base_dir), parts)
+                    if found:
+                        probe.declined.append((at, f"`{keyword}`, a branch of which introduces "
+                                                   f"{found} that this generator does not build, "
+                                                   f"so it was never probed"))
+                        break
+            elif keyword in ("then", "else", "contains"):
+                found = novel((value, document, base_dir),
+                              parts_of_items(parts) if keyword == "contains" else parts)
+                if found:
+                    probe.declined.append((at, f"`{keyword}` introduces {found} that this "
+                                               f"generator does not build, so it was never probed"))
+            elif keyword == "dependentSchemas":
+                for name, sub in (value.items() if isinstance(value, dict) else []):
+                    found = novel((sub, document, base_dir), parts)
+                    if found:
+                        probe.declined.append((at, f"`dependentSchemas` under '{name}' introduces "
+                                                   f"{found} that this generator does not build, "
+                                                   f"so it was never probed"))
+                        break
 
     for node, _, _ in parts:
         if "const" in node:
-            return node["const"], declined, unbuilt
+            return node["const"]
     enums = [n["enum"] for n, _, _ in parts if isinstance(n.get("enum"), list) and n["enum"]]
     if enums:
         shared = [v for v in enums[0] if all(v in other for other in enums[1:])]
         if not shared:
-            return None, declined + [(at, "a value every `enum` accepts")], [at]
-        return shared[0], declined, unbuilt
+            probe.declined.append((at, "a value every `enum` accepts could not be built, so the "
+                                       "value was left out of the decision"))
+            probe.unbuilt.append(at)
+            return None
+        return shared[0]
 
     kind = kind_of(parts)
     if kind == "object":
@@ -890,38 +1091,43 @@ def build(parts, roots, depth: int = 8, at=()):
                 declared.setdefault(name, []).append((sub, document, base_dir))
             for name in node.get("required") or []:
                 declared.setdefault(name, [])
+        patterns = [p for node, _, _ in parts
+                    for p in (node.get("patternProperties") or {}) if isinstance(p, str)]
+        naming = [(node["propertyNames"], document, base_dir)
+                  for node, document, base_dir in parts if "propertyNames" in node]
+        if patterns or naming:
+            probe.names[at] = (patterns, naming, frozenset(declared))
         for name, subs in declared.items():
-            below, refused, unmade = (build(subs, roots, depth - 1, at + (name,)) if subs
-                                      else ({}, [], []))
-            declined += refused
-            unbuilt += unmade
+            if any(sub is False for sub, _, _ in subs):
+                continue                          # a `false` schema forbids the property outright
+            below = build(subs, probe, depth - 1, at + (name,)) if subs else {}
             if below is not None:
                 value[name] = below
-        return value, declined, unbuilt
+        return value
     if kind == "array":
-        positions, tail = [], []
+        positions, tail, closed_tail = [], [], False
         for node, document, base_dir in parts:
             if isinstance(node.get("prefixItems"), list):
                 for index, item in enumerate(node["prefixItems"]):
                     while len(positions) <= index:
                         positions.append([])
                     positions[index].append((item, document, base_dir))
-            if isinstance(node.get("items"), dict):
-                tail.append((node["items"], document, base_dir))
+            items = node.get("items")
+            if isinstance(items, dict):
+                tail.append((items, document, base_dir))
+            elif items is False:
+                closed_tail = True                # nothing past the prefix, by declaration
             elif "items" in node:
-                declined.append((at, "an array whose item schema is not a schema object"))
+                probe.declined.append((at, "an array whose item schema is not a schema object, "
+                                           "so no element was built from it"))
         built = []
         for index, subs in enumerate(positions):
-            below, refused, unmade = build(subs, roots, depth - 1, at + (index,))
-            declined += refused
-            unbuilt += unmade
+            below = build(subs, probe, depth - 1, at + (index,))
             built.append({} if below is None else below)
         # An element of `items` as well as the prefix positions: with both declared, `items` covers
         # everything past the prefix, and building only the prefix left that shape unmeasured.
-        if tail:
-            below, refused, unmade = build(tail, roots, depth - 1, at + (len(built),))
-            declined += refused
-            unbuilt += unmade
+        if tail and not closed_tail:
+            below = build(tail, probe, depth - 1, at + (len(built),))
             if below is not None:
                 built.append(below)
         low = max([n.get("minItems", 0) for n, _, _ in parts] or [0])
@@ -931,29 +1137,34 @@ def build(parts, roots, depth: int = 8, at=()):
                 # Padding with copies violates `uniqueItems`, and an array with nothing to build
                 # from would be padded with an object the schema never declared. Either way the
                 # array is what could not be built, not the schema's fault.
-                return None, declined + [(at, f"an array of {low} elements this generator cannot "
-                                              f"make distinct" if unique else
-                                              f"an array of {low} elements with no item schema")], \
-                    unbuilt + [at]
+                probe.declined.append((at, (f"an array of {low} elements this generator cannot "
+                                            f"make distinct" if unique else
+                                            f"an array of {low} elements with no item schema")
+                                       + " could not be built, so the value was left out of the "
+                                         "decision"))
+                probe.unbuilt.append(at)
+                return None
             while len(built) < low:
                 built.append(copy.deepcopy(built[-1]))
         high = min([n.get("maxItems", 1 << 20) for n, _, _ in parts] or [1 << 20])
-        return (built[:high] if len(built) > high else built), declined, unbuilt
-    if kind == "string":
-        text, refusal = a_string(parts)
-        if text is None:
-            return None, declined + [(at, refusal)], unbuilt + [at]
-        return text, declined, unbuilt
-    if kind in ("integer", "number"):
-        number, refusal = a_number(parts, kind == "integer")
-        if number is None:
-            return None, declined + [(at, refusal)], unbuilt + [at]
-        return number, declined, unbuilt
+        return built[:high] if len(built) > high else built
+    if kind in ("string", "integer", "number"):
+        value, refusal = (a_string(parts) if kind == "string"
+                          else a_number(parts, kind == "integer"))
+        if value is None:
+            probe.declined.append((at, f"{refusal} could not be built, so the value was left out "
+                                       f"of the decision"))
+            probe.unbuilt.append(at)
+        return value
     if kind == "boolean":
-        return True, declined, unbuilt
+        return True
     if kind == "null":
-        return None, declined, unbuilt + [at]        # `null` is a value; pruning it keeps it out
-    return None, declined + [(at, f"a value of type '{kind}'")], unbuilt + [at]
+        probe.unbuilt.append(at)                  # `null` is a value; pruning it keeps it out
+        return None
+    probe.declined.append((at, f"a value of type '{kind}' could not be built, so it was left out "
+                               f"of the decision"))
+    probe.unbuilt.append(at)
+    return None
 
 
 def prune(instance, locations):
@@ -984,18 +1195,44 @@ def prune(instance, locations):
     return out
 
 
-def caused_by_pruning(path, missing) -> bool:
-    """Whether one validation error is this check's own doing rather than the schema's.
-
-    An error at or under something that could not be built, or on the object a removed property
-    was required by. Anything else is the schema refusing a decision built to satisfy it.
-    """
-    for location in missing:
+def pruned_away(path, unbuilt) -> bool:
+    """Whether an instance path is at or under a value that could not be built, or is the object
+    a removed property was required by."""
+    for location in unbuilt:
         if tuple(path[:len(location)]) == location:
             return True
         if location[:len(path)] == tuple(path) and len(location) == len(path) + 1:
             return True
     return False
+
+
+def keywords_on(path):
+    """The keywords along a schema path, without the names and indices between them.
+
+    `dependentSchemas/agent/required` is two keywords and a property; `properties/anyOf/pattern`
+    is a property that happens to be called `anyOf`. `$ref` never appears: the validator splices
+    the target's path in where the reference stood.
+    """
+    out, name_next = [], False
+    for step in path:
+        if name_next:
+            name_next = False
+            continue
+        if isinstance(step, int):
+            continue
+        out.append(step)
+        name_next = step in NAMED_BY_KEY
+    return out
+
+
+def artefact(error, errors) -> bool:
+    """Whether an `unevaluated*` error is the annotation artefact `BUNDLE.md` tells readers to
+    skip: a subschema below it failed, contributed no annotations, and it reported everything."""
+    if error.validator not in ("unevaluatedProperties", "unevaluatedItems"):
+        return False
+    path = tuple(error.absolute_path)
+    return any(other is not error and tuple(other.absolute_path)[:len(path)] == path
+               for other in errors)
 
 
 def probe_validator(schema, schema_path: str):
@@ -1040,19 +1277,55 @@ def object_locations(instance, path=()):
             yield from object_locations(value, path + (index,))
 
 
-def carrying(instance, location, name: str):
-    """The instance with one foreign property added at one location."""
+def carrying(instance, location, name: str, value="probe"):
+    """The instance with one foreign property, carrying one value, added at one location."""
     out = copy.deepcopy(instance)
     node = out
     for step in location:
         node = node[step]
-    node[name] = "probe"
+    node[name] = copy.deepcopy(value)
     return out
 
 
-def branches_of(parts, roots):
+def fair_names(validator, rules):
+    """`(names, closed by enumeration)` — the probe names no name rule at one object refuses for
+    their shape.
+
+    A `patternProperties` entry or a `propertyNames` pattern refuses a name for how it looks, and a
+    probe refused that way says nothing about whether the object is closed: `^exeris` refused and
+    `zz9probe` walking in is an open object. So the candidates are filtered through every name
+    rule that applies, and a name built from a `propertyNames` pattern joins them. A `propertyNames`
+    that enumerates its names is the one rule that IS a closer, when every name it allows is one
+    the base declares — and when it allows one the base does not, that name is the probe.
+    """
+    if not rules:
+        return list(PROBE_PROPERTIES), False
+    patterns, naming, declared = rules
+    candidates, finite = list(PROBE_PROPERTIES), False
+    for node, _, _ in naming:
+        if not isinstance(node, dict):
+            continue
+        if isinstance(node.get("pattern"), str):
+            built = from_pattern(node["pattern"])
+            if built:
+                candidates.append(built)
+        listed = (node["enum"] if isinstance(node.get("enum"), list)
+                  else [node["const"]] if "const" in node else None)
+        if listed is not None:
+            finite = True
+            candidates += [v for v in listed if isinstance(v, str)]
+    fair = []
+    for name in dict.fromkeys(candidates):
+        if name in declared or any(re.search(p, name) for p in patterns):
+            continue
+        if all(validator.evolve(schema=node).is_valid(name) for node, _, _ in naming):
+            fair.append(name)
+    return fair, finite and not fair
+
+
+def branches_of(parts):
     """Each `oneOf` / `anyOf` branch that applies to a value, as a part of its own."""
-    applied, _ = applying(parts, roots)
+    applied, _ = applying(parts)
     for node, document, base_dir in applied:
         for keyword in ("oneOf", "anyOf"):
             for branch in node.get(keyword) or []:
@@ -1071,112 +1344,108 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
 
     Three steps, and the first is the one that matters. A decision is generated to satisfy this
     schema; it is validated against this schema; and only then is a property added at each object
-    it carries, one boolean per object. Nothing reads an error message, counts a keyword or looks
-    at a path. A schema that rejects the decision built for it is not measured at all — it is
-    reported, with the rejection, because that is what a closer parked where it sees only its own
-    branch does to every conforming decision, and what an instance this generator cannot build
-    looks like from the outside.
+    it carries — under several names and with several values, one boolean per object: closed
+    when every witness is refused. Nothing reads an error message, counts a keyword or looks at a
+    path to reach a verdict.
+
+    Only what is measured is an error: an object that took a property the base does not name,
+    on a decision the schema accepted. A schema that refuses the decision built for it is
+    reported as not measured, at warning level, whatever keyword the refusal came through — the
+    refusal is a conclusion drawn from this generator's output, and telling the schema's fault
+    from this check's own by the shape of the refusal's path was a guess that turned conforming
+    repositories red. The keyword, and the one shape that is always a schema's own doing (a
+    closer parked inside an `allOf` branch), are named for the reader.
     """
     if not isinstance(schema, dict):
         return
     here = os.path.dirname(schema_path)
-    if not any(ref_target(node.get("$ref"), here, roots)
-               for node in subschemas(schema) if isinstance(node, dict)):
-        # Or through a file of the repository's own that composes the base. The generator declines
-        # a reference it cannot resolve, so following one here would produce a decision built from
-        # nothing and a rejection that says the wrong thing. What can be said is that it was not
-        # measured.
-        for node in subschemas(schema):
-            ref = node.get("$ref") if isinstance(node, dict) else None
-            if not isinstance(ref, str) or ref.startswith("#") or "://" in ref:
-                continue
-            through = os.path.normpath(os.path.join(here, ref.partition("#")[0]))
-            document = load_schema(through)
-            if isinstance(document, dict) and any(
-                    ref_target(n.get("$ref"), os.path.dirname(through), roots)
-                    for n in subschemas(document) if isinstance(n, dict)):
-                rep.warning(rel, f"composes a bundle base through {os.path.relpath(through)}, a "
-                                 f"file this check does not follow, so nothing about what it "
-                                 f"refuses was measured. Compose the base in this schema, or check "
-                                 f"that one where it is composed", rule="schema")
-                return
+    if not reaches_bundle(schema, here, roots):
         return
-
     parts = [(schema, schema, here)]
     try:
-        # Inside the guard: a base carrying `{"type": "string", "minLength": "3"}` — a string where
-        # an int belongs, which nothing validates because a vendored base never goes through
-        # `check_schema` — raised out of the generator before `rep.emit()`, and every finding in
-        # the repository went with it.
+        # Inside the guard, every step: a base carrying `{"type": "string", "minLength": "3"}` —
+        # a string where an int belongs, which nothing validates because a vendored base never
+        # goes through `check_schema` — raised out of the generator; a `$ref` reached only by the
+        # probe, under a `patternProperties` entry no built property matched, raised out of the
+        # probe. Either took every finding in the repository with it before `rep.emit()`.
         validator = probe_validator(schema, schema_path)
-        instance, declined, missing = build(parts, roots)
-        candidate = prune(instance, missing)
+        probe = Probe()
+        candidate = prune(build(parts, probe), probe.unbuilt)
         errors = list(validator.iter_errors(candidate))
         if errors:
             # A `oneOf` or `anyOf` at the root is a real composition — per-scope rules are written
             # that way — and generating past it produces a decision no branch accepts. One branch
             # at a time, keeping the first that validates.
-            for branch in branches_of(parts, roots):
-                alternative, alternative_declined, alternative_missing = build(
-                    parts + [branch], roots)
-                pruned = prune(alternative, alternative_missing)
+            for branch in branches_of(parts):
+                attempt = Probe()
+                pruned = prune(build(parts + [branch], attempt), attempt.unbuilt)
                 if validator.is_valid(pruned):
-                    instance, declined, missing = alternative, alternative_declined, \
-                        alternative_missing
-                    candidate, errors = pruned, []
+                    probe, candidate, errors = attempt, pruned, []
                     break
-    except Exception as exc:
-        rep.error(rel, f"composes over a bundle base and could not be measured at all "
-                       f"({type(exc).__name__}: {exc})", rule="schema")
-        return
 
-    # Reported after the retry, and from the instance that was actually probed: a decline from an
-    # attempt that was abandoned describes nothing the reader can act on.
-    for location, what in dict.fromkeys(declined):
-        rep.warning(rel, f"not measured at {where(location)}: {what}. The value was left out of "
-                         f"the decision this check probes, so whether this schema refuses a "
-                         f"property the base does not name is unknown there", rule="schema")
+        # Reported after the retry, and from the instance that was actually probed: a decline from
+        # an attempt that was abandoned describes nothing the reader can act on.
+        for location, what in dict.fromkeys(probe.declined):
+            rep.warning(rel, f"not measured at {where(location)}: {what}", rule="schema")
 
-    if errors:
-        ours = [e for e in errors if caused_by_pruning(tuple(e.absolute_path), missing)]
-        if len(ours) == len(errors):
-            # Everything that failed is downstream of a value this check could not build, and the
-            # root is one of them: nothing can be measured here, and saying the schema rejects a
-            # conforming decision would be blaming it for this check's limits.
-            first = errors[0]
-            rep.warning(rel, f"no decision could be built that this schema accepts — refused at "
-                             f"{where(tuple(first.absolute_path))}: {first.message}. With a value "
-                             f"this check could not construct, that is its own limit as much as "
-                             f"the schema's, so nothing here was measured", rule="schema")
+        if errors:
+            # A refusal of the decision this check built is a conclusion drawn from the
+            # generator's output, not a measurement: the refusal is as likely to be a value this
+            # could not construct, or a keyword it does not walk, as the schema refusing what its
+            # base declares — and telling the two apart by the shape of the refusal's path is a
+            # guess, which is how a conforming repository was turned red. What can be said is that
+            # nothing here was measured; the keyword the refusal came through, and the one shape
+            # that is always the schema's own doing, are named for the reader to judge.
+            quoted = [e for e in errors if not artefact(e, errors)] or errors
+            through = [k for k in keywords_on(quoted[0].absolute_schema_path)
+                       if k in DECLINED_KEYWORDS or k in DECLINED_ASSERTIONS]
+            parked = any(e.validator in ("unevaluatedProperties", "additionalProperties")
+                         and "allOf" in keywords_on(e.absolute_schema_path) for e in quoted)
+            rep.warning(rel, "no decision could be built that this schema accepts — refused "
+                             + "; ".join(f"at {where(tuple(e.absolute_path))}: {e.message}"
+                                         for e in quoted[:2])
+                             + (f" — through `{through[0]}`" if through else "")
+                             + ". A probe is only evidence when the instance conforms, so nothing "
+                               "about what this schema refuses was measured. Either a value this "
+                               "check could not construct, or the schema refusing what its base "
+                               "declares"
+                             + (" — a closer inside an `allOf` branch does this: it sees only the "
+                                "properties named beside it" if parked else "")
+                             + ". Not measured", rule="schema")
             return
-        # The root `unevaluatedProperties` line is an artefact of a failing `$ref` branch — the one
-        # `BUNDLE.md` tells readers to skip — so quoting `errors[0]` after sorting by depth quoted
-        # exactly the line that says nothing. The real ones come first, and more than one is shown.
-        real = [e for e in errors
-                if not (e.validator == "unevaluatedProperties" and not list(e.absolute_path))]
-        shown = (real or errors)[:2]
-        rep.error(rel, "rejects a decision built to satisfy it: "
-                       + "; ".join(f"at {where(tuple(e.absolute_path))}: {e.message}"
-                                   for e in shown)
-                       + ". Nothing about what this schema refuses was measured, because a probe "
-                         "is only evidence when the instance conforms. A closer inside an `allOf` "
-                         "branch does this — it sees only the properties named beside it — and so "
-                         "does a narrowing this check could not satisfy", rule="schema")
-        return
 
-    for location in object_locations(candidate):
-        if caused_by_pruning(location, missing):
-            continue
-        accepted = [name for name in PROBE_PROPERTIES
-                    if validator.is_valid(carrying(candidate, location, name))]
-        if not accepted:
-            continue
-        rep.error(rel, f"an instance may carry any property at {where(location)} — a decision this "
-                       f"schema accepts still validates with '{accepted[0]}' added there, so the "
-                       f"object takes whatever the base does not name. Close it: the base closes "
-                       f"nothing, and a closer at the root does not reach into an array's items. "
-                       f"Rule 13 makes this file what a decision conforms to; that the closers are "
-                       f"yours is this bundle's contract, in `BUNDLE.md`", rule="schema")
+        for location in object_locations(candidate):
+            if pruned_away(location, probe.unbuilt):
+                continue
+            names, enumerated = fair_names(validator, probe.names.get(location))
+            if not names:
+                if not enumerated:
+                    rep.warning(rel, f"not measured at {where(location)}: no property name this "
+                                     f"check can construct passes the name rules there "
+                                     f"(`propertyNames`, `patternProperties`), so whether the "
+                                     f"object takes a name the base does not declare is unknown",
+                                rule="schema")
+                continue
+            # One boolean per object, from several witnesses: a name is refused for being
+            # undeclared only when every value under it is refused too.
+            accepted = next(((name, value) for name in names for value in PROBE_VALUES
+                             if validator.is_valid(carrying(candidate, location, name, value))),
+                            None)
+            if accepted is None:
+                continue
+            rep.error(rel, f"an instance may carry any property at {where(location)} — a decision "
+                           f"this schema accepts still validates with '{accepted[0]}': "
+                           f"{json.dumps(accepted[1])} added there, "
+                           f"so the object takes whatever the base does not name. Close it: the "
+                           f"base closes nothing, and a closer at the root does not reach into an "
+                           f"array's items. Rule 13 makes this file what a decision conforms to; "
+                           f"that the closers are yours is this bundle's contract, in `BUNDLE.md`",
+                      rule="schema")
+    except Exception as exc:
+        # This check's own failure on one schema: unmeasured, not a verdict on the schema.
+        rep.warning(rel, f"not measured: composes over a bundle base and this check failed on it "
+                         f"({type(exc).__name__}: {exc}), so whether it closes what the base "
+                         f"leaves open is unknown", rule="schema")
 
 
 def check_schemas(rep: Report, roots=None):
@@ -1222,48 +1491,51 @@ def check_schemas(rep: Report, roots=None):
         # off-pin tree is reported once however many references reach it — it is one fact with one
         # fix, retargeting this schema, and a composition closing four objects against a stale tree
         # would otherwise answer for it four times.
-        off_pin = []
+        off_pin, unresolved = [], 0
         for node in subschemas(schema):
-            ref = node.get("$ref") if isinstance(node, dict) else None
-            if not isinstance(ref, str):
-                continue
-            # A URL is the one that has to be refused: resolving one needs a fetch, and rule 8
-            # forbids fetching. A fragment-only ref points inside this same document.
-            if ref.startswith(("http://", "https://")):
-                rep.error(rel, f"$ref '{ref}' is a URL — a vendored bundle resolves from the "
-                               f"filesystem, and fetching one at validation time is what rule 8 "
-                               f"forbids. Use a relative path into .agents/vendor/.", rule="schema")
-                continue
-            file_part, _, fragment = ref.partition("#")
-            if file_part:
-                target = os.path.normpath(os.path.join(d, file_part))
-                if _compose.contained(os.getcwd(), target) is None:
-                    rep.error(rel, f"$ref '{ref}' resolves outside the repository — a reference "
-                                   f"resolves from the filesystem, inside the checkout, and one "
-                                   f"that leaves it names a file this repository cannot vouch for "
-                                   f"and a reader cannot see (rule 8)", rule="schema")
+            for keyword, ref in references_of(node):
+                # A URL is the one that has to be refused: resolving one needs a fetch, and rule 8
+                # forbids fetching. A fragment-only ref points inside this same document.
+                if ref.startswith(("http://", "https://")):
+                    rep.error(rel, f"{keyword} '{ref}' is a URL — a vendored bundle resolves from the "
+                                   f"filesystem, and fetching one at validation time is what rule 8 "
+                                   f"forbids. Use a relative path into .agents/vendor/.", rule="schema")
+                    unresolved += 1
                     continue
-                if not os.path.exists(target):
-                    rep.error(rel, f"$ref target does not exist: {ref}", rule="schema")
-                    continue
-                document = load_schema(target)
-                if document is None:
-                    rep.error(rel, f"$ref target is not readable JSON: {ref} — the file is there, "
-                                   f"so this is the file to look at, not the pointer",
-                              rule="schema")
-                    continue
-            else:
-                document = schema
-            # And the pointer, which nothing checked. The file existing was taken for the whole
-            # answer, while this release makes `<file>#/properties/<name>/items` the documented way
-            # to close a nested object — a typo there is a closer over nothing, on a `$ref` whose
-            # file is right there.
-            if fragment.startswith("/") and node_at(document, fragment) is None:
-                rep.error(rel, f"$ref '{ref}' names a pointer that does not resolve in "
-                               f"{file_part or 'this document'}", rule="schema")
-            landed = ref_target(ref, d, roots)
-            if landed and not landed[2]:
-                off_pin.append(vendored_tree(landed[0]))
+                file_part, _, fragment = ref.partition("#")
+                if file_part:
+                    target = os.path.normpath(os.path.join(d, file_part))
+                    if _compose.contained(os.getcwd(), target) is None:
+                        rep.error(rel, f"{keyword} '{ref}' resolves outside the repository — a "
+                                       f"reference resolves from the filesystem, inside the checkout, "
+                                       f"and one that leaves it names a file this repository cannot "
+                                       f"vouch for and a reader cannot see (rule 8)", rule="schema")
+                        unresolved += 1
+                        continue
+                    if not os.path.exists(target):
+                        rep.error(rel, f"{keyword} target does not exist: {ref}", rule="schema")
+                        unresolved += 1
+                        continue
+                    document = load_schema(target)
+                    if document is None:
+                        rep.error(rel, f"{keyword} target is not readable JSON: {ref} — the file is "
+                                       f"there, so this is the file to look at, not the pointer",
+                                  rule="schema")
+                        unresolved += 1
+                        continue
+                else:
+                    document = schema
+                # And the pointer, which nothing checked. The file existing was taken for the whole
+                # answer, while this release makes `<file>#/properties/<name>/items` the documented way
+                # to close a nested object — a typo there is a closer over nothing, on a `$ref` whose
+                # file is right there.
+                if fragment.startswith("/") and node_at(document, fragment) is None:
+                    rep.error(rel, f"{keyword} '{ref}' names a pointer that does not resolve in "
+                                   f"{file_part or 'this document'}", rule="schema")
+                    unresolved += 1
+                landed = ref_target(ref, d, roots)
+                if landed and not landed[2]:
+                    off_pin.append(vendored_tree(landed[0]))
         for tree in dict.fromkeys(off_pin):
             rep.error(rel, f"composes over {tree}, which no import in the manifest pins — a "
                            f"pin's digest vouches for the tree it names and for nothing else, and "
@@ -1280,6 +1552,15 @@ def check_schemas(rep: Report, roots=None):
             Validator.check_schema(schema)
         except Exception as e:
             rep.error(rel, f"not a valid JSON Schema: {e}", rule="schema")
+            continue
+        if unresolved:
+            # A reference the validator cannot resolve raises the moment an instance reaches it —
+            # which, for one under a `patternProperties` entry, is the moment the probe adds a
+            # name. The reference is the finding, already reported; measuring past it is not.
+            rep.warning(rel, f"closers not measured: {unresolved} reference(s) in this file do "
+                             f"not resolve, and a decision cannot be validated through a "
+                             f"reference the validator cannot follow. Fix those first",
+                        rule="schema")
             continue
         check_closers(rep, rel, schema, os.path.join(d, f), roots)
 
@@ -1579,6 +1860,27 @@ def main():
     prefix = os.path.relpath(os.path.abspath(a.root), os.getcwd())
     os.chdir(a.root)
     rep = Report("agents_file_check", path_prefix="" if prefix == "." else prefix)
+    try:
+        run_checks(a, rep)
+    except Exception as exc:
+        # The report is the contract. Every check here reads an input somebody else wrote, and
+        # a run that raised out of one wrote no report at all — so a consumer saw a traceback
+        # where the findings should have been, and a CI step that was red for a reason nobody
+        # could annotate. The failure is a finding, named to the frame, and everything reported
+        # before it still reaches the reader; what the failing check would have reported past
+        # that point is missing, and the finding says so.
+        import traceback
+        frame = traceback.extract_tb(exc.__traceback__)[-1]
+        rep.error("agents_file_check", f"the checker itself failed in {frame.name}() at "
+                                       f"{os.path.basename(frame.filename)}:{frame.lineno} — "
+                                       f"{type(exc).__name__}: {exc}. Every finding beside this "
+                                       f"one is real; whatever that check would have reported "
+                                       f"after this point is missing", rule="checker")
+    sys.exit(rep.emit())
+
+
+def run_checks(a, rep: Report) -> None:
+    """Every check, in order, against the tree `main()` moved into."""
     manifest: dict = {}   # a repository with no .agents/ still runs every other check
 
     if not os.path.exists("AGENTS.md"):
@@ -1702,7 +2004,6 @@ def main():
 
     provider_owned = provider_owned_paths(manifest, rep)
     check_adapters(rep, a.strict_adapters, provider_owned)
-    sys.exit(rep.emit())
 
 
 if __name__ == "__main__":

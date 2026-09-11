@@ -582,10 +582,12 @@ def test_two_bases_disagreeing_about_a_property_do_not_kill_the_run():
                 "unevaluatedProperties": False},
                vendored={f"{VENDORED}/schemas/other.base.schema.json": other})
     try:
-        out = errors(d)          # raises AssertionError of its own if the checker crashed
-        check("the run survives, and the schema is reported as rejecting what was built for it — "
-              "no instance can satisfy two bases that disagree about one property",
-              any("rejects a decision built to satisfy it" in l for l in out), True)
+        errors(d)                # raises AssertionError of its own if the checker crashed
+        check("the run survives, and the schema is declined as accepting no decision this check "
+              "built — no instance can satisfy two bases that disagree about one property — at "
+              "warning level, because a refusal is not a measurement",
+              (any("no decision could be built" in w for w in warnings(d)),
+               [e for e in errors(d) if "schema::" in e]), (True, []))
     finally:
         shutil.rmtree(d)
 
@@ -600,16 +602,22 @@ def test_a_closer_that_refuses_the_base_itself_is_reported():
                           {"properties": {"agent": {"enum": ["r"]}},
                            "additionalProperties": False}]})
     try:
-        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
-        check("a schema that rejects the base's own properties is reported",
-              any("rejects a decision built to satisfy it" in f for f in out), True)
+        errs, warns = schema_findings(d)
+        check("a schema that rejects the base's own properties is reported, and named as the "
+              "parked closer it is",
+              any("no decision could be built" in w and "allOf" in w for w in warns), True)
+        check("at warning level: the refusal is drawn from what this check built, not measured",
+              errs, [])
     finally:
         shutil.rmtree(d)
 
 
-def test_a_root_that_composes_through_another_file_is_reported():
-    """`{"$ref": "inner.json"}` at the root, with the base composed one file over: `applies_at_the
-    _root` stops at a file boundary, so the schema was neither probed nor reported."""
+def test_a_root_that_composes_through_another_file_is_measured():
+    """`{"$ref": "inner.json"}` at the root, with the base composed one file over. Two rounds ago
+    the walker stopped at a file boundary and the schema was neither probed nor reported; one
+    round ago it was reported as a file the check does not follow. The generator follows every
+    reference inside the checkout now, as the validator does, so the composition is measured
+    where it is."""
     d = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
                 "$ref": "../core/inner.json"})
     try:
@@ -619,10 +627,12 @@ def test_a_root_that_composes_through_another_file_is_reported():
             json.dump({"$schema": "https://json-schema.org/draft/2020-12/schema",
                        "allOf": [{"$ref": f"../vendor/{VENDORED}/schemas/verdict.base.schema.json"}]},
                       fh)
-        check("a base composed through a file this check does not follow is reported",
-              any("through" in w and "does not follow" in w for w in warnings(d)), True)
+        check("a base composed through a file of the repository's own is measured through it",
+              open_locations(d), ["<root>", "checks_run/0", "findings/0", "handoffs/0"])
+        check("and nothing is said about a file not followed",
+              [w for w in warnings(d) if "does not follow" in w or "not measured" in w], [])
     finally:
-        shutil.rmtree(d)
+        _RUNS.pop(d, None); shutil.rmtree(d)
 
 
 def test_an_object_two_levels_down_is_probed():
@@ -711,10 +721,12 @@ def test_a_closer_parked_in_a_sibling_branch_is_reported():
                           {"properties": {"agent": {"enum": ["r"]}},
                            "unevaluatedProperties": False}]})
     try:
-        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
-        check("the misplaced closer is reported, as the rejection it causes",
-              any(f.startswith("rejects a decision built to satisfy it") and "at <root>" in f
-                  for f in out), True)
+        errs, warns = schema_findings(d)
+        check("the misplaced closer is reported, as the rejection it causes, where it happens",
+              any(w.startswith("no decision could be built") and "at <root>" in w
+                  and "allOf" in w for w in warns), True)
+        check("and not as an error, which a conforming repository could not be cleared of",
+              errs, [])
     finally:
         shutil.rmtree(d)
     clean = custom({"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -722,7 +734,7 @@ def test_a_closer_parked_in_a_sibling_branch_is_reported():
     try:
         check("and the same keyword on the branch that carries the base is left alone — measured, "
               "a conforming decision passes it",
-              any("rejects a decision" in e for e in errors(clean)), False)
+              any("no decision could be built" in w for w in warnings(clean)), False)
     finally:
         shutil.rmtree(clean)
 
@@ -934,10 +946,11 @@ def test_a_closer_parked_in_a_branch_one_level_down_is_reported():
                     {"properties": {"tag": {"type": "string"}},
                      "unevaluatedProperties": False}]}}}})
     try:
-        out = [l.split("schema::", 1)[-1] for l in errors(d) if "schema::" in l]
-        check("caught by measurement, at the level it happens",
-              any(f.startswith("rejects a decision built to satisfy it") and "at findings/0" in f
-                  for f in out), True)
+        errs, warns = schema_findings(d)
+        check("caught, at the level it happens",
+              any(w.startswith("no decision could be built") and "at findings/0" in w
+                  for w in warns), True)
+        check("as a warning, since what was refused is what this check built", errs, [])
     finally:
         shutil.rmtree(d)
 
@@ -960,8 +973,8 @@ def test_a_refusal_of_one_name_shape_is_not_a_closed_object():
 SUBSCHEMA_KEYWORDS = {
     "properties", "patternProperties", "additionalProperties", "propertyNames", "items",
     "prefixItems", "additionalItems", "contains", "unevaluatedItems", "unevaluatedProperties",
-    "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "dependentSchemas", "$ref", "$defs",
-    "definitions",
+    "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "dependentSchemas", "$ref",
+    "$dynamicRef", "$defs", "definitions",
 }
 
 
@@ -1057,8 +1070,8 @@ def test_a_value_the_generator_cannot_build_is_a_warning_not_a_verdict():
     try:
         errs = [e.split("schema::", 1)[-1] for e in errors(d) if "schema::" in e]
         warns = [w.split("schema::", 1)[-1] for w in warnings(d) if "schema::" in w]
-        check("it is not called a schema that rejects a conforming decision",
-              any("rejects a decision built to satisfy it" in e for e in errs), False)
+        check("it is not called a schema that rejects a conforming decision — no error at all",
+              errs, [])
         check("and the reader is told nothing was measured, and why",
               any("no decision could be built" in w or "not measured" in w for w in warns), True)
     finally:
@@ -1091,8 +1104,8 @@ def test_an_unbuildable_value_costs_its_own_location_and_nothing_else():
               any("not measured at note" in w for w in warnings(d)), True)
         check("and the object left open elsewhere is still reported",
               open_locations(d), ["handoffs/0"])
-        check("with no verdict about the schema itself",
-              any("rejects a decision" in e for e in errors(d)), False)
+        check("with no verdict about the schema itself — the open object is the only error",
+              [e for e in errors(d) if "schema::" in e and OPEN_AT not in e], [])
     finally:
         _RUNS.pop(d, None); shutil.rmtree(d)
 
@@ -1107,8 +1120,8 @@ def test_a_schema_wide_decline_is_only_for_a_root_that_cannot_be_built():
     try:
         check("the schema is declined whole",
               any("no decision could be built" in w for w in warnings(d)), True)
-        check("and it is not called a schema that rejects a conforming decision",
-              any("rejects a decision" in e for e in errors(d)), False)
+        check("and it is not called a schema that rejects a conforming decision — no error at all",
+              [e for e in errors(d) if "schema::" in e], [])
     finally:
         _RUNS.pop(d, None); shutil.rmtree(d)
 
@@ -1168,10 +1181,10 @@ def test_a_base_that_is_not_valid_json_schema_does_not_end_the_run():
                 "unevaluatedProperties": False},
                vendored={f"{VENDORED}/schemas/broken.base.schema.json": broken})
     try:
-        out = errors(d)                     # raises of its own if the checker crashed
-        check("the run survives and says what happened",
-              any("could not be measured at all" in e or "no decision could be built" in e
-                  for e in out + warnings(d)), True)
+        errors(d)                           # raises of its own if the checker crashed
+        check("the run survives and says what happened, as not measured",
+              any("this check failed on it" in w or "no decision could be built" in w
+                  for w in warnings(d)), True)
     finally:
         _RUNS.pop(d, None); shutil.rmtree(d)
 
@@ -1188,11 +1201,11 @@ def test_the_error_quoted_is_not_the_annotation_artefact():
                     {"properties": {"tag": {"type": "string"}},
                      "unevaluatedProperties": False}]}}}})
     try:
-        quoted = [e.split("schema::", 1)[-1] for e in errors(d) if "rejects a decision" in e]
+        quoted = [w for w in schema_findings(d)[1] if "no decision could be built" in w]
         check("the rejection is reported", len(quoted), 1)
         check("and it leads with the failure, not with the root's unevaluated line",
-              quoted[0].split("; ")[0].startswith("rejects a decision built to satisfy it: at "
-                                                  "findings/0"), True)
+              quoted[0].split("; ")[0].startswith("no decision could be built that this schema "
+                                                  "accepts — refused at findings/0"), True)
     finally:
         _RUNS.pop(d, None); shutil.rmtree(d)
 
@@ -1363,6 +1376,320 @@ def test_a_reference_into_a_tree_no_import_pins():
         check("a second pinned bundle is pinned", off_pin(out), [])
     finally:
         shutil.rmtree(d)
+
+
+# ── what the red team broke: eight classes, one case each ─────────────────────────────────────
+#
+# Ten attacks on the closer rule, eight of them landing, in three kinds: (a) silence where the
+# schema was open, (b) an error against a repository that conformed, (c) a run that ended without
+# a report. Each case here is the attack, reduced, and the answer that closed it — reproduced
+# against the checker before the change, so the assertion measures the fix and not the wish.
+
+DRAFT = "https://json-schema.org/draft/2020-12/schema"
+BASE_NAMES = ["agent", "decision", "decision_label", "scope_class", "findings", "suggestions",
+              "checks_run", "required_validation", "handoffs"]
+
+
+def composing(keyword: str, **over) -> dict:
+    """The README shape with every object closed, composed through `keyword` — `$ref` or
+    `$dynamicRef` — and `over` merged into the narrowing branch's properties."""
+    properties = {
+        "findings": {"items": closed({"allOf": [{keyword: BASE + "#/properties/findings/items"}]},
+                                     True)},
+        "checks_run": {"items": closed({keyword: BASE + "#/properties/checks_run/items"}, True)},
+        "handoffs": {"items": closed({keyword: BASE + "#/properties/handoffs/items"}, True)},
+    }
+    properties.update(over)
+    return closed({"$schema": DRAFT, "allOf": [{keyword: BASE}, {"properties": properties}]}, True)
+
+
+def schema_findings(repo: str) -> tuple[list[str], list[str]]:
+    """`(errors, warnings)` under the schema rule, text only."""
+    return ([e.split("schema::", 1)[-1] for e in errors(repo) if "schema::" in e],
+            [w.split("schema::", 1)[-1] for w in warnings(repo) if "schema::" in w])
+
+
+def test_a_dynamic_reference_composes_like_a_static_one():
+    """(a) `$dynamicRef` resolves exactly as `$ref` does until its fragment names a dynamic anchor,
+    so a composition written with it validated every decision through the base — and the check,
+    looking for `$ref` alone, saw no composition: zero errors, zero warnings, nothing closed
+    anywhere. Both reference keywords are one thing to the check now."""
+    for shape in ({"$schema": DRAFT, "$dynamicRef": BASE},
+                  {"$schema": DRAFT, "allOf": [{"$dynamicRef": BASE}]}):
+        check("a composition through `$dynamicRef` is measured, and every object named",
+              open_locations_for(shape), ["<root>", "checks_run/0", "findings/0", "handoffs/0"])
+    check("and one that closes every object through it is clean",
+          open_locations_for(composing("$dynamicRef")), [])
+
+
+def test_a_branch_that_introduces_an_object_is_named_whatever_names_it():
+    """(a) `dependentSchemas` putting an object under `extra` through a `$dynamicRef`: not walked,
+    not built, not probed — and not declared, because whether a branch "introduces a shape" was
+    read off the value's keywords, and `$dynamicRef` was not one of them. The comparison is
+    structural now: a branch introduces whatever the parts applying at that level do not declare,
+    named by property, level by level."""
+    thing = {"$defs": {"thing": OPEN_OBJECT}}
+    for keyword, branch in (
+            ("dependentSchemas", {"dependentSchemas": {"agent": {"properties": {
+                "extra": {"$dynamicRef": "#/$defs/thing"}}}}}),
+            ("then", {"if": {"required": ["agent"]}, "then": {"properties": {
+                "extra": {"allOf": [{"$ref": "#/$defs/thing"}]}}}}),
+            ("oneOf", {"oneOf": [{"required": ["agent"]}, {"properties": {
+                "extra": {"$dynamicRef": "#/$defs/thing"}}}]})):
+        d = custom({**composing("$ref"), **branch, **thing})
+        try:
+            check(f"`{keyword}` introducing an object is reported, naming the property",
+                  any("not measured at <root>" in w and f"`{keyword}`" in w and "'extra'" in w
+                      for w in warnings(d)), True)
+        finally:
+            _RUNS.pop(d, None); shutil.rmtree(d)
+    d = consumer()
+    try:
+        check("while the bases' own branches, which only constrain what is built, say nothing",
+              [w for w in warnings(d) if "not measured" in w], [])
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_name_refused_for_its_shape_does_not_close_an_object():
+    """(a) The boolean oracle. Every probe name began with `exeris`, so `patternProperties:
+    {"^exeris": false}` refused all three and the root was reported closed while `zz9probe` walked
+    in. The probe now uses only names no name rule at that object refuses for their shape, and
+    the one name rule that IS a closer — a `propertyNames` enumerating the base's names — is
+    read as one, without a warning about a rule it could not get past."""
+    for rule in ({"patternProperties": {"^exeris": False}},
+                 {"propertyNames": {"not": {"pattern": "^exeris"}}}):
+        check(f"the root is open under {next(iter(rule))}, because a differently shaped name gets in",
+              "<root>" in open_locations_for({"$schema": DRAFT, "allOf": [{"$ref": BASE}], **rule}),
+              True)
+    d = custom({"$schema": DRAFT, "allOf": [{"$ref": BASE}],
+                "propertyNames": {"enum": BASE_NAMES}})
+    try:
+        check("an enumeration of the base's names closes the root",
+              "<root>" in open_locations(d), False)
+        check("and nothing is said about a name rule, because it was read as the closer it is",
+              [w for w in warnings(d) if "name rule" in w], [])
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+    d = custom({"$schema": DRAFT, "allOf": [{"$ref": BASE}],
+                "propertyNames": {"enum": BASE_NAMES + ["x-note"]}})
+    try:
+        check("an enumeration allowing one name the base does not declare is open by that name",
+              any("at <root>" in e and "'x-note'" in e for e in errors(d)), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_closer_that_admits_one_type_is_an_open_object():
+    """(a) The boolean oracle, second half. The probe carried one value, a string, so
+    `unevaluatedProperties: {"type": "integer"}` refused it for its type and the root was read as
+    closed while every number walked in under any name. A closer refuses a NAME whatever stands
+    under it; the probe now carries several values, and an object is closed only when every one
+    of them is refused."""
+    for typed in ("integer", "boolean", "null", "object", "array"):
+        d = custom({"$schema": DRAFT, "allOf": [{"$ref": BASE}],
+                    "unevaluatedProperties": {"type": typed}})
+        try:
+            check(f"a root admitting any `{typed}` under an undeclared name is open",
+                  "<root>" in open_locations(d), True)
+            check("and the value that walked in is quoted, so the reader sees what got through",
+                  any("at <root>" in e and "'exeris-closer-probe-property': " in e
+                      for e in schema_findings(d)[0]), True)
+        finally:
+            _RUNS.pop(d, None); shutil.rmtree(d)
+    d = custom({"$schema": DRAFT, "allOf": [{"$ref": BASE}], "unevaluatedProperties": False})
+    try:
+        check("while `false` refuses every witness, and the root is closed",
+              "<root>" in open_locations(d), False)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_neighbouring_composition_is_followed():
+    """(a) Closing `handoffs` items by referencing the repository's own `handoff.schema.json` —
+    the sibling the standard names — reached the generator as "a reference outside the bundle":
+    declined, a warning that the location was not measured, and then measured anyway through the
+    validator. Everything inside the checkout is followed now, so what the neighbour declares is
+    built and probed and the warning is gone."""
+    for neighbour_closed, expected in ((True, []), (False, ["handoffs/0"])):
+        d = custom(composing("$ref", handoffs={"items": {"$ref": "handoff.schema.json"}}))
+        try:
+            neighbour = {"$schema": DRAFT, "allOf": [
+                {"$ref": f"../vendor/{VENDORED}/schemas/handoff.base.schema.json"}]}
+            with open(os.path.join(d, ".agents", "schemas", "handoff.schema.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(closed(neighbour, neighbour_closed), fh)
+            # The neighbour is a schema of its own and is checked as one, so its open root is
+            # reported against its own file; what this asks about is the verdict's locations.
+            check(f"a handoff closed in the neighbour ({neighbour_closed}) is measured through it",
+                  sorted(l.split(OPEN_AT, 1)[1].split(" ", 1)[0] for l in errors(d)
+                         if OPEN_AT in l and "verdict.schema.json" in l), expected)
+            check("with no warning about a reference not followed",
+                  [w for w in warnings(d) if "not measured" in w], [])
+        finally:
+            _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_refusal_is_blamed_on_the_keyword_it_came_through():
+    """(b) never-blame-conforming, and the misparked-closer verdict that did not track the schema.
+    A `then` requiring a property the generator never built, a `dependentSchemas` doing the same,
+    a `contains` it never aimed at, a `not`, a `maxProperties`: five conforming schemas, each told
+    it "rejects a decision built to satisfy it — a closer inside an `allOf` branch does this".
+    None had one. Every refusal of the decision this check built is its own limit as much as the
+    schema's — a conclusion drawn from the generator's output, not a measurement — so every one
+    is a warning naming the keyword it came through; the parked closer is named as the shape
+    that is always the schema's own doing, and still does not fail a build on a conclusion."""
+    conforming = (
+        ("then", {"if": {"required": ["agent"]},
+                  "then": {"properties": {"reviewer_notes": {"type": "string"}},
+                           "required": ["reviewer_notes"]}}),
+        ("dependentSchemas", {"dependentSchemas": {"agent": {"required": ["extra"]}}}),
+        ("not", {"not": {"required": ["suggestions"]}}),
+        ("maxProperties", {"maxProperties": 5}),
+    )
+    for keyword, extra in conforming:
+        d = custom({**composing("$ref"), **extra})
+        try:
+            errs, warns = schema_findings(d)
+            check(f"`{keyword}`: no error against a repository that conforms", errs, [])
+            check(f"`{keyword}`: the reader is told what was not measured, and through what",
+                  any("no decision could be built" in w and f"`{keyword}`" in w for w in warns),
+                  True)
+        finally:
+            _RUNS.pop(d, None); shutil.rmtree(d)
+    d = custom(composing("$ref", checks_run={
+        "items": closed({"$ref": BASE + "#/properties/checks_run/items"}, True),
+        "contains": {"properties": {"check": {"const": "vale"}}}}))
+    try:
+        errs, warns = schema_findings(d)
+        check("`contains`: no error against a repository that conforms", errs, [])
+        check("`contains`: named as the keyword the refusal came through",
+              any("through `contains`" in w for w in warns), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+    parked = custom({"$schema": DRAFT, "allOf": [{"$ref": BASE},
+                                                 {"properties": {"agent": {"enum": ["r"]}},
+                                                  "unevaluatedProperties": False}]})
+    try:
+        errs, warns = schema_findings(parked)
+        check("a closer parked beside the base is named as one, at the level of every other "
+              "refusal: the reader is told, and the build is not failed on a conclusion",
+              (any("no decision could be built" in w and "allOf" in w for w in warns), errs),
+              (True, []))
+    finally:
+        _RUNS.pop(parked, None); shutil.rmtree(parked)
+
+
+def test_an_array_shape_the_generator_does_not_aim_at_is_not_the_schemas_fault():
+    """(b) array-shapes. A finding written as a `oneOf` over its tags, a `contains` demanding one
+    check reported `not-run`, a tuple of checks closed with `items: false`: three compositions that
+    refuse a foreign property everywhere and accept a conforming decision, three errors. The first
+    two are refusals through keywords the generator does not walk, and say so; the third was the
+    generator building an element past a prefix that `items: false` had closed."""
+    item = BASE + "#/properties/findings/items"
+    per_tag = {"items": {"oneOf": [
+        closed({"allOf": [{"$ref": item}, {"properties": {"tag": {"const": tag}}}],
+                "required": ["tag"]}, True) for tag in ("style", "correctness")]}}
+    d = custom(composing("$ref", findings=per_tag))
+    try:
+        errs, warns = schema_findings(d)
+        check("a `oneOf` per tag is no error", errs, [])
+        check("and is named twice: as the branch introducing `tag`, and as the keyword the "
+              "refusal came through",
+              (any("`oneOf`" in w and "'tag'" in w for w in warns),
+               any("through `oneOf`" in w for w in warns)), (True, True))
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+    d = custom(composing("$ref", checks_run={
+        "items": closed({"$ref": BASE + "#/properties/checks_run/items"}, True),
+        "contains": {"properties": {"result": {"const": "not-run"}}}}))
+    try:
+        errs, warns = schema_findings(d)
+        check("a `contains` over an enum value is no error", errs, [])
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+    d = custom(composing("$ref", checks_run={
+        "prefixItems": [closed({"$ref": BASE + "#/properties/checks_run/items"}, True)],
+        "items": False}))
+    try:
+        errs, warns = schema_findings(d)
+        check("a tuple closed with `items: false` is measured, clean, and silent",
+              (errs, [w for w in warns if "not measured" in w]), ([], []))
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_the_run_survives_a_reference_only_the_probe_reaches():
+    """(c) run-survives, the class "fixed" four times. `patternProperties: {"^exeris": {"$ref":
+    "missing.json"}}`: no built property matched, so validating the decision never touched the
+    reference, and the probe — which adds exactly such a name — was the first to, outside the
+    guard. The reference is reported where references are judged, the closers are declared
+    unmeasured while it does not resolve, and the report is written."""
+    d = custom({**composing("$ref"),
+                "patternProperties": {"^exeris": {"$ref": "missing.json"}}})
+    try:
+        errs, warns = schema_findings(d)                  # raises of its own if the checker crashed
+        check("the reference is the finding", any("target does not exist" in e for e in errs), True)
+        check("and the closers are declared unmeasured rather than crashed through",
+              any(w.startswith("closers not measured") for w in warns), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_the_run_survives_a_schema_nested_past_the_recursion_limit():
+    """(c) The schema walker was recursive, and a schema is an input: one nested deeper than the
+    interpreter allows raised out of `check_schemas` and the run ended with no report."""
+    d = custom({"$schema": DRAFT, "allOf": [{"$ref": BASE}], "unevaluatedProperties": False})
+    try:
+        depth = 1500
+        text = ('{"$schema": "%s", "allOf": [{"$ref": "%s"}], "unevaluatedProperties": false, '
+                '"$defs": {"deep": %s%s}}' % (DRAFT, BASE,
+                                               '{"type": "object", "properties": {"d": ' * depth,
+                                               '{"type": "object"}' + "}}" * depth))
+        with open(os.path.join(d, ".agents", "schemas", "verdict.schema.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text)
+        errs, _ = schema_findings(d)                      # raises of its own if the checker crashed
+        check("the run survives and the file is the finding",
+              any("not a valid JSON Schema" in e for e in errs), True)
+    finally:
+        _RUNS.pop(d, None); shutil.rmtree(d)
+
+
+def test_a_check_that_raises_becomes_a_finding_and_the_report_is_still_written():
+    """(c) The guard above every check: the report is the contract, so a check that raises is a
+    finding naming the frame, and everything reported before it still reaches the reader. Driven
+    directly, with a check that raises, because the point is that no particular crash has to be
+    known in advance for the run to survive it."""
+    import contextlib
+    import io
+    mod = checker_module()
+
+    def failing(a, rep):
+        rep.warning("AGENTS.md", "reported before the failure", rule="before")
+        raise ValueError("a check did not expect this input")
+
+    mod.run_checks = failing
+    out, argv, here = io.StringIO(), sys.argv, os.getcwd()
+    sys.argv = [CHECKER, "--root", "."]
+    try:
+        with contextlib.redirect_stdout(out):
+            try:
+                mod.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+    finally:
+        sys.argv = argv
+        os.chdir(here)
+    lines = out.getvalue().splitlines()
+    check("the run fails", code, 1)
+    check("the failure is a finding, named to the frame and the exception",
+          any(l.startswith("::error") and "the checker itself failed in failing()" in l
+              and "ValueError" in l for l in lines), True)
+    check("what was reported before it is still reported",
+          any("reported before the failure" in l for l in lines), True)
+    check("and the report is written", any(l.startswith("## agents_file_check") for l in lines), True)
 
 
 if __name__ == "__main__":

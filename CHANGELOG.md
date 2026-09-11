@@ -94,12 +94,17 @@ number.
 - **The check builds a decision the schema accepts, and asks one question of it.** A conforming
   instance is generated from the composed schema — `required`, `type`, `pattern`, `minLength`,
   `minItems`, `enum`, `const` — validated against that schema, and only then is a property added at
-  each object it carries: still valid means the object is open. Nothing reads an error message,
-  counts a keyword or inspects a path, and a schema that rejects the decision built for it is
-  reported rather than measured, because a probe is evidence only when the instance conforms. That
-  subsumes a rule of its own: a closer parked inside an `allOf` branch, where it sees only the
-  properties named beside it, refuses every conforming decision — so it is caught by measurement,
-  at whatever depth it sits, instead of by a scan for the shape. A repository's own narrowing
+  each object it carries, under several names and carrying several values — a string, a number, a
+  boolean, `null`, an object, an array. Any of them still valid means the object is open, and the
+  report quotes the one that got in; closed means every one was refused. One witness was not
+  enough: `unevaluatedProperties: {"type": "integer"}` refuses a string for its type and lets every
+  number in under any name, and a probe carrying one string read that as a closed object. Nothing
+  reads an error message, counts a keyword or inspects a path to reach a verdict, and a schema that
+  rejects the decision built for it is reported rather than measured, because a probe is evidence
+  only when the instance conforms. That covers a rule of its own: a closer parked inside an `allOf`
+  branch, where it sees only the properties named beside it, refuses every conforming decision —
+  so it is caught at whatever depth it sits, instead of by a scan for the shape, and named as the
+  shape it is. A repository's own narrowing
   pattern is built rather than guessed at where it can be — literal runs, escapes, a class with a
   quantifier, the first alternative of a group — and where it cannot, the schema is declined with
   the reason, at warning level: a value this check could not construct is its own limit as much as
@@ -115,17 +120,56 @@ number.
 - **The check names what it did not measure.** The probe understands a stated set of shapes —
   `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
   document that named them — and every construct it meets and does not walk is now a warning
-  naming the construct and the location: a branching keyword that could introduce an object,
-  `patternProperties`, an object-valued `additionalProperties`, an array whose item schema is not
-  a schema object, a reference it cannot resolve, the depth bound running out. Silence there was
-  indistinguishable from measured-and-closed, which is how five review rounds each found one more
-  shape it did not know. A branch that only tightens what is already probed is not reported, or
-  the bundle's own bases would put warnings on every composition in the ecosystem.
-- A composition that pulls the base in below an instance's root — under a wrapper, or through
-  another file — is reported as **not measured**, at warning level. It can be entirely correct, and
-  measuring it would mean deriving instance locations from the composition's own structure, which
-  is the walker the probe replaced. What is unknown says it is unknown, and does not fail a build
-  that was conforming.
+  naming the construct and the location: a branching keyword that would put a property the
+  generator did not build, named, an object under `patternProperties` or an object-valued
+  `additionalProperties`, an array whose item schema is not a schema object, a reference it
+  cannot follow, the depth bound running out. Silence there was indistinguishable from
+  measured-and-closed, which is how five review rounds each found one more shape it did not know.
+  A branch that only tightens what is already probed is not reported, or the bundle's own bases
+  would put warnings on every composition in the ecosystem — and "only tightens" is decided by
+  comparing the branch, level by level, with what the parts applying at each level declare,
+  not by scanning the branch for a shape: the scan read `$ref` and not `$dynamicRef`, and an
+  object introduced through the second was neither built, probed nor declared.
+- **Only what is measured is an error.** Two findings come out of this check, and they are not
+  the same kind of thing. An object that took a property the base does not name, on a decision the
+  schema accepted, is a measurement: the instance conformed, the property got in, and no limit of
+  this check can produce that. A schema refusing the decision built for it is a conclusion drawn
+  from the generator's output — as likely a value this check could not construct, or a keyword it
+  does not walk, as the schema refusing what its base declares — and it is reported as not
+  measured, at warning level, whatever keyword the refusal came through. That keyword is named,
+  and so is the one shape that is always the schema's own doing, a closer parked inside an `allOf`
+  branch; the reader is told, and a build is not failed on a conclusion. This is a change from
+  the rule stated before this release shipped, that a refusal through a keyword the generator had
+  honoured was the schema's fault and an error: a `then` requiring a property the generator never
+  built, a `dependentSchemas` doing the same, a `contains` it never aimed at, a `oneOf` per finding
+  tag two levels down, a `maxProperties` — five conforming schemas each got that error, telling
+  the keywords apart by the shape of the refusal's path was fixed once for each, and the sixth
+  shape was the one the fix did not know. The guess is gone rather than improved: unmeasured says
+  it is unmeasured. The same holds for this check failing on one schema — it reports that it
+  failed there and what it could not measure, rather than a verdict.
+- **The probe is fair to a name rule.** `patternProperties: {"^exeris": false}` refused every
+  probe name — all three began with `exeris` — and the root was reported closed while any other
+  name walked in. A closer refuses undeclared names, not names that look a certain way, so the
+  probe now uses only names no `patternProperties` entry or `propertyNames` rule at that object
+  refuses for their shape, from a wider set of shapes plus one built from the rule's own
+  pattern; when none passes, it says so. The one name rule that is a closer — a `propertyNames`
+  enumerating the base's names — is read as one: closed, without a warning, and open by the name
+  it lets through when it allows one the base does not declare.
+- **`$dynamicRef` composes.** It resolves exactly as `$ref` does until its fragment names a
+  dynamic anchor, so a composition written with it validated every decision through the base —
+  and the check, looking for `$ref` alone, saw no composition at all: zero errors, zero warnings,
+  nothing closed anywhere. Both keywords are one thing to the check now, everywhere a reference
+  is read; a `$dynamicRef` to a dynamic anchor is declined by name, because the dynamic scope is
+  what this does not model.
+- **Every reference inside the checkout is followed**, the way the validator follows it: a
+  wrapper of the repository's own composing the base one file over, and the neighbouring
+  `handoff.schema.json` the standard names as the way to close a verdict's `handoffs` items. The
+  first was reported as a file this check does not follow, the second declined as "a reference
+  outside the bundle" and then measured anyway through the validator. Both are measured now, with
+  what the neighbour declares built and probed. What is declined is what the validator itself
+  cannot follow — a URL, a path leaving the checkout, a file that is not a schema object — by
+  name, and `items: false` past a prefix builds nothing rather than an element it then reports
+  the schema for refusing.
 - Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
   into a vendored tree that **no** import pins is a finding, not a shrug: it resolves, so no other
   check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
@@ -144,6 +188,17 @@ number.
 
 ### Fixed
 
+- **The checker writes its report whatever its input does — the class "fixed" four times,
+  answered once.** Three more ways a run ended with a traceback where the findings should have
+  been, each reproduced: a `$ref` under a `patternProperties` entry that no built property
+  matched, which validating the decision never touched and the probe — adding exactly such a
+  name — was the first to reach, outside the guard; a schema nested past the interpreter's
+  recursion limit, which raised out of the recursive walker in the middle of `check_schemas`; and
+  whatever the next one is. The walker is iterative, the closers are declared unmeasured while a
+  reference in the file does not resolve (the reference is the finding, already reported), and
+  above every check sits one guard: a check that raises is a finding naming the frame and the
+  exception, everything reported before it still reaches the reader, and the report says what is
+  missing past that point. A run that fails still fails; it no longer fails silently.
 - **An eval run no longer ends on one bad reference — third statement, and the first two were
   wrong.** The first fix made a base's own relative `$ref` resolve next to the base rather than
   next to the composed schema, which is why a verdict carrying a handoff had been ending the run
