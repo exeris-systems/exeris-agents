@@ -1672,6 +1672,11 @@ def test_a_check_that_raises_becomes_a_finding_and_the_report_is_still_written()
     mod.run_checks = failing
     out, argv, here = io.StringIO(), sys.argv, os.getcwd()
     sys.argv = [CHECKER, "--root", "."]
+    # `emit()` writes to $GITHUB_STEP_SUMMARY when that is set and to stdout otherwise, so a test
+    # that captures stdout measures the sink rather than the guard and passes everywhere except
+    # inside Actions. The subprocess helper above already strips it for that reason; this path runs
+    # in-process and did not.
+    summary = os.environ.pop("GITHUB_STEP_SUMMARY", None)
     try:
         with contextlib.redirect_stdout(out):
             try:
@@ -1682,6 +1687,8 @@ def test_a_check_that_raises_becomes_a_finding_and_the_report_is_still_written()
     finally:
         sys.argv = argv
         os.chdir(here)
+        if summary is not None:
+            os.environ["GITHUB_STEP_SUMMARY"] = summary
     lines = out.getvalue().splitlines()
     check("the run fails", code, 1)
     check("the failure is a finding, named to the frame and the exception",
