@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for two defects a consuming repository hits and this repository does not.
+"""Regression tests for defects a consuming repository hits and this repository does not.
 
-Both shipped in 1.1.0, both are silent, and both were found by running the tools against a second
-consumer rather than by reading them:
+It vendors nothing and grades nothing, so every case here needs a consumer built to find it. The
+first two shipped in 1.1.0, both silent, both found by running the tools against a second
+consumer rather than by reading them; the grader cases below were found the same way, against a
+real composed schema:
 
   1. `provider-owned` in the mapping spelling rule 7 requires — `{path: …, generated-region: …}` —
      was read with `set(...)`, which raises TypeError on an unhashable dict inside a bare
@@ -29,6 +31,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECK = os.path.join(ROOT, "tools", "agents_file_check.py")
 RUNNER = os.path.join(ROOT, "bundle", "evals", "run.py")
+SCHEMAS = os.path.join(ROOT, "bundle", "schemas")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import check, main  # noqa: E402  (after the sys.path line it needs)
@@ -323,6 +326,253 @@ def test_the_no_jsonschema_fallback_says_when_it_cannot_validate():
                   mod.validate({"decision": "PASS"}, reachable), [])
         finally:
             sys.modules.clear(); sys.modules.update(real)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_base_ref_resolves_beside_the_base_that_names_it():
+    """The third path defect, and the one this file's second entry above is the pattern for.
+
+    A base has relative `$ref`s of its own — `handoff.base.schema.json`, beside it in the vendored
+    tree — and they were resolved against the COMPOSED schema's directory. That directory is only
+    right for the composition's own references. Worse, the join was relative to relative:
+    `urljoin("../vendor/<pin>/schemas/verdict.base.schema.json", "handoff.base.schema.json")` is
+    `"vendor/<pin>/schemas/handoff.base.schema.json"` — the leading `../` normalised away, a
+    directory no repository has. So a verdict carrying a handoff raised `Unresolvable` out of the
+    grader, and a grader that raises reports nothing at all: not a failed case, a lost run.
+    """
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "evalrun_baseref")
+
+        def verdict(handoff):
+            return {"agent": "fixture-reviewer", "decision": "PASS", "scope_class": "docs-only",
+                    "findings": [], "checks_run": [{"check": "vale", "result": "pass"}],
+                    "handoffs": [handoff]}
+
+        good = {"from": "fixture-reviewer", "to": "human", "blocking": True,
+                "reason": "the receiving role owns the number"}
+        try:
+            clean = mod.validate(verdict(good), composed)
+            bad = mod.validate(verdict({"from": "fixture-reviewer", "to": "human",
+                                        "blocking": True}), composed)
+        except Exception as exc:                       # the defect: it raised out of the grader
+            check(f"a handoff is graded, not raised on ({type(exc).__name__})", False, True)
+            return
+        check("a well-formed handoff validates", clean, [])
+        check("and a handoff missing `reason` is a graded failure, so the base really applied",
+              bool(bad) and "reason" in bad[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def grader_tree() -> tuple[str, str, str]:
+    """(repo, composed schema path, vendored runner path) — a consumer with the real bases."""
+    d = tempfile.mkdtemp(prefix="grader-")
+    vendor = os.path.join(d, ".agents", "vendor", "exeris-agents-2.0.0")
+    os.makedirs(os.path.join(d, ".git"))
+    shutil.copytree(SCHEMAS, os.path.join(vendor, "schemas"))
+    os.makedirs(os.path.join(vendor, "evals"))
+    shutil.copy(RUNNER, os.path.join(vendor, "evals", "run.py"))
+    composed = os.path.join(d, ".agents", "schemas", "verdict.schema.json")
+    write(composed, json.dumps({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [{"$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                  {"properties": {"agent": {"enum": ["fixture-reviewer"]}}}],
+        "unevaluatedProperties": False}))
+    return d, composed, os.path.join(vendor, "evals", "run.py")
+
+
+def load_runner(path: str, name: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ABSENT = object()
+
+VERDICT = {"agent": "fixture-reviewer", "decision": "PASS", "scope_class": "docs-only",
+           "findings": [], "checks_run": [{"check": "vale", "result": "pass"}]}
+
+
+def test_a_reference_that_cannot_resolve_is_a_graded_failure():
+    """The failure class this release claims to have closed, by its likelier trigger: not a base
+    whose neighbour moved, but a `$ref` that names something which is not there. It reached the
+    caller as an exception, and `run()` catches nothing around `grade()`, so one bad reference in
+    one case ended the whole run with a traceback instead of failing that case."""
+    d, composed, runner = grader_tree()
+    try:
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": "../vendor/exeris-agents-2.0.0/schemas/gone.base.schema.json"}],
+            "unevaluatedProperties": False}))
+        mod = load_runner(runner, "evalrun_unresolvable")
+        try:
+            out = mod.validate(VERDICT, composed)
+        except BaseException as exc:            # SystemExit included: the guard exits the process
+            check(f"an unresolvable $ref is graded, not raised ({type(exc).__name__})", False, True)
+            return
+        check("it comes back as a failure the case can carry",
+              bool(out) and "resolve" in out[0].lower(), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_grader_that_cannot_build_its_registry_says_so():
+    """The fallback rebuilt the validator without the registry and without the location `$id` — the
+    two things that make a vendored `$ref` resolve — and returned its verdict as if nothing had
+    happened. A grader that quietly weakens is the failure this file has now fixed three times."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "evalrun_noregistry")
+        import jsonschema                             # noqa: F401 — see below
+        # jsonschema is imported first, deliberately: it imports `referencing` itself, so stubbing
+        # that out beforehand would fail jsonschema's own import and exercise the other branch.
+        # This passed for the right reason only because the suite happens to run alphabetically.
+        was = sys.modules.get("referencing", _ABSENT)
+        sys.modules["referencing"] = None            # force the ImportError branch
+        try:
+            out = mod.validate(VERDICT, composed)
+        except BaseException as exc:
+            check(f"a grader without a registry answers, it does not raise ({type(exc).__name__})",
+                  False, True)
+            return
+        finally:
+            # One entry back, not the whole module table: clearing `sys.modules` to undo a single
+            # stub takes every other module's identity with it.
+            if was is _ABSENT:
+                sys.modules.pop("referencing", None)
+            else:
+                sys.modules["referencing"] = was
+        check("it says it could not validate rather than reporting a clean instance",
+              bool(out) and "cannot validate" in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_case_pointed_at_a_bundle_base_is_refused():
+    """From 2.0.0 a base refuses almost nothing on its own, so a case graded against one reports a
+    clean run over answers no repository would accept. The runner names it instead."""
+    d, composed, runner = grader_tree()
+    try:
+        write(os.path.join(d, ".agents", "evals", "scenarios.yaml"),
+              "version: 1\ndefaults:\n  schema_dir: ../schemas\n  fixture_dir: fixtures\n"
+              "cases:\n  - id: graded-against-a-base\n    agent: a\n    prompt: p\n"
+              "    expect:\n      schema: "
+              "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json\n")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report",
+                            os.path.join(d, "report.json"), "--scenarios",
+                            os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=d)
+        check("a case naming a vendored base is an error, not an `ok`",
+              ("ok    graded-against-a-base" in p.stdout, "base" in p.stdout.lower()),
+              (False, True))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_composed_schema_that_declares_its_own_id_still_resolves():
+    """`located()` supplies the file a schema was read from as its `$id`, which is what makes a
+    relative `$ref` into the vendored tree resolve. It declined to do so when the schema already
+    declared one — and a repository that gives its schema an `$id`, as JSON Schema invites, then
+    has every `$ref` joined onto that identifier instead of onto the file. The failure arrives as a
+    missing file, which points the reader at the vendored tree rather than at the `$id`."""
+    d, composed, runner = grader_tree()
+    try:
+        body = json.load(open(composed, encoding="utf-8"))
+        write(composed, json.dumps({"$id": "https://exeris.example/schemas/verdict", **body}))
+        mod = load_runner(runner, "evalrun_ownid")
+        out = mod.validate(VERDICT, composed)
+        check("a schema with its own `$id` validates against the vendored base all the same",
+              out, [])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_ref_leaving_the_checkout_fails_the_case_rather_than_the_run():
+    """`within_repo()` refuses by exiting the process — right for a CLI argument read once at
+    startup, wrong inside a grader, where it takes every later case with it. `except Exception`
+    does not catch `SystemExit`, so this was still the failure class `### Fixed` claims to close."""
+    d, composed, runner = grader_tree()
+    try:
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": "../../../../../../etc/passwd"}]}))
+        mod = load_runner(runner, "evalrun_escape")
+        try:
+            out = mod.validate(VERDICT, composed)
+        except BaseException as exc:
+            check(f"a $ref out of the checkout is graded, not exited ({type(exc).__name__})",
+                  False, True)
+            return
+        check("and the failure says the reference left the repository",
+              bool(out) and "outside the repository" in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_failure_that_is_not_about_a_path_is_not_reported_as_one():
+    """The catch-all told every case the same story — a `$ref` that did not resolve, a path that is
+    not there. A grader that misnames what went wrong sends its reader to the wrong file."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "evalrun_mislabel")
+
+        class Exploding(dict):
+            def __contains__(self, key): raise RuntimeError("not a path problem at all")
+
+        try:
+            out = mod.validate(Exploding(), composed)
+        except BaseException as exc:
+            check(f"an unexpected failure is caught ({type(exc).__name__})", False, True)
+            return
+        check("and it is not dressed up as a missing file",
+              bool(out) and "path that is not there" not in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_an_unparseable_schema_fails_the_case_rather_than_the_run():
+    """`json.load` on the composed schema sat outside every guard in `validate()`, and `main()`
+    checks that the file exists without ever checking that it parses. Both branches read it — the
+    jsonschema one and the shallow fallback — so a repository with one broken schema lost the whole
+    run, which is the class three of this release's `### Fixed` entries are about."""
+    d, composed, runner = grader_tree()
+    try:
+        write(composed, "{ this is not json")
+        mod = load_runner(runner, "evalrun_unparseable")
+        # One case, not two: the read happens before either branch is chosen, so stubbing
+        # jsonschema out would exercise the same three lines and assert nothing further.
+        try:
+            out = mod.validate({}, composed)
+        except BaseException as exc:
+            check(f"an unparseable schema is graded, not raised ({type(exc).__name__})",
+                  False, True)
+            return
+        check("it says the schema itself will not parse",
+              bool(out) and "not readable JSON" in out[0], True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_path_that_is_not_there_is_a_typo_not_a_base():
+    """The vendored-base refusal ran before the existence check, so a case naming
+    `.../verdikt.base.schema.json` was told to name the composed schema instead — advice about the
+    wrong problem."""
+    d, composed, runner = grader_tree()
+    try:
+        write(os.path.join(d, ".agents", "evals", "scenarios.yaml"),
+              "version: 1\ndefaults:\n  schema_dir: ../schemas\n  fixture_dir: fixtures\n"
+              "cases:\n  - id: typo\n    agent: a\n    prompt: p\n    expect:\n      schema: "
+              "../vendor/exeris-agents-2.0.0/schemas/verdikt.base.schema.json\n")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report",
+                            os.path.join(d, "report.json"), "--scenarios",
+                            os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=d)
+        check("the missing file is what the case is told about",
+              ("schema not found" in p.stdout, "names a bundle base" in p.stdout), (True, False))
     finally:
         shutil.rmtree(d)
 

@@ -4,8 +4,12 @@ All notable changes to the Exeris agent bundle. Keep a Changelog 1.1, SemVer, AD
 
 Versioning, stated precisely because the earlier wording licensed a wrong reading:
 
-- **MAJOR** — the contract moves under a repository that was following it: a new required field, a
-  removed or renamed manifest key, a changed vendored layout, a removed or renamed CLI flag.
+- **MAJOR** — the change requires work of a repository that was already conforming, whichever
+  direction the text moved. Tightening does it: a new required field, a removed or renamed manifest
+  key, a changed vendored layout, a removed or renamed CLI flag. So does relaxing: a base that
+  stops constraining leaves every composing schema accepting what it used to refuse, and only the
+  repository can put the refusal back. The work a conforming consumer must do decides this, not
+  whether the contract grew or shrank.
 - **MINOR** — a new check, policy or schema field. A new check *can* turn a green build red, but
   only where the repository was already not conforming: that is the check catching up with a rule
   that already bound, not the contract moving. This is how check tooling is versioned everywhere,
@@ -17,6 +21,234 @@ is an answer and the section's presence never implies MAJOR. Its content, agains
 above, decides the number.
 
 ## [Unreleased]
+
+## [2.0.0] - 2026-09-10
+
+The base schemas stop closing themselves, because a composing schema cannot add a property to a
+base that does. Three shapes, measured side by side: with `additionalProperties: false` in the base
+the added field is refused; with `unevaluatedProperties: false` in the base it is refused
+identically, since that keyword sees only the annotations of its own schema object and its in-place
+applicators and never a sibling `allOf` branch in the composing schema — it reads like the fix and
+is not; with no closer in the base at all, the added field validates and a foreign one is still
+refused, by the composition.
+
+**MAJOR by relaxation.** Nothing here adds a required field, renames a key or moves the vendored
+layout. The base alone becomes more permissive, and that is the sharper direction: a repository
+that bumps and changes nothing keeps a schema which now accepts any property, with nothing going
+red. The preamble above says what that costs a conforming consumer, which is what decides the
+number.
+
+### Breaking
+
+- **The bases refuse nothing on their own.** No object in `verdict.base.schema.json`,
+  `handoff.base.schema.json` or `triage-result.base.schema.json` declares `additionalProperties` or
+  `unevaluatedProperties` — not a root, not a finding, not a check entry, not a validation gate.
+  Each file's `description` says so and says where the closers belong, because that is the thing a
+  later reader would otherwise put back.
+- **What a consumer must add: one closer per object, not one per schema.**
+  `"unevaluatedProperties": false` at the root of every schema that `$ref`s a base, and again in a
+  subschema over every object that base leaves open. Eight objects across the three schemas: a
+  verdict composition closes four — its root, a `findings` item, a `checks_run` item and a
+  `handoffs` item, the last declared in `handoff.base.schema.json` one file over and open all the
+  same — a triage-result composition closes three, its root, a `validation_gates` item and a
+  `secondary_handoffs` item, and a handoff composition closes its root. `unevaluatedProperties` stops
+  at the object it sits in, so a root closer leaves every array item taking any property; measured,
+  a composition closing only its root refuses a foreign property at the root and admits one in a
+  check entry. An object the repository does not extend still needs a subschema of its own,
+  carrying the `$ref` and the closer. `agents_file_check.py` names every object left open, so the
+  work is enumerated rather than discovered.
+- **Every graded failure will carry a line naming your own fields as unexpected.** A composition
+  validates through a `$ref` into the base; when anything inside that branch fails, the branch
+  fails, and a failing subschema contributes no annotations — so an `unevaluatedProperties` above
+  it reports every property present. `<root>: Unevaluated properties are not allowed ('agent',
+  'checks_run', 'decision', …)` sits beside the real error in every failure report, at every
+  consumer, and it is not the problem: read the other errors first, and it goes when they do.
+  `BUNDLE.md` says so where a consumer meets it.
+- **The root closer can be added before the bump.** Over 1.4.0's closed base it changes no outcome:
+  a conforming instance still validates and a foreign root property is still refused, by the base.
+  An extension cannot be added early — 1.4.0's base refuses the added field, which is the whole
+  reason for this release.
+
+### Added
+
+- `agents_file_check.py`: a composed schema must refuse a property its bundle base does not name,
+  at the root and inside every object the base carries, and each location where nothing refuses one
+  is an error naming that location — `<root>`, `findings/0`, `checks_run/0`. Without the check,
+  bumping the bundle and changing nothing is a silent loss of enforcement, the failure this release
+  would otherwise ship. The question is asked of the schema rather than read off it: a structural
+  probe built from the base is validated, then validated again with one property added at one
+  location, and a location where nothing named that property is open. So the keyword a repository
+  reaches for is its own business — `unevaluatedProperties`, `additionalProperties`, a
+  `propertyNames` enum — and what is reported is where an instance is unguarded rather than which
+  subschema lacked a token. What is asked is asked of the base that is actually vendored, so a
+  repository stays green while it pins a bundle whose bases still close themselves and goes red
+  when it re-vendors — the moment the enforcement actually moves. From then on the count of what is
+  left to do is whatever a run says, not whatever a release note said once.
+- **A closer that refuses everything is reported too.** Either spelling: `additionalProperties:
+  false` beside the base, which the probe catches because that keyword's verdict does not depend on
+  a branch that failed, and `unevaluatedProperties: false` inside the `allOf` branch next to the
+  one carrying the base, which no probe can tell from a correct closer and which is named by its
+  shape. Both see only the properties written beside them, so both reject everything the base
+  declares while looking closed to a check that asks only whether a foreign property can get in. A
+  conforming decision graded against such a schema is refused outright.
+- **The check builds a decision the schema accepts, and asks one question of it.** A conforming
+  instance is generated from the composed schema — `required`, `type`, `pattern`, `minLength`,
+  `minItems`, `enum`, `const` — validated against that schema, and only then is a property added at
+  each object it carries, under several names and carrying several values — a string, a number, a
+  boolean, `null`, an object, an array. Any of them still valid means the object is open, and the
+  report quotes the one that got in; closed means every one was refused. One witness was not
+  enough: `unevaluatedProperties: {"type": "integer"}` refuses a string for its type and lets every
+  number in under any name, and a probe carrying one string read that as a closed object. Nothing
+  reads an error message, counts a keyword or inspects a path to reach a verdict, and a schema that
+  rejects the decision built for it is reported rather than measured, because a probe is evidence
+  only when the instance conforms. That covers a rule of its own: a closer parked inside an `allOf`
+  branch, where it sees only the properties named beside it, refuses every conforming decision —
+  so it is caught at whatever depth it sits, instead of by a scan for the shape, and named as the
+  shape it is. A repository's own narrowing
+  pattern is built rather than guessed at where it can be — literal runs, escapes, a class with a
+  quantifier, the first alternative of a group — and where it cannot, the schema is declined with
+  the reason, at warning level: a value this check could not construct is its own limit as much as
+  the schema's, and failing a conforming repository over it is the mistake the level protects
+  against.
+- **A value the check cannot build costs one location, not the schema.** The generator says where
+  it could not construct something; that value is left out of the decision, the rest is measured,
+  and the location is named. Declining the whole schema is now reserved for a root that cannot be
+  built at all — where what could not be constructed was required, so nothing conforming remains.
+  Every assertion keyword is either satisfied or declined by name, partitioned like the subschema
+  vocabulary and with the same two-hands test behind it, because an assertion neither satisfied nor
+  declined produces a value the schema refuses and reports that as the schema's fault.
+- **The check names what it did not measure.** The probe understands a stated set of shapes —
+  `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
+  document that named them — and every construct it meets and does not walk is now a warning
+  naming the construct and the location: a branching keyword that would put a property the
+  generator did not build, named, an object under `patternProperties` or an object-valued
+  `additionalProperties`, an array whose item schema is not a schema object, a reference it
+  cannot follow, the depth bound running out. Silence there was indistinguishable from
+  measured-and-closed, which is how five review rounds each found one more shape it did not know.
+  A branch that only tightens what is already probed is not reported, or the bundle's own bases
+  would put warnings on every composition in the ecosystem — and "only tightens" is decided by
+  comparing the branch, level by level, with what the parts applying at each level declare,
+  not by scanning the branch for a shape: the scan read `$ref` and not `$dynamicRef`, and an
+  object introduced through the second was neither built, probed nor declared.
+- **Only what is measured is an error.** Two findings come out of this check, and they are not
+  the same kind of thing. An object that took a property the base does not name, on a decision the
+  schema accepted, is a measurement: the instance conformed, the property got in, and no limit of
+  this check can produce that. A schema refusing the decision built for it is a conclusion drawn
+  from the generator's output — as likely a value this check could not construct, or a keyword it
+  does not walk, as the schema refusing what its base declares — and it is reported as not
+  measured, at warning level, whatever keyword the refusal came through. That keyword is named,
+  and so is the one shape that is always the schema's own doing, a closer parked inside an `allOf`
+  branch; the reader is told, and a build is not failed on a conclusion. This is a change from
+  the rule stated before this release shipped, that a refusal through a keyword the generator had
+  honoured was the schema's fault and an error: a `then` requiring a property the generator never
+  built, a `dependentSchemas` doing the same, a `contains` it never aimed at, a `oneOf` per finding
+  tag two levels down, a `maxProperties` — five conforming schemas each got that error, telling
+  the keywords apart by the shape of the refusal's path was fixed once for each, and the sixth
+  shape was the one the fix did not know. The guess is gone rather than improved: unmeasured says
+  it is unmeasured. The same holds for this check failing on one schema — it reports that it
+  failed there and what it could not measure, rather than a verdict. That is the one false green
+  this rule chooses: a schema that is wide open and also makes this check raise is not red, and
+  `tests/test_schema_closers.py` says so in as many words, so that it is a decision on record and
+  not a gap found later. The checker failing as a whole is still red.
+- **The probe is fair to a name rule.** `patternProperties: {"^exeris": false}` refused every
+  probe name — all three began with `exeris` — and the root was reported closed while any other
+  name walked in. A closer refuses undeclared names, not names that look a certain way, so the
+  probe now uses only names no `patternProperties` entry or `propertyNames` rule at that object
+  refuses for their shape, from a wider set of shapes plus one built from the rule's own
+  pattern; when none passes, it says so. The one name rule that is a closer — a `propertyNames`
+  enumerating the base's names — is read as one: closed, without a warning, and open by the name
+  it lets through when it allows one the base does not declare.
+- **`$dynamicRef` composes.** It resolves exactly as `$ref` does until its fragment names a
+  dynamic anchor, so a composition written with it validated every decision through the base —
+  and the check, looking for `$ref` alone, saw no composition at all: zero errors, zero warnings,
+  nothing closed anywhere. Both keywords are one thing to the check now, everywhere a reference
+  is read; a `$dynamicRef` to a dynamic anchor is declined by name, because the dynamic scope is
+  what this does not model.
+- **Every reference inside the checkout is followed**, the way the validator follows it: a
+  wrapper of the repository's own composing the base one file over, and the neighbouring
+  `handoff.schema.json` the standard names as the way to close a verdict's `handoffs` items. The
+  first was reported as a file this check does not follow, the second declined as "a reference
+  outside the bundle" and then measured anyway through the validator. Both are measured now, with
+  what the neighbour declares built and probed. What is declined is what the validator itself
+  cannot follow — a URL, a path leaving the checkout, a file that is not a schema object — by
+  name, and `items: false` past a prefix builds nothing rather than an element it then reports
+  the schema for refusing.
+- Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
+  into a vendored tree that **no** import pins is a finding, not a shrug: it resolves, so no other
+  check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
+  pointer is resolved as well as its file, because `<base>#/properties/<name>/items` is now the
+  documented way to close a nested object and a pointer that names nothing is a closer over
+  nothing.
+- **The eval runner refuses a case whose `expect.schema` names a bundle base.** That was the
+  release's second piece of consumer work and it shipped as advice; advice is not a check, and the
+  closer rule got one. A base now accepts a foreign property anywhere and any value the
+  repository's own enums exclude, so a case graded against one passes on answers the repository
+  refuses. Point `expect.schema` at the composed schema in `.agents/schemas/`.
+- `tests/test_schema_closers.py`, run in CI: what a composition over the open bases refuses, what
+  the bare base no longer does, what an unclosed object admits, and the checker's answer to every
+  closer removed in turn. The instance cases are graded through `bundle/evals/run.py`'s own
+  `validate()`, so what is exercised is the grader a consumer's evals run.
+
+### Fixed
+
+- **The checker writes its report whatever its input does — the class "fixed" four times,
+  answered once.** Three more ways a run ended with a traceback where the findings should have
+  been, each reproduced: a `$ref` under a `patternProperties` entry that no built property
+  matched, which validating the decision never touched and the probe — adding exactly such a
+  name — was the first to reach, outside the guard; a schema nested past the interpreter's
+  recursion limit, which raised out of the recursive walker in the middle of `check_schemas`; and
+  whatever the next one is. The walker is iterative, the closers are declared unmeasured while a
+  reference in the file does not resolve (the reference is the finding, already reported), and
+  above every check sits one guard: a check that raises is a finding naming the frame and the
+  exception, everything reported before it still reaches the reader, and the report says what is
+  missing past that point. A run that fails still fails; it no longer fails silently.
+- **An eval run no longer ends on one bad reference — third statement, and the first two were
+  wrong.** The first fix made a base's own relative `$ref` resolve next to the base rather than
+  next to the composed schema, which is why a verdict carrying a handoff had been ending the run
+  with `Unresolvable` since 1.0.0: `urljoin` normalises the leading `../` away when the base URI is
+  itself relative, so the second hop landed in a directory no repository has. That was written up
+  here as the failure class closed. It was not: any *other* unresolvable reference still left
+  `validate()` as an exception, and neither `grade()` nor `run()` catches one, so a single bad path
+  still took every later case's result with it. The second fix caught `Exception` and this entry
+  said so again — and `within_repo()` refuses a path that leaves the checkout by calling
+  `sys.exit`, which raises `SystemExit`, which is not an `Exception`. So the guard protecting the
+  runner was killing the run it protected, through the branch the fix had just declared closed.
+  Three outcomes are now distinguished and each has a test: a reference that resolves to nothing, a
+  path refused for leaving the repository, and any other failure, which says it was the grader that
+  failed and names what raised. A fourth path was found in review after all three: the composed
+  schema's own `json.load` sat outside every guard, in both branches, so a repository with one
+  unparseable schema still lost the run — `main()` checks that the file exists and never that it
+  parses. It is read inside the guard now. The history is here rather than tidied away because this
+  release's argument is that a claim nothing re-measures is worth less than a run, and this
+  particular claim has needed four.
+- **The checker read a `$ref` target before deciding it was allowed to.** `load_schema` opened
+  whatever path it was handed; what stopped it leaving the checkout was `ref_target()`, two modules
+  away, which every caller happened to go through. Measured on a direct call, it read and parsed a
+  JSON file outside the tree and returned its contents — for files outside the tree the refusal was
+  `json.load` failing on something it had already read. The containment is now against the `open()`
+  itself, the value opened is the one the check returned, and a `$ref` that resolves outside the
+  repository is reported rather than surfacing as a target that does not exist or a pointer that
+  does not resolve. Raised by SonarCloud as path injection, which as reported was a false positive:
+  the sanitiser was real, it was just in another module — and so was the defect.
+- **A case naming a path that is not there was told it had named a bundle base.** The refusal ran
+  before the existence check, so a typo under `.agents/vendor/` was answered with advice about
+  composed schemas. And a `$ref` target that exists but does not parse was reported as a pointer
+  that does not resolve, sending the reader to the pointer rather than to the file.
+- **Every failure was reported as a `$ref` that did not resolve.** The catch-all told each case the
+  same story, path and all, whatever had actually gone wrong — a grader that misnames a failure
+  sends its reader to the wrong file.
+- **A schema declaring its own `$id` never got the location that makes its references resolve.**
+  `located()` supplies the file a schema was read from as its identifier, and it deferred whenever
+  the schema already carried one. A repository that gives its schema an `$id`, as JSON Schema
+  invites, then had every relative `$ref` joined onto that identifier instead of onto the file, and
+  the failure surfaced as a missing file — pointing the reader at the vendored tree rather than at
+  the identifier that had redirected them. The file wins now: rule 8 lets a reference resolve from
+  the filesystem and nowhere else, so where the document is *is* what its references are relative
+  to.
+- **The grader's fallback rebuilt itself without the reference registry and said nothing.** A
+  validator without the registry and without the location `$id` resolves no vendored `$ref` at all;
+  it reported like the whole contract while checking the repository's own keywords. Each half now
+  says which one is missing instead of degrading quietly.
 
 ## [1.4.0] - 2026-09-09
 

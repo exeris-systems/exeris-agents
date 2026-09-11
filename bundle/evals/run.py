@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -87,12 +89,49 @@ def load_yaml(path: str):
         return yaml.safe_load(fh) or {}
 
 
-def file_registry(schema_path: str):
-    """Resolve `$ref` relative paths from the filesystem, so a composed schema works offline.
+def located(schema: dict, schema_path: str) -> dict:
+    """The schema, carrying the file it was read from as its `$id`.
 
-    A repository schema narrows a vendored base by `allOf` + a relative `$ref`. Nothing here
+    Nothing in the bundle carries one: an `$id` in a vendored base would make its canonical
+    identifier a URL to fetch or register, which is the whole reason the bases do without. But a
+    validator with no `$id` starts from an empty base URI, and every `$ref` then resolves relative
+    to relative — where the join is not the join anyone means. See `resolvable_from()`. The
+    identifier is supplied here, at read time, out of where the file actually is: it names a
+    location, never something to retrieve.
+
+    The file wins over an `$id` the schema declares, and that is deliberate. A repository may give
+    its schema an identifier — JSON Schema invites it — and every relative `$ref` in a vendored
+    layout is still written relative to the file, because that is the only thing rule 8 lets a
+    reference resolve from. Deferring to a declared `$id` sent those references off to join a URL
+    the tree knows nothing about; the failure then arrived as a missing file, pointing the reader
+    at the vendored tree instead of at the identifier that redirected them.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    return {**schema, "$id": resolvable_from(schema_path)}
+
+
+def resolvable_from(path: str) -> str:
+    """An absolute path as the URI a `$ref` can be joined against.
+
+    A relative base is the trap, and it cost a real failure: with the composed schema's own
+    directory as the base, `urljoin("../vendor/<pin>/schemas/verdict.base.schema.json",
+    "handoff.base.schema.json")` is `"vendor/<pin>/schemas/handoff.base.schema.json"` — the leading
+    `../` is normalised away, the second hop lands in a directory that does not exist, and a
+    verdict carrying a handoff raised `Unresolvable` out of the grader instead of being graded.
+    An absolute `file:` URI joins by the rules the resolver assumes.
+    """
+    return Path(os.path.abspath(path)).as_uri()
+
+
+def file_registry(schema_path: str):
+    """Resolve `$ref` paths from the filesystem, so a composed schema works offline.
+
+    A repository schema narrows a vendored base by `allOf` + a relative `$ref`, and that base has
+    relative `$ref`s of its own — `handoff.base.schema.json`, beside it in the vendored tree. Each
+    resolves against the file that names it, which is what the `file:` URIs here buy. Nothing
     touches the network: agents-md-schema.md rule 8 forbids fetching at runtime, and a bundle is
-    vendored precisely so the base is a file on disk.
+    vendored precisely so every base is a file on disk.
     """
     from referencing import Registry, Resource
     from referencing.jsonschema import DRAFT202012
@@ -102,7 +141,12 @@ def file_registry(schema_path: str):
     def retrieve(uri: str):
         # A `$ref` is a path fragment out of a JSON file, which is the same class of input as
         # `--scenarios` and `schema_dir`. Three of those were guarded and this one was not.
-        target = uri if os.path.isabs(uri) else os.path.normpath(os.path.join(base_dir, uri))
+        if uri.startswith("file:"):
+            target = unquote(urlparse(uri).path)
+        elif os.path.isabs(uri):
+            target = uri
+        else:
+            target = os.path.normpath(os.path.join(base_dir, uri))
         target = within_repo(target, f"$ref '{uri}'")
         with open(target, encoding="utf-8") as fh:
             return Resource.from_contents(json.load(fh), default_specification=DRAFT202012)
@@ -113,10 +157,24 @@ def file_registry(schema_path: str):
 def validate(instance, schema_path: str) -> list[str]:
     """Schema conformance. Falls back to a shallow required-keys check when jsonschema is absent,
     and says which it did — a grader that silently weakens is worse than one that is missing."""
+    name = os.path.basename(schema_path)
+    # Read first, and guarded: an unparseable composed schema raised out of the grader and ended
+    # the run, which is the class three entries of this release's `### Fixed` are about. `main()`
+    # checks that the file exists and never that it parses.
+    try:
+        with open(schema_path, encoding="utf-8") as fh:
+            schema = json.load(fh)
+    except Exception as exc:
+        return [f"cannot validate {name}: the schema itself is not readable JSON ({exc})"]
+    if not isinstance(schema, dict):
+        # `true` and `false` are legal JSON Schema, and an array is not but parses. The fallback
+        # below asks the document for `.get`, which is an AttributeError out of the grader and one
+        # more way to end a run — the same class as the three above.
+        return [f"cannot validate {name}: the schema is {type(schema).__name__}, not an object, so "
+                f"there is nothing here to validate against"]
     try:
         import jsonschema
     except ImportError:
-        schema = json.load(open(schema_path, encoding="utf-8"))
         # A composed schema declares its `required` inside the `allOf` branches, not at the top
         # level — the base's branch is a `$ref` this fallback cannot follow, but a repository's own
         # branch is inline and readable. Collect what IS reachable before giving up.
@@ -130,19 +188,60 @@ def validate(instance, schema_path: str) -> list[str]:
             # repository's enums — carries no top-level `required`, so this branch validated ZERO
             # fields and returned "valid". That is a grader silently weakening to nothing, which
             # this function's own docstring says is worse than one that is missing. Say so instead.
-            return [f"cannot validate {os.path.basename(schema_path)}: jsonschema is not installed "
-                    f"and the schema declares no top-level `required` to fall back on "
-                    f"(pip install jsonschema)"]
+            return [f"cannot validate {name}: jsonschema is not installed and the schema "
+                    f"declares no top-level `required` to fall back on (pip install jsonschema)"]
         missing = [k for k in required if k not in (instance or {})]
         return [f"missing required key '{k}' (shallow check: jsonschema not installed)"
                 for k in missing]
-    schema = json.load(open(schema_path, encoding="utf-8"))
+    # No silent fallback here. Rebuilding the validator without the registry and without the
+    # location `$id` drops the two things that make a vendored `$ref` resolve at all, and the
+    # grader that comes back checks a fraction of the contract while reporting like the whole one.
+    # Each half says which one is missing instead.
     try:
-        v = jsonschema.Draft202012Validator(schema, registry=file_registry(schema_path))
-    except (ImportError, TypeError):
-        v = jsonschema.Draft202012Validator(schema)
-    return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
-            for e in v.iter_errors(instance)]
+        registry = file_registry(schema_path)
+    except ImportError:
+        return [f"cannot validate {name}: `referencing` is not installed, so a `$ref` into the "
+                f"vendored bundle cannot be resolved and the grader would be checking the "
+                f"repository's own keywords and nothing the base carries "
+                f"(pip install jsonschema referencing)"]
+    try:
+        v = jsonschema.Draft202012Validator(located(schema, schema_path), registry=registry)
+    except TypeError as exc:
+        return [f"cannot validate {name}: this jsonschema does not take a reference registry "
+                f"({exc}); 4.18 and newer do, and without one a vendored `$ref` resolves to "
+                f"nothing"]
+    # Whatever goes wrong here belongs to the case that named this schema. Raised, it leaves
+    # `grade()` and `run()`, neither of which catches anything, and ends the whole run — every
+    # later case unreported over one bad path. The same reason `build_prompt`'s missing fixture is
+    # recorded rather than thrown. Three outcomes, because a grader that misnames what went wrong
+    # sends its reader to the wrong file.
+    try:
+        return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
+                for e in v.iter_errors(instance)]
+    except SystemExit as exc:
+        # `within_repo()` refuses by exiting: right for a CLI argument read once at startup, fatal
+        # here, where `except Exception` does not catch it and the run dies mid-case.
+        return [f"cannot validate {name}: a `$ref` resolved outside the repository and was refused "
+                f"({exc}). Paths are repository-relative by design"]
+    except Exception as exc:
+        if isinstance(exc, unresolvable()):
+            return [f"cannot validate {name}: a `$ref` did not resolve ({exc}). A vendored base is "
+                    f"a file on disk, so this is a path that is not there"]
+        return [f"cannot validate {name}: the grader failed on this instance "
+                f"({type(exc).__name__}: {exc})"]
+
+
+def unresolvable() -> tuple:
+    """The exception classes that mean a reference went nowhere.
+
+    jsonschema wraps referencing's `Unresolvable` and subclasses it, so one class covers both; the
+    empty tuple keeps the caller honest where `referencing` is not importable at all.
+    """
+    try:
+        from referencing.exceptions import Unresolvable
+        return (Unresolvable,)
+    except ImportError:
+        return ()
 
 
 def extract_json(raw: str):
@@ -205,6 +304,12 @@ def build_prompt(case: dict, fixture_dir: str) -> str:
         parts.append(f"\n--- {fixture} ---\n{open(path, encoding='utf-8').read().strip()}")
     parts.append("\nAnswer with the JSON object your response contract requires, and nothing else.")
     return "\n".join(p for p in parts if p)
+
+
+def vendored(path: str) -> bool:
+    """True for a schema inside `.agents/vendor/`, which makes it the bundle's and not this
+    repository's."""
+    return f"{os.sep}.agents{os.sep}vendor{os.sep}" in os.path.realpath(path) + os.sep
 
 
 def within_repo(path: str, what: str) -> str:
@@ -295,7 +400,6 @@ def main() -> int:
             print(f"ERROR {case['id']}: no expect.schema"); continue
         schema_path = within_repo(os.path.join(schema_dir, named),
                                   f"case '{case['id']}' expect.schema")
-
         # F5: a missing fixture is recorded like a missing schema. It used to raise out of
         # build_prompt and abort the whole run, so one typo in one case hid every later result.
         try:
@@ -309,6 +413,18 @@ def main() -> int:
             entry |= {"status": "error", "failures": [f"schema not found: {schema_path}"]}
             results.append(entry); failed += 1
             print(f"ERROR {case['id']}: schema not found"); continue
+        # After the existence check, not before it: a path under `.agents/vendor/` that is not
+        # there is a typo, and telling its author to name the composed schema instead sends them
+        # to fix the wrong thing.
+        if vendored(schema_path):
+            entry |= {"status": "error", "failures": [
+                f"expect.schema names a bundle base ({named}). A base fixes the shape and leaves "
+                f"the vocabulary and every closer to the repository, so from 2.0.0 it accepts a "
+                f"foreign property anywhere and any value the repository's own enums exclude — a "
+                f"case graded against one passes on answers the repository refuses. Name the "
+                f"composed schema in .agents/schemas/ instead."]}
+            results.append(entry); failed += 1
+            print(f"ERROR {case['id']}: expect.schema names a bundle base"); continue
         if a.dry_run:
             entry["status"] = "resolved"
             results.append(entry)

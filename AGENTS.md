@@ -29,16 +29,19 @@ is the defect.
 **Everything here is consumed by other repositories.** A change is never local: it reaches twenty
 checkouts through a version pin. So —
 
-- **A change to `bundle/` is a version change.** SemVer over the schema contract: a change that
-  moves the contract under a repository that was following it is MAJOR — a new required field, a
-  removed or renamed manifest key, a changed vendored layout. A new check is MINOR even when it
-  turns a build red, because it does that only where the repository was already not conforming.
-  Wording is PATCH. A `### Breaking` section is mandatory per release (ADR-085 §H.27); its
-  content decides the number, never its presence. `CHANGELOG.md` moves in the same pull request (ADR-085 §H.27).
+- **A change to `bundle/` is a version change.** SemVer over the schema contract, and the three
+  cases are written once — in [`CHANGELOG.md`](CHANGELOG.md)'s preamble, the file that ships to a
+  consumer and the file whose own history is the evidence for them. Read them there before
+  choosing a number; a copy here would be a second place to author one rule, and the copy that
+  stood here was already missing a case. A `### Breaking` section is mandatory per release
+  (ADR-085 §H.27); its content decides the number, never its presence. `CHANGELOG.md` moves in the
+  same pull request (ADR-085 §H.27).
 - **A change to `bundle/policies/` may only restrict.** A consuming repository may restrict
   further and may never relax, so a relaxation here silently relaxes every repository at once.
-- **A change to `bundle/schemas/` that adds a required property is MAJOR**, because a repository's
-  composed schema starts rejecting answers its roles already produce.
+- **A change to `bundle/schemas/` lands in every repository's composed schema.** Adding a required
+  property makes that schema reject answers its roles already produce; removing a constraint makes
+  it accept what it used to refuse, silently, until the repository closes the shape itself. Either
+  is work for a repository that was conforming, which is what the changelog's preamble weighs.
 - **Never widen a base schema's role vocabulary.** Role names are per-repository by design
   (schema rule 10 keeps the repository prefix); the base leaves `agent`, `task_class` and
   `scope_class` open and the repository narrows them. A name that appears here is a leak.
@@ -68,12 +71,20 @@ python3 tools/agents_file_check.py     --root ../exeris-docs
 python3 tools/agents_render.py --check --root ../exeris-docs
 python3 tools/agents_bundle.py verify  --root ../exeris-docs
 python3 tools/agents_bundle.py digest  --from .
+
+# and the evals, driven by THIS branch's runner rather than the consumer's pinned copy — otherwise
+# the run only re-reports whichever version that repository is behind on. Copy into a scratch copy
+# of the consumer: the runner writes its report inside the tree it evaluates.
+cp bundle/evals/run.py <scratch>/.agents/vendor/exeris-agents-<pin>/evals/run.py
+(cd <scratch> && python3 .agents/vendor/exeris-agents-<pin>/evals/run.py \
+    --scenarios .agents/evals/scenarios.yaml --dry-run)
 ```
 
-Report the counts, and report a check that did not run as not run
+Report the counts **measured at the commit being reported**, not at whichever run happened first,
+and report a check that did not run as not run
 ([`bundle/policies/error-handling-and-fallback.md`](bundle/policies/error-handling-and-fallback.md)
 rule 1). A change to `bundle/` that a consumer's evals cover reruns them and the pull request names
-the run (schema rule 14).
+the run (schema rule 14) — a change to `bundle/schemas/` or to `evals/run.py` always covers them.
 
 ## Safety
 

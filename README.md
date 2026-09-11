@@ -22,7 +22,7 @@ what is true; this repository is what makes it run.**
 
 ```bash
 # once, when choosing a version — the network is used here, by a human, and nowhere else
-python3 tools/agents_bundle.py vendor --root ../my-repo --from . --version 1.0.0 --ref <sha>
+python3 tools/agents_bundle.py vendor --root ../my-repo --from . --version 2.0.0 --ref <sha>
 ```
 
 It prints the pin to paste into `.agents/manifest.yaml`:
@@ -30,7 +30,7 @@ It prints the pin to paste into `.agents/manifest.yaml`:
 ```yaml
 imports:
   - bundle: exeris-agents
-    version: 1.0.0
+    version: 2.0.0
     ref: <full commit sha>
     sha256: sha256:<digest over every vendored byte>
 ```
@@ -46,9 +46,29 @@ and a repository's schema narrows a base one instead of copying it:
 
 ```json
 { "allOf": [
-    { "$ref": "../vendor/exeris-agents-1.0.0/schemas/verdict.base.schema.json" },
-    { "properties": { "agent": { "enum": ["my-repo-reviewer"] } } } ] }
+    { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json" },
+    { "properties": {
+        "agent": { "enum": ["my-repo-reviewer"] },
+        "findings": { "items": {
+          "allOf": [
+            { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/findings/items" },
+            { "properties": { "tag": { "enum": ["style", "correctness"] } } } ],
+          "unevaluatedProperties": false } },
+        "checks_run": { "items": {
+          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/checks_run/items",
+          "unevaluatedProperties": false } },
+        "handoffs": { "items": {
+          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/handoffs/items",
+          "unevaluatedProperties": false } } } } ],
+  "unevaluatedProperties": false }
 ```
+
+That is the whole shape: the enum a repository narrows, the property it adds — `tag`, on a finding,
+which is what an open base is for — and one closer per object. Why the bases carry none, and which
+objects a composition owes a closer, is in [`bundle/BUNDLE.md`](bundle/BUNDLE.md) under "What a
+schema here costs you" — the copy that ships inside `.agents/vendor/`, where a consumer meets it.
+`agents_file_check.py` names every object a composition leaves open, so `--root .` is the migration
+list rather than a reading exercise.
 
 ## Verifying it
 
@@ -71,11 +91,11 @@ been read.
 
 ## Versioning
 
-SemVer over the **contract**. MAJOR is the contract moving under a repository that was following
-it — a new required field, a removed or renamed manifest key, a changed vendored layout. A new
-check is MINOR even when it turns a build red, because it does that only where the repository was
-already not conforming. Wording is PATCH. A `### Breaking` section is mandatory in every release
-(ADR-085 §H.27), so its presence never implies MAJOR — its content does. See [`CHANGELOG.md`](CHANGELOG.md).
+SemVer over the **contract**, and the three cases are stated once, in
+[`CHANGELOG.md`](CHANGELOG.md)'s preamble — the file that ships with the package and the one a
+consumer reads when deciding whether a bump is safe. A `### Breaking` section is mandatory in every
+release (ADR-085 §H.27), so its presence never implies MAJOR — its content, against those cases,
+does.
 
 ## Licence
 
