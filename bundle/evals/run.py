@@ -216,8 +216,16 @@ def validate(instance, schema_path: str) -> list[str]:
     # recorded rather than thrown. Three outcomes, because a grader that misnames what went wrong
     # sends its reader to the wrong file.
     try:
+        errors = list(v.iter_errors(instance))
+        real_errors = [e for e in errors if not (
+            e.validator in ("unevaluatedProperties", "unevaluatedItems") and
+            any(o is not e and
+                o.validator not in ("unevaluatedProperties", "unevaluatedItems") and
+                tuple(o.absolute_path)[:len(e.absolute_path)] == tuple(e.absolute_path)
+                for o in errors)
+        )] or errors
         return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
-                for e in v.iter_errors(instance)]
+                for e in real_errors]
     except SystemExit as exc:
         # `within_repo()` refuses by exiting: right for a CLI argument read once at startup, fatal
         # here, where `except Exception` does not catch it and the run dies mid-case.
@@ -398,12 +406,21 @@ def main() -> int:
             entry |= {"status": "error", "failures": ["case names no expect.schema"]}
             results.append(entry); failed += 1
             print(f"ERROR {case['id']}: no expect.schema"); continue
-        schema_path = within_repo(os.path.join(schema_dir, named),
-                                  f"case '{case['id']}' expect.schema")
+        try:
+            schema_path = within_repo(os.path.join(schema_dir, named),
+                                      f"case '{case['id']}' expect.schema")
+        except SystemExit as exc:
+            entry |= {"status": "error", "failures": [f"expect.schema resolves outside repository: {named} ({exc})"]}
+            results.append(entry); failed += 1
+            print(f"ERROR {case['id']}: expect.schema resolves outside repository"); continue
         # F5: a missing fixture is recorded like a missing schema. It used to raise out of
         # build_prompt and abort the whole run, so one typo in one case hid every later result.
         try:
             prompt = build_prompt(case, fixture_dir)
+        except SystemExit as exc:
+            entry |= {"status": "error", "failures": [f"fixture resolves outside repository: {case.get('fixture')} ({exc})"]}
+            results.append(entry); failed += 1
+            print(f"ERROR {case['id']}: fixture resolves outside repository"); continue
         except OSError as exc:
             entry |= {"status": "error", "failures": [f"fixture not readable: {exc}"]}
             results.append(entry); failed += 1

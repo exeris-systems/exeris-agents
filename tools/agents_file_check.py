@@ -1442,7 +1442,10 @@ def check_closers(rep: Report, rel: str, schema, schema_path: str, roots):
                            f"that the closers are yours is this bundle's contract, in `BUNDLE.md`",
                       rule="schema")
     except Exception as exc:
-        # This check's own failure on one schema: unmeasured, not a verdict on the schema.
+        # This check's own failure on one schema: not a crash of the whole run (an error of the
+        # checker itself, which main()'s outer guard reports at the end), and not a finding against
+        # the repository either — a base carrying bad schema syntax, or an unhandled keyword, is
+        # this checker's limitation. Report what happened and move to the next schema.
         rep.warning(rel, f"not measured: composes over a bundle base and this check failed on it "
                          f"({type(exc).__name__}: {exc}), so whether it closes what the base "
                          f"leaves open is unknown", rule="schema")
@@ -1881,6 +1884,7 @@ def main():
 
 def run_checks(a, rep: Report) -> None:
     """Every check, in order, against the tree `main()` moved into."""
+    _PARSED.clear()
     manifest: dict = {}   # a repository with no .agents/ still runs every other check
 
     if not os.path.exists("AGENTS.md"):

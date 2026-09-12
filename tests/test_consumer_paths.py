@@ -577,6 +577,114 @@ def test_a_path_that_is_not_there_is_a_typo_not_a_base():
         shutil.rmtree(d)
 
 
+def test_a_case_schema_outside_checkout_fails_the_case_not_the_run():
+    """`expect.schema` resolving outside the repository fails that specific case rather than
+    aborting the whole run, matching the behavior of $ref resolution in validate()."""
+    d, composed, runner = grader_tree()
+    try:
+        write(os.path.join(d, ".agents", "evals", "scenarios.yaml"),
+              "version: 1\ndefaults:\n  schema_dir: ../schemas\n  fixture_dir: fixtures\n"
+              "cases:\n"
+              "  - id: escape-case\n    agent: a\n    prompt: p\n"
+              "    expect:\n      schema: ../../../../../../etc/passwd\n"
+              "  - id: valid-case\n    agent: a\n    prompt: p\n"
+              "    expect:\n      schema: verdict.schema.json\n")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report",
+                            os.path.join(d, "report.json"), "--scenarios",
+                            os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=d)
+        check("the escaping case fails without aborting the second case",
+              ("ERROR escape-case: expect.schema resolves outside repository" in p.stdout,
+               "ok    valid-case" in p.stdout), (True, True))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_case_fixture_outside_checkout_fails_the_case_not_the_run():
+    """`fixture` resolving outside the repository fails that specific case rather than
+    aborting the whole run via within_repo's SystemExit."""
+    d, composed, runner = grader_tree()
+    try:
+        write(os.path.join(d, ".agents", "evals", "scenarios.yaml"),
+              "version: 1\ndefaults:\n  schema_dir: ../schemas\n  fixture_dir: fixtures\n"
+              "cases:\n"
+              "  - id: escape-fixture\n    agent: a\n    prompt: p\n"
+              "    fixture: ../../../../../../etc/passwd\n"
+              "    expect:\n      schema: verdict.schema.json\n"
+              "  - id: valid-case\n    agent: a\n    prompt: p\n"
+              "    expect:\n      schema: verdict.schema.json\n")
+        p = subprocess.run([sys.executable, runner, "--dry-run", "--report",
+                            os.path.join(d, "report.json"), "--scenarios",
+                            os.path.join(".agents", "evals", "scenarios.yaml")],
+                           capture_output=True, text=True, cwd=d)
+        check("the escaping fixture fails without aborting the second case",
+              ("ERROR escape-fixture: fixture resolves outside repository" in p.stdout,
+               "ok    valid-case" in p.stdout), (True, True))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_filters_unevaluated_properties_artefacts():
+    """When a decision fails an enum or required field, unevaluatedProperties reports every field
+    as unexpected because the branch failed. The grader filters that artefact out without
+    masking genuine unexpected properties across multiple levels."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "evalrun_artefact_filter")
+        # Case 1: branch failure generates secondary artefact, which is filtered out
+        invalid_verdict = dict(VERDICT)
+        invalid_verdict["decision"] = "INVALID_DECISION"
+        out = mod.validate(invalid_verdict, composed)
+        check("the real failure is reported", any("INVALID_DECISION" in err for err in out), True)
+        check("the unevaluatedProperties artefact is filtered out",
+              any("Unevaluated properties are not allowed" in err for err in out), False)
+
+        # Case 2: two genuine unevaluatedProperties at different depths are NOT mutually suppressed
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                {"properties": {
+                    "agent": {"enum": ["fixture-reviewer"]},
+                    "checks_run": {
+                        "items": {"unevaluatedProperties": False}
+                    }
+                }}
+            ],
+            "unevaluatedProperties": False
+        }))
+        spurious_verdict = dict(VERDICT)
+        spurious_verdict["spurious_root"] = "extra"
+        spurious_verdict["checks_run"] = [{"check": "vale", "result": "pass", "spurious_check": 1}]
+        out2 = mod.validate(spurious_verdict, composed)
+        check("both root and nested unexpected properties are reported",
+              (any("spurious_root" in err for err in out2),
+               any("spurious_check" in err for err in out2)), (True, True))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_schema_cache_cleared_on_run_checks():
+    """`_PARSED` schema cache in tools/agents_file_check.py is cleared on run_checks()
+    to prevent cross-tree schema pollution during in-process runs."""
+    import argparse
+    mod = checker_module()
+    mod._PARSED["stale_key"] = {"dummy": "schema"}
+    d = tempfile.mkdtemp(prefix="cache-")
+    try:
+        write(os.path.join(d, "AGENTS.md"), "---\ntitle: T\ntype: reference\nstatus: active\n---\n# T\n")
+        rep = mod.Report("test")
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            mod.run_checks(argparse.Namespace(root=d, verbose=False, strict_adapters=False), rep)
+            check("stale schema cache was cleared", "stale_key" not in mod._PARSED, True)
+        finally:
+            os.chdir(old_cwd)
+    finally:
+        shutil.rmtree(d)
+
+
 def test_a_policy_nothing_composes_is_reported():
     """rule 5's unchecked direction. The forward one — a profile naming a policy that does not
     resolve — is an error. The reverse was invisible: on disk, in the manifest, composed by nobody.

@@ -50,7 +50,7 @@ rather than from reading.
 
 One consequence has nothing to do with what you write and everything to do with what you will read.
 When a decision fails validation for any reason — a missing `reason`, a `decision` outside the
-enum — the report will also carry a line like:
+enum — a raw Draft 2020-12 validator will also carry a line like:
 
     <root>: Unevaluated properties are not allowed ('agent', 'checks_run', 'decision', 'findings',
     'handoffs', 'scope_class' were unexpected)
@@ -58,7 +58,8 @@ enum — the report will also carry a line like:
 Those are your own required fields, and they are not the problem. A composition validates the
 decision through a `$ref` into the base; when anything inside that branch fails, the branch fails,
 and a failing subschema contributes no annotations — so the `unevaluatedProperties` above it sees
-nothing as evaluated and reports every property present. **Read the other errors first.** The
-unevaluated line disappears the moment the real failure is fixed, and a decision that validates
-never produces it.
+nothing as evaluated and reports every property present. The eval runner (`evals/run.py`) filters
+these secondary annotation artefacts out when underlying branch errors are present; when validating
+outside the runner, read the other errors first — the unevaluated line disappears the moment the real
+failure is fixed, and a decision that validates never produces it.
 
