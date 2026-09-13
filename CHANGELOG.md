@@ -62,9 +62,10 @@ number.
   branch fails, and a failing subschema contributes no annotations — so a Draft 2020-12
   `unevaluatedProperties` above it reports every property present. `<root>: Unevaluated properties are
   not allowed ('agent', 'checks_run', 'decision', …)` sits beside the real error in raw failure
-  reports; the eval runner (`evals/run.py`) filters these secondary annotation artefacts when
-  underlying branch errors exist, but outside that runner read the other errors first and it goes when
-  they do. `BUNDLE.md` says so where a consumer meets it.
+  reports; the eval runner (`evals/run.py`) filters these secondary annotation artefacts
+  corresponding to declared schema properties while preserving genuine unexpected properties, but
+  outside that runner read the other errors first and it goes when they do. `BUNDLE.md` says so
+  where a consumer meets it.
 - **The root closer can be added before the bump.** Over 1.4.0's closed base it changes no outcome:
   a conforming instance still validates and a foreign root property is still refused, by the base.
   An extension cannot be added early — 1.4.0's base refuses the added field, which is the whole
@@ -253,12 +254,19 @@ number.
 - **An `expect.schema` or `fixture` resolving outside the repository aborted the eval run.**
   `within_repo()` exits on an escape; for a CLI argument this is right, but when evaluating a scenario
   case naming a schema or fixture outside the checkout, raising `SystemExit` took the entire run with
-  it instead of recording that single case as an error. Caught and recorded per-case.
+  it instead of recording that single case as an error. It now raises `PathEscapeError`, caught per-case
+  and handled cleanly without in-band `SystemExit` control flow.
 - **The eval grader filtered no `unevaluatedProperties` artefacts.** When any property inside an
   instance failed, the enclosing `allOf` branch contributed no annotations, causing
-  `unevaluatedProperties` to report every property as unexpected. The grader now strips these
-  secondary annotation artefacts whenever underlying non-annotation errors are present, preventing
-  masking of parent unexpected properties while surfacing actionable failures directly.
+  `unevaluatedProperties` to report every property as unexpected. The grader now strips secondary
+  annotation artefacts corresponding to declared schema properties in active branches and matching
+  `patternProperties` across root and nested array/object paths when an underlying branch error is
+  present, while strictly refusing genuine unexpected properties from clean instances, inactive
+  conditional branches and absent dependent schemas.
+- **Conditional schema evaluation and fragment references lacked path-escape guards and strict RFC 6901 conformance.**
+  Conditional `if` references now validate against a sandboxed reference registry fail-closed, `file://` URIs
+  are checked against the repository root, `resolve_pointer()` decodes percent-encoding prior to `~1`/`~0`
+  unescaping per RFC 6901 §6, and `find_declared_props()` resolves both `$ref` and `$dynamicRef`.
 - **The checker's schema AST cache leaked between in-process runs.** Module-level `_PARSED` in
   `tools/agents_file_check.py` was never cleared on `run_checks()`, so consecutive invocations within
   a test or runner process re-used stale parsed schemas from earlier trees.

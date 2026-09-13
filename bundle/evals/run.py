@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -29,6 +30,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+class PathEscapeError(ValueError):
+    """A path resolving outside the repository checkout."""
 
 
 def repo_root(start: str) -> str:
@@ -154,6 +159,243 @@ def file_registry(schema_path: str):
     return Registry(retrieve=retrieve)
 
 
+UNEXPECTED_RE = re.compile(
+    r"Unevaluated properties are not allowed \((.*?) was unexpected\)|"
+    r"Unevaluated properties are not allowed \((.*?) were unexpected\)"
+)
+
+
+def resolve_pointer(doc: dict | list | None, pointer: str):
+    """Resolve a JSON Pointer fragment (e.g. '#/$defs/Name' or '/properties/foo') within `doc`."""
+    if doc is None:
+        return None
+    if pointer.startswith("#"):
+        pointer = pointer[1:]
+    if not pointer:
+        return doc
+    parts = pointer.split("/")
+    if parts[0] == "":
+        parts = parts[1:]
+    curr = doc
+    for part in parts:
+        part = unquote(part).replace("~1", "/").replace("~0", "~")
+        if isinstance(curr, dict):
+            curr = curr.get(part)
+        elif isinstance(curr, list) and part.isdigit():
+            idx = int(part)
+            if idx < len(curr):
+                curr = curr[idx]
+            else:
+                return None
+        else:
+            return None
+        if curr is None:
+            return None
+    return curr
+
+
+def check_if_match(
+    if_node: dict,
+    inst_node,
+    base_dir: str = "",
+    root_schema: dict | None = None,
+    registry=None,
+) -> bool:
+    """Whether `inst_node` satisfies the conditional `if` subschema."""
+    if not isinstance(inst_node, dict):
+        return False
+    if "$ref" in if_node and isinstance(if_node["$ref"], str):
+        ref = if_node["$ref"]
+        if ref.startswith("#") and root_schema:
+            resolved = resolve_pointer(root_schema, ref)
+            if isinstance(resolved, dict):
+                if_node = resolved
+        elif not ref.startswith("#") and base_dir:
+            file_part, fragment = ref.split("#", 1) if "#" in ref else (ref, "")
+            if file_part.startswith("file:"):
+                target = unquote(urlparse(file_part).path)
+            elif os.path.isabs(file_part):
+                target = file_part
+            else:
+                target = os.path.normpath(os.path.join(base_dir, file_part))
+            try:
+                target = within_repo(target, f"if $ref '{ref}'")
+                if target and os.path.exists(target):
+                    with open(target, encoding="utf-8") as fh:
+                        ext_doc = json.load(fh)
+                    resolved = resolve_pointer(ext_doc, "#" + fragment) if fragment else ext_doc
+                    if isinstance(resolved, dict):
+                        if_node = resolved
+            except PathEscapeError:
+                return False
+    try:
+        import jsonschema
+        validator = jsonschema.Draft202012Validator(if_node, registry=registry)
+        return bool(validator.is_valid(inst_node))
+    except ImportError:
+        pass
+    except Exception:
+        # If schema validation fails (e.g. unresolvable ref or path escape), fail-closed
+        return False
+
+    # Fallback only when jsonschema is not installed
+    if "$ref" in if_node:
+        return False
+    if_props = if_node.get("properties") or {}
+    for k, v in if_props.items():
+        if isinstance(v, dict):
+            if "const" in v and inst_node.get(k) != v["const"]:
+                return False
+            if "enum" in v and inst_node.get(k) not in v["enum"]:
+                return False
+            if "type" in v:
+                t = v["type"]
+                val = inst_node.get(k)
+                if t == "string" and not isinstance(val, str):
+                    return False
+                if t == "integer" and (isinstance(val, bool) or not isinstance(val, int)):
+                    return False
+                if t == "number" and (isinstance(val, bool) or not isinstance(val, (int, float))):
+                    return False
+                if t == "boolean" and not isinstance(val, bool):
+                    return False
+                if t == "array" and not isinstance(val, list):
+                    return False
+                if t == "object" and not isinstance(val, dict):
+                    return False
+    req = if_node.get("required") or []
+    if any(k not in inst_node for k in req):
+        return False
+    return True
+
+
+def find_declared_props(
+    schema_node: dict | None,
+    path: tuple,
+    base_dir: str,
+    root_schema: dict | None = None,
+    stack: tuple = (),
+    inst_node=None,
+    registry=None,
+) -> set[str]:
+    """Find property names declared by this schema node (and its allOf/$ref/conditional hierarchy) at `path`."""
+    if not isinstance(schema_node, dict):
+        return set()
+    if root_schema is None:
+        root_schema = schema_node
+
+    props = set()
+
+    for ref_key in ("$ref", "$dynamicRef"):
+        ref = schema_node.get(ref_key)
+        if isinstance(ref, str):
+            if "#" in ref:
+                file_part, fragment = ref.split("#", 1)
+                fragment = "#" + fragment
+            else:
+                file_part, fragment = ref, ""
+
+            if not file_part:
+                ref_id = (id(root_schema), fragment)
+                if ref_id not in stack:
+                    target_sch = resolve_pointer(root_schema, fragment)
+                    if isinstance(target_sch, dict):
+                        props.update(find_declared_props(target_sch, path, base_dir, root_schema, stack + (ref_id,), inst_node, registry=registry))
+            else:
+                if file_part.startswith("file:"):
+                    target = unquote(urlparse(file_part).path)
+                elif os.path.isabs(file_part):
+                    target = file_part
+                else:
+                    target = os.path.normpath(os.path.join(base_dir, file_part))
+                try:
+                    target = within_repo(target, f"{ref_key} '{ref}'")
+                except PathEscapeError:
+                    target = None
+
+                if target and os.path.exists(target):
+                    ref_id = (target, fragment)
+                    if ref_id not in stack:
+                        try:
+                            with open(target, encoding="utf-8") as fh:
+                                ext_doc = json.load(fh)
+                            target_sch = resolve_pointer(ext_doc, fragment) if fragment else ext_doc
+                            if isinstance(target_sch, dict):
+                                props.update(find_declared_props(target_sch, path, os.path.dirname(target), ext_doc, stack + (ref_id,), inst_node, registry=registry))
+                        except Exception:
+                            pass
+
+    if not path:
+        props.update((schema_node.get("properties") or {}).keys())
+        for pat, _ in (schema_node.get("patternProperties") or {}).items():
+            if isinstance(inst_node, dict):
+                for k in inst_node.keys():
+                    try:
+                        if re.search(pat, k):
+                            props.add(k)
+                    except re.error:
+                        pass
+        for b in (schema_node.get("allOf") or []):
+            props.update(find_declared_props(b, (), base_dir, root_schema, stack, inst_node, registry=registry))
+
+        for dep_key, dep in (schema_node.get("dependentSchemas") or {}).items():
+            if isinstance(dep, dict) and isinstance(inst_node, dict) and dep_key in inst_node:
+                props.update(find_declared_props(dep, (), base_dir, root_schema, stack, inst_node, registry=registry))
+
+        if_node = schema_node.get("if")
+        then_b = schema_node.get("then")
+        else_b = schema_node.get("else")
+        if isinstance(if_node, dict) and isinstance(inst_node, dict):
+            if check_if_match(if_node, inst_node, base_dir, root_schema, registry=registry):
+                if isinstance(then_b, dict):
+                    props.update(find_declared_props(then_b, (), base_dir, root_schema, stack, inst_node, registry=registry))
+            else:
+                if isinstance(else_b, dict):
+                    props.update(find_declared_props(else_b, (), base_dir, root_schema, stack, inst_node, registry=registry))
+        return props
+
+    step, rest = path[0], path[1:]
+    for b in (schema_node.get("allOf") or []):
+        props.update(find_declared_props(b, path, base_dir, root_schema, stack, inst_node, registry=registry))
+
+    for dep_key, dep in (schema_node.get("dependentSchemas") or {}).items():
+        if isinstance(dep, dict) and isinstance(inst_node, dict) and dep_key in inst_node:
+            props.update(find_declared_props(dep, path, base_dir, root_schema, stack, inst_node, registry=registry))
+
+    if_node = schema_node.get("if")
+    then_b = schema_node.get("then")
+    else_b = schema_node.get("else")
+    if isinstance(if_node, dict) and isinstance(inst_node, dict):
+        if check_if_match(if_node, inst_node, base_dir, root_schema, registry=registry):
+            if isinstance(then_b, dict):
+                props.update(find_declared_props(then_b, path, base_dir, root_schema, stack, inst_node, registry=registry))
+        else:
+            if isinstance(else_b, dict):
+                props.update(find_declared_props(else_b, path, base_dir, root_schema, stack, inst_node, registry=registry))
+
+    if isinstance(step, str):
+        sub = (schema_node.get("properties") or {}).get(step)
+        if isinstance(sub, dict):
+            next_inst = inst_node.get(step) if isinstance(inst_node, dict) else None
+            props.update(find_declared_props(sub, rest, base_dir, root_schema, stack, next_inst, registry=registry))
+        for pat, pat_sch in (schema_node.get("patternProperties") or {}).items():
+            try:
+                if re.search(pat, step) and isinstance(pat_sch, dict):
+                    next_inst = inst_node.get(step) if isinstance(inst_node, dict) else None
+                    props.update(find_declared_props(pat_sch, rest, base_dir, root_schema, stack, next_inst, registry=registry))
+            except re.error:
+                pass
+    elif isinstance(step, int):
+        next_inst = inst_node[step] if isinstance(inst_node, list) and 0 <= step < len(inst_node) else None
+        items = schema_node.get("items")
+        if isinstance(items, dict):
+            props.update(find_declared_props(items, rest, base_dir, root_schema, stack, next_inst, registry=registry))
+        prefix = schema_node.get("prefixItems") or []
+        if isinstance(prefix, list) and step < len(prefix):
+            props.update(find_declared_props(prefix[step], rest, base_dir, root_schema, stack, next_inst, registry=registry))
+    return props
+
+
 def validate(instance, schema_path: str) -> list[str]:
     """Schema conformance. Falls back to a shallow required-keys check when jsonschema is absent,
     and says which it did — a grader that silently weakens is worse than one that is missing."""
@@ -217,21 +459,46 @@ def validate(instance, schema_path: str) -> list[str]:
     # sends its reader to the wrong file.
     try:
         errors = list(v.iter_errors(instance))
-        real_errors = [e for e in errors if not (
-            e.validator in ("unevaluatedProperties", "unevaluatedItems") and
-            any(o is not e and
-                o.validator not in ("unevaluatedProperties", "unevaluatedItems") and
-                tuple(o.absolute_path)[:len(e.absolute_path)] == tuple(e.absolute_path)
-                for o in errors)
-        )] or errors
-        return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
-                for e in real_errors]
-    except SystemExit as exc:
-        # `within_repo()` refuses by exiting: right for a CLI argument read once at startup, fatal
-        # here, where `except Exception` does not catch it and the run dies mid-case.
-        return [f"cannot validate {name}: a `$ref` resolved outside the repository and was refused "
-                f"({exc}). Paths are repository-relative by design"]
+        base_dir = os.path.dirname(os.path.abspath(schema_path))
+        result = []
+        for e in errors:
+            path = tuple(e.path)
+            if e.validator == "unevaluatedProperties":
+                # An unevaluatedProperties error is an annotation artefact ONLY if
+                # an underlying branch error on this path failed to produce annotations.
+                has_branch_failure = any(
+                    o.validator not in ("unevaluatedProperties", "unevaluatedItems")
+                    for o in errors
+                )
+                if has_branch_failure:
+                    m = UNEXPECTED_RE.match(e.message)
+                    if m:
+                        raw = m.group(1) or m.group(2)
+                        unexpected = re.findall(r"'([^']*)'", raw) or [p.strip().strip("'\"") for p in raw.split(",")]
+                        declared = find_declared_props(schema, path, base_dir, inst_node=instance, registry=registry)
+                        genuine = [p for p in unexpected if p not in declared]
+                        if not genuine:
+                            # Pure annotation artefact from a failed allOf/ref branch: drop it
+                            continue
+                        if len(genuine) == 1:
+                            msg = f"Unevaluated properties are not allowed ('{genuine[0]}' was unexpected)"
+                        else:
+                            quoted = ", ".join(f"'{g}'" for g in sorted(genuine))
+                            msg = f"Unevaluated properties are not allowed ({quoted} were unexpected)"
+                        result.append((path, msg))
+                        continue
+            result.append((path, e.message))
+        return [f"{'/'.join(str(p) for p in path) or '<root>'}: {msg}" for path, msg in result]
     except Exception as exc:
+        escape_cause = exc if isinstance(exc, PathEscapeError) else None
+        curr = exc
+        while not escape_cause and curr:
+            curr = getattr(curr, "_wrapped", None) or getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+            if isinstance(curr, PathEscapeError):
+                escape_cause = curr
+        if escape_cause:
+            return [f"cannot validate {name}: a `$ref` resolved outside the repository and was refused "
+                    f"({escape_cause}). Paths are repository-relative by design"]
         if isinstance(exc, unresolvable()):
             return [f"cannot validate {name}: a `$ref` did not resolve ({exc}). A vendored base is "
                     f"a file on disk, so this is a path that is not there"]
@@ -332,8 +599,8 @@ def within_repo(path: str, what: str) -> str:
     resolved = os.path.realpath(path)
     root = os.path.realpath(REPO)
     if resolved != root and not resolved.startswith(root + os.sep):
-        sys.exit(f"eval-run: {what} resolves outside the repository ({resolved}); "
-                 f"paths are repository-relative by design")
+        raise PathEscapeError(f"eval-run: {what} resolves outside the repository ({resolved}); "
+                              f"paths are repository-relative by design")
     return resolved
 
 
@@ -366,21 +633,24 @@ def main() -> int:
     # parsed the file — so the one CLI-controlled read the guard exists for still happened, and a
     # path outside the checkout produced a YAML parse error or a raw FileNotFoundError rather than
     # the refusal. A guard that runs after the sink is a comment.
-    scenarios = within_repo(a.scenarios, "--scenarios")
-    report_path = within_repo(a.report, "--report")
+    try:
+        scenarios = within_repo(a.scenarios, "--scenarios")
+        report_path = within_repo(a.report, "--report")
 
-    cfg = load_yaml(scenarios)
-    defaults = cfg.get("defaults") or {}
-    # Relative to the SCENARIOS FILE, not to this script. The two were the same only while the
-    # runner lived at `.agents/evals/` — vendored, it sits at `.agents/vendor/<bundle>-<v>/evals/`,
-    # so `../schemas` resolved to the bundle's BASE schemas and `fixtures` to a directory the
-    # vendored tree does not have. Every case then failed to resolve, in every consumer, with the
-    # documented defaults. The same trap the dispatcher and repo_root() above were written for.
-    base = os.path.dirname(scenarios)
-    schema_dir = within_repo(os.path.join(base, defaults.get("schema_dir", "../schemas")),
-                             "defaults.schema_dir")
-    fixture_dir = within_repo(os.path.join(base, defaults.get("fixture_dir", "fixtures")),
-                              "defaults.fixture_dir")
+        cfg = load_yaml(scenarios)
+        defaults = cfg.get("defaults") or {}
+        # Relative to the SCENARIOS FILE, not to this script. The two were the same only while the
+        # runner lived at `.agents/evals/` — vendored, it sits at `.agents/vendor/<bundle>-<v>/evals/`,
+        # so `../schemas` resolved to the bundle's BASE schemas and `fixtures` to a directory the
+        # vendored tree does not have. Every case then failed to resolve, in every consumer, with the
+        # documented defaults. The same trap the dispatcher and repo_root() above were written for.
+        base = os.path.dirname(scenarios)
+        schema_dir = within_repo(os.path.join(base, defaults.get("schema_dir", "../schemas")),
+                                 "defaults.schema_dir")
+        fixture_dir = within_repo(os.path.join(base, defaults.get("fixture_dir", "fixtures")),
+                                  "defaults.fixture_dir")
+    except PathEscapeError as exc:
+        sys.exit(str(exc))
 
     cases = cfg.get("cases") or []
     if a.case:
@@ -409,7 +679,7 @@ def main() -> int:
         try:
             schema_path = within_repo(os.path.join(schema_dir, named),
                                       f"case '{case['id']}' expect.schema")
-        except SystemExit as exc:
+        except PathEscapeError as exc:
             entry |= {"status": "error", "failures": [f"expect.schema resolves outside repository: {named} ({exc})"]}
             results.append(entry); failed += 1
             print(f"ERROR {case['id']}: expect.schema resolves outside repository"); continue
@@ -417,7 +687,7 @@ def main() -> int:
         # build_prompt and abort the whole run, so one typo in one case hid every later result.
         try:
             prompt = build_prompt(case, fixture_dir)
-        except SystemExit as exc:
+        except PathEscapeError as exc:
             entry |= {"status": "error", "failures": [f"fixture resolves outside repository: {case.get('fixture')} ({exc})"]}
             results.append(entry); failed += 1
             print(f"ERROR {case['id']}: fixture resolves outside repository"); continue

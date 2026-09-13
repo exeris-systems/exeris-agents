@@ -660,8 +660,689 @@ def test_eval_grader_filters_unevaluated_properties_artefacts():
         check("both root and nested unexpected properties are reported",
               (any("spurious_root" in err for err in out2),
                any("spurious_check" in err for err in out2)), (True, True))
+
+        # Case 3: mixed branch error and genuine unexpected property.
+        # A branch failure must not mask genuine unexpected properties, nor leak declared artefacts.
+        broken_and_spurious = dict(VERDICT)
+        broken_and_spurious["decision"] = "INVALID_DECISION"
+        broken_and_spurious["spurious_root"] = "extra"
+        out3 = mod.validate(broken_and_spurious, composed)
+        check("the branch error is reported", any("INVALID_DECISION" in err for err in out3), True)
+        check("the genuine unexpected root property is reported despite branch failure",
+              any("spurious_root" in err for err in out3), True)
+        check("declared properties in checks_run are not reported as unevaluated artefacts",
+              any("checks_run/0" in err and "'check'" in err for err in out3), False)
     finally:
         shutil.rmtree(d)
+
+
+def test_within_repo_raises_path_escape_error_not_system_exit():
+    """`within_repo()` raises a specific `PathEscapeError` instead of invoking `sys.exit()` directly,
+    ensuring clean domain error handling across layer boundaries."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_escape_error")
+        check("PathEscapeError is defined on runner module", hasattr(mod, "PathEscapeError"), True)
+        raised_escape = False
+        esc_cls = getattr(mod, "PathEscapeError", ())
+        try:
+            mod.within_repo("../../../../../../etc/passwd", "test probe")
+        except esc_cls:
+            raised_escape = True
+        except SystemExit:
+            raised_escape = False
+        check("within_repo raises PathEscapeError instead of SystemExit", raised_escape, True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_find_declared_props_handles_internal_defs():
+    """`find_declared_props()` resolves internal `$defs` / JSON pointers, so that schemas using
+    `#/$defs/...` (such as handoff.base.schema.json) do not leak declared properties as
+    spurious unevaluatedProperties artefacts on branch failure."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_defs")
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "CheckDetail": {
+                    "type": "object",
+                    "properties": {
+                        "check": {"type": "string"},
+                        "result": {"enum": ["pass", "fail"]},
+                        "detail_text": {"type": "string"}
+                    },
+                    "unevaluatedProperties": False
+                }
+            },
+            "allOf": [
+                {"$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                {"properties": {
+                    "agent": {"enum": ["fixture-reviewer"]},
+                    "checks_run": {
+                        "items": {"$ref": "#/$defs/CheckDetail"}
+                    }
+                }}
+            ],
+            "unevaluatedProperties": False
+        }))
+        # Case A: branch error on root ('INVALID_DECISION') with valid checks_run using $defs
+        inst_a = dict(VERDICT)
+        inst_a["decision"] = "INVALID_DECISION"
+        inst_a["checks_run"] = [{"check": "vale", "result": "pass", "detail_text": "clean"}]
+        out_a = mod.validate(inst_a, composed)
+        check("branch error is reported", any("INVALID_DECISION" in err for err in out_a), True)
+        check("declared properties in $defs are NOT reported as unexpected artefacts",
+              any("detail_text" in err for err in out_a), False)
+        check("checks_run/0 is clean of unevaluated artefacts",
+              any("checks_run/0" in err for err in out_a), False)
+
+        # Case B: branch error + genuine unexpected property inside checks_run[0]
+        inst_b = dict(VERDICT)
+        inst_b["decision"] = "INVALID_DECISION"
+        inst_b["checks_run"] = [{"check": "vale", "result": "pass", "detail_text": "clean", "rogue_check_field": 123}]
+        out_b = mod.validate(inst_b, composed)
+        check("genuine rogue property inside $defs is reported",
+              any("rogue_check_field" in err for err in out_b), True)
+        check("declared detail_text is still not reported as unexpected",
+              any("detail_text" in err for err in out_b), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_find_declared_props_external_file_with_fragment():
+    """`find_declared_props()` resolves external schema references with URI fragments
+    (e.g., `file.json#/$defs/Name`), correctly traversing both the file and the inner pointer."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_ext_fragment")
+        helper_path = os.path.join(d, ".agents", "schemas", "helpers.json")
+        write(helper_path, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "AuditInfo": {
+                    "type": "object",
+                    "properties": {
+                        "auditor": {"type": "string"},
+                        "stamp": {"type": "string"}
+                    },
+                    "unevaluatedProperties": False
+                }
+            }
+        }))
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                {"properties": {
+                    "agent": {"enum": ["fixture-reviewer"]},
+                    "audit": {"$ref": "helpers.json#/$defs/AuditInfo"}
+                }}
+            ],
+            "unevaluatedProperties": False
+        }))
+        inst = dict(VERDICT)
+        inst["decision"] = "INVALID_DECISION"
+        inst["audit"] = {"auditor": "bot", "stamp": "2026-09-13", "spurious_audit_field": 42}
+        out = mod.validate(inst, composed)
+        check("branch error reported", any("INVALID_DECISION" in err for err in out), True)
+        check("spurious audit field reported", any("spurious_audit_field" in err for err in out), True)
+        check("declared auditor field from external fragment is not reported",
+              any("'auditor'" in err for err in out), False)
+        check("declared stamp field from external fragment is not reported",
+              any("'stamp'" in err for err in out), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_find_declared_props_refuses_escaping_ref():
+    """`find_declared_props()` must never read outside the repository when encountering
+    an escaping `$ref`."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_escape_introspect")
+        escaping_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"$ref": "../../../../../../etc/passwd"},
+                {"properties": {"safe_field": {"type": "string"}}}
+            ]
+        }
+        # find_declared_props should not crash and must not access files outside the repo
+        props = mod.find_declared_props(escaping_schema, (), os.path.dirname(composed))
+        check("safe field within schema is found", "safe_field" in props, True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_diamond_and_circular_ref_handling():
+    """`find_declared_props()` properly handles diamond `$ref` dependencies without
+    prematurely suppressing subsequent lookups, and safely terminates on circular references."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_diamond_circular")
+        shared_path = os.path.join(d, ".agents", "schemas", "shared.json")
+        write(shared_path, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"shared_key": {"type": "string"}}
+        }))
+        diamond_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"properties": {"first": {"$ref": "shared.json"}}},
+                {"properties": {"second": {"$ref": "shared.json"}}}
+            ]
+        }
+        props_first = mod.find_declared_props(diamond_schema, ("first",), os.path.dirname(composed))
+        props_second = mod.find_declared_props(diamond_schema, ("second",), os.path.dirname(composed))
+        check("first branch finds shared_key", "shared_key" in props_first, True)
+        check("second branch finds shared_key (no diamond suppression)", "shared_key" in props_second, True)
+
+        # Circular ref
+        circ_a = os.path.join(d, ".agents", "schemas", "circ_a.json")
+        circ_b = os.path.join(d, ".agents", "schemas", "circ_b.json")
+        write(circ_a, json.dumps({"$ref": "circ_b.json", "properties": {"a_prop": {"type": "string"}}}))
+        write(circ_b, json.dumps({"$ref": "circ_a.json", "properties": {"b_prop": {"type": "string"}}}))
+        circ_props = mod.find_declared_props({"$ref": "circ_a.json"}, (), os.path.dirname(composed))
+        check("circular refs terminate and collect properties",
+              ("a_prop" in circ_props, "b_prop" in circ_props), (True, True))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_refuses_rogue_properties_in_oneof_and_anyof():
+    """`validate()` must never silence rogue properties from alternative `oneOf` or `anyOf`
+    branches under `unevaluatedProperties: false`."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_oneof_anyof")
+        poly_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "oneOf": [
+                {"properties": {"type": {"const": "A"}, "variant_a": {"type": "string"}}, "required": ["type", "variant_a"]},
+                {"properties": {"type": {"const": "B"}, "variant_b": {"type": "number"}}, "required": ["type", "variant_b"]}
+            ],
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(poly_schema))
+        # Variant A instance with rogue field from Variant B
+        out = mod.validate({"type": "A", "variant_a": "valid", "variant_b": 123}, composed)
+        check("rogue property from alternative oneOf branch is refused",
+              any("variant_b" in err for err in out), True)
+
+        # anyOf schema
+        anyof_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+                {"properties": {"type": {"const": "base"}, "core": {"type": "string"}}, "required": ["type", "core"]},
+                {"properties": {"type": {"const": "extra"}, "extra_feature": {"type": "boolean"}}, "required": ["type", "extra_feature"]}
+            ],
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(anyof_schema))
+        out_any = mod.validate({"type": "base", "core": "ok", "extra_feature": True}, composed)
+        check("rogue property from unsatisfied anyOf branch is refused",
+              any("extra_feature" in err for err in out_any), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_recognizes_conditional_then_else_and_dependent_properties():
+    """`find_declared_props()` traverses active `then`, `else` and `dependentSchemas` so that properties
+    declared in active conditional branches are recognized as declared and not flagged as unevaluated artefacts,
+    while properties from inactive branches remain strictly refused."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_conditional_props")
+        cond_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                {
+                    "if": {"properties": {"decision": {"const": "CONDITIONAL"}}},
+                    "then": {"properties": {"conditional_note": {"type": "string"}}},
+                    "else": {"properties": {"unconditional_stamp": {"type": "string"}}}
+                },
+                {
+                    "dependentSchemas": {
+                        "scope_class": {"properties": {"scope_detail": {"type": "string"}}}
+                    }
+                }
+            ],
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(cond_schema))
+
+        # Case 1: decision is CONDITIONAL with branch failure on root ('agent' invalid).
+        # 'then' is active -> conditional_note is declared and not reported as unevaluated artefact.
+        # scope_class is present -> scope_detail is declared and not reported.
+        # unconditional_stamp from inactive 'else' is rogue and MUST be reported.
+        inst_cond = dict(VERDICT)
+        inst_cond["agent"] = "INVALID_AGENT"
+        inst_cond["decision"] = "CONDITIONAL"
+        inst_cond["conditional_note"] = "pending fix"
+        inst_cond["unconditional_stamp"] = "2026-09-13"
+        inst_cond["scope_detail"] = "deep"
+        out_cond = mod.validate(inst_cond, composed)
+        check("branch failure is reported", any("INVALID_AGENT" in err for err in out_cond), True)
+        check("declared conditional_note from active 'then' is not reported as unevaluated artefact",
+              any("conditional_note" in err for err in out_cond), False)
+        check("declared scope_detail from active 'dependentSchemas' is not reported as unevaluated artefact",
+              any("scope_detail" in err for err in out_cond), False)
+        check("rogue unconditional_stamp from inactive 'else' is reported as unexpected",
+              any("unconditional_stamp" in err for err in out_cond), True)
+
+        # Case 2: decision is PASS with branch failure on root ('agent' invalid).
+        # 'else' is active -> unconditional_stamp is declared.
+        # conditional_note from inactive 'then' is rogue and MUST be reported.
+        inst_pass = dict(VERDICT)
+        inst_pass["agent"] = "INVALID_AGENT"
+        inst_pass["decision"] = "PASS"
+        inst_pass["conditional_note"] = "pending fix"
+        inst_pass["unconditional_stamp"] = "2026-09-13"
+        inst_pass["scope_detail"] = "deep"
+        out_pass = mod.validate(inst_pass, composed)
+        check("branch failure is reported on PASS case", any("INVALID_AGENT" in err for err in out_pass), True)
+        check("declared unconditional_stamp from active 'else' is not reported as unevaluated artefact",
+              any("unconditional_stamp" in err for err in out_pass), False)
+        check("rogue conditional_note from inactive 'then' is reported as unexpected",
+              any("conditional_note" in err for err in out_pass), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_resolve_pointer_rfc6901_percent_encoded_tilde():
+    """`resolve_pointer()` conforms to RFC 6901 §6 by evaluating percent-encoding before unescaping ~1 and ~0."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_percent_tilde")
+        doc = {
+            "$defs": {
+                "slash/key": {"properties": {"val1": {"type": "string"}}},
+                "tilde~key": {"properties": {"val2": {"type": "string"}}}
+            }
+        }
+        res_slash = mod.resolve_pointer(doc, "#/$defs/slash%7E1key")
+        check("percent-encoded tilde with 1 (%7E1) resolves to slash",
+              isinstance(res_slash, dict) and "val1" in res_slash.get("properties", {}), True)
+        res_tilde = mod.resolve_pointer(doc, "#/$defs/tilde%7E0key")
+        check("percent-encoded tilde with 0 (%7E0) resolves to tilde",
+              isinstance(res_tilde, dict) and "val2" in res_tilde.get("properties", {}), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_dynamic_ref_declared_props():
+    """`find_declared_props()` resolves `$dynamicRef` references just like `$ref`, preventing
+    declared properties from leaking as unevaluated artefacts on branch failure."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_dynamic_ref")
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"$dynamicRef": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json"},
+                {"properties": {"agent": {"enum": ["fixture-reviewer"]}}}
+            ],
+            "unevaluatedProperties": False
+        }))
+        inst = dict(VERDICT)
+        inst["decision"] = "INVALID_DECISION"
+        out = mod.validate(inst, composed)
+        check("branch failure is reported", any("INVALID_DECISION" in err for err in out), True)
+        check("declared properties in $dynamicRef base are not reported as unevaluated artefacts",
+              any("'checks_run'" in err or "'decision'" in err or "'findings'" in err for err in out if "Unevaluated" in err), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_refuses_rogue_property_in_inactive_conditional_then_else():
+    """Rogue properties from inactive conditional branches (e.g. 'then' when condition is false,
+    or 'else' when condition is true) are strictly refused by unevaluatedProperties."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_rogue_conditional")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [
+                {"properties": {"type": {"enum": ["admin", "guest"]}}, "required": ["type"]},
+                {
+                    "if": {"properties": {"type": {"const": "admin"}}},
+                    "then": {"properties": {"admin_token": {"type": "string"}}},
+                    "else": {"properties": {"guest_id": {"type": "string"}}}
+                }
+            ],
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # Case A: type=guest with illegal admin_token (no other error) -> must be refused!
+        out_a = mod.validate({"type": "guest", "guest_id": "123", "admin_token": "rogue"}, composed)
+        check("rogue admin_token on guest is refused when clean",
+              any("admin_token" in err for err in out_a), True)
+
+        # Case B: type=guest with illegal admin_token AND type error on guest_id (int instead of str)
+        out_b = mod.validate({"type": "guest", "guest_id": 999, "admin_token": "rogue"}, composed)
+        check("guest_id type error is reported", any("guest_id" in err for err in out_b), True)
+        check("rogue admin_token on guest is refused even with branch failure",
+              any("admin_token" in err for err in out_b), True)
+
+        # Case C: type=admin with illegal guest_id -> must be refused!
+        out_c = mod.validate({"type": "admin", "admin_token": "token123", "guest_id": "rogue"}, composed)
+        check("rogue guest_id on admin is refused when clean",
+              any("guest_id" in err for err in out_c), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_refuses_rogue_property_in_inactive_dependent_schemas():
+    """Properties from dependentSchemas are strictly refused when the triggering property is absent."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_rogue_dependent")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"kind": {"type": "string"}, "credit_card": {"type": "string"}},
+            "dependentSchemas": {
+                "credit_card": {
+                    "properties": {"billing_address": {"type": "string"}}
+                }
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # Case A: clean instance without credit_card, but carries billing_address -> refused!
+        out_a = mod.validate({"kind": "cash", "billing_address": "nowhere"}, composed)
+        check("rogue billing_address without trigger is refused when clean",
+              any("billing_address" in err for err in out_a), True)
+
+        # Case B: branch error (kind is int) + billing_address -> both refused!
+        out_b = mod.validate({"kind": 123, "billing_address": "nowhere"}, composed)
+        check("kind type error is reported", any("kind" in err for err in out_b), True)
+        check("rogue billing_address without trigger is refused with branch failure",
+              any("billing_address" in err for err in out_b), True)
+
+        # Case C: valid trigger present -> billing_address is allowed
+        out_c = mod.validate({"kind": "card", "credit_card": "1234", "billing_address": "Main St"}, composed)
+        check("valid dependent property with trigger validates clean", out_c, [])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_internal_defs_same_dir_no_collision():
+    """`find_declared_props()` does not falsely treat identical def names in separate files in the same
+    directory as circular references."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_same_dir_defs")
+        schemas_dir = os.path.dirname(composed)
+        file_a = os.path.join(schemas_dir, "part_a.json")
+        file_b = os.path.join(schemas_dir, "part_b.json")
+        write(file_a, json.dumps({
+            "$defs": {"Common": {"allOf": [{"properties": {"field_a": {"type": "string"}}}, {"$ref": "part_b.json"}]}},
+            "$ref": "#/$defs/Common"
+        }))
+        write(file_b, json.dumps({
+            "$defs": {"Common": {"properties": {"field_b": {"type": "string"}}}},
+            "$ref": "#/$defs/Common"
+        }))
+        props = mod.find_declared_props({"$ref": "part_a.json"}, (), schemas_dir)
+        check("both field_a and field_b resolved without collision",
+              ("field_a" in props, "field_b" in props), (True, True))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_resolve_pointer_handles_percent_encoded_fragments():
+    """`resolve_pointer()` conforms to RFC 6901 §6 by unescaping percent-encoded characters in URI fragments."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_percent_encoded")
+        doc = {
+            "$defs": {
+                "Special Key": {"properties": {"spaced_prop": {"type": "string"}}},
+                "Slash/Key": {"properties": {"slashed_prop": {"type": "string"}}}
+            }
+        }
+        res_space = mod.resolve_pointer(doc, "#/$defs/Special%20Key")
+        check("percent-encoded space is unescaped", isinstance(res_space, dict) and "spaced_prop" in res_space.get("properties", {}), True)
+        res_slash = mod.resolve_pointer(doc, "#/$defs/Slash~1Key")
+        check("escaped slash ~1 is unescaped", isinstance(res_slash, dict) and "slashed_prop" in res_slash.get("properties", {}), True)
+    finally:
+        shutil.rmtree(d)
+
+
+
+def test_eval_grader_property_names_with_commas_and_special_chars():
+    """Rogue properties containing commas or special characters are preserved accurately
+    without being split into spurious tokens."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_special_chars")
+        inst = dict(VERDICT)
+        inst["decision"] = "INVALID_DECISION"
+        inst["bad,prop,name"] = "test"
+        out = mod.validate(inst, composed)
+        check("branch failure is reported", any("INVALID_DECISION" in err for err in out), True)
+        check("rogue property with commas is reported whole",
+              any("'bad,prop,name'" in err for err in out), True)
+        check("rogue property was not split into fragments",
+              any("'name'" in err for err in out), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_within_repo_and_validate_path_escape_integration():
+    """`validate()` gracefully intercepts `PathEscapeError` caused by relative or `file:` `$ref`s
+    resolving outside the repository, and symlinks escaping the checkout are refused."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_escape_integ")
+        # Relative escape in $ref
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": "../../../../../../etc/passwd"}]
+        }))
+        out_rel = mod.validate(VERDICT, composed)
+        check("relative escaping $ref produces clean refusal message",
+              bool(out_rel) and "resolved outside the repository and was refused" in out_rel[0], True)
+
+        # file:// escape in $ref
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "allOf": [{"$ref": "file:///etc/passwd"}]
+        }))
+        out_file = mod.validate(VERDICT, composed)
+        check("file:// escaping $ref produces clean refusal message",
+              bool(out_file) and "resolved outside the repository and was refused" in out_file[0], True)
+
+        # Symlink escaping the checkout
+        symlink_path = os.path.join(d, "escape_link")
+        try:
+            os.symlink("/etc", symlink_path)
+            raised_symlink = False
+            try:
+                mod.within_repo(symlink_path, "symlink escape probe")
+            except mod.PathEscapeError:
+                raised_symlink = True
+            check("within_repo refuses escaping symlink", raised_symlink, True)
+        except OSError:
+            pass  # Filesystem doesn't permit symlinks
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_nested_conditional_properties_recognized():
+    """`find_declared_props()` properly passes instance context down nested paths so that
+    conditional then/else properties and dependentSchemas inside array items or nested objects
+    are recognized as declared rather than leaked as unevaluated artefacts on branch failure."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_nested_cond")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "items_list": {
+                    "type": "array",
+                    "items": {
+                        "properties": {"type": {"type": "string"}, "status": {"type": "string"}},
+                        "required": ["type"],
+                        "if": {"properties": {"type": {"const": "audit"}}, "required": ["type"]},
+                        "then": {"properties": {"auditor": {"type": "string"}}},
+                        "else": {"properties": {"guest_token": {"type": "string"}}},
+                        "dependentSchemas": {
+                            "auditor": {"properties": {"stamp": {"type": "string"}}}
+                        },
+                        "unevaluatedProperties": False
+                    }
+                }
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # Case A: type=audit (active then), auditor present (active dependentSchema for stamp),
+        # with branch type error on status (int instead of str).
+        # Both auditor and stamp must be recognized as declared and NOT reported as unevaluated!
+        inst_a = {
+            "items_list": [
+                {"type": "audit", "status": 999, "auditor": "Alice", "stamp": "2026-09-14"}
+            ]
+        }
+        out_a = mod.validate(inst_a, composed)
+        check("nested branch error (status type) is reported", any("status" in err for err in out_a), True)
+        check("declared auditor from nested active 'then' is not reported as unevaluated artefact",
+              any("auditor" in err for err in out_a), False)
+        check("declared stamp from nested active dependentSchema is not reported as unevaluated artefact",
+              any("stamp" in err for err in out_a), False)
+
+        # Case B: type=audit with rogue guest_token from inactive 'else'
+        inst_b = {
+            "items_list": [
+                {"type": "audit", "status": 999, "auditor": "Alice", "guest_token": "rogue"}
+            ]
+        }
+        out_b = mod.validate(inst_b, composed)
+        check("rogue guest_token from inactive else is refused", any("guest_token" in err for err in out_b), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_root_condition_with_nested_path():
+    """`find_declared_props()` correctly evaluates root conditionals against the root instance
+    when evaluating nested paths (such as array items), rather than testing root conditions
+    against the child node."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_root_cond_nested")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"env": {"type": "string"}},
+            "if": {"properties": {"env": {"const": "prod"}}, "required": ["env"]},
+            "then": {
+                "properties": {
+                    "audit_trail": {
+                        "type": "array",
+                        "items": {
+                            "properties": {"action": {"type": "string"}, "code": {"type": "integer"}},
+                            "unevaluatedProperties": False
+                        }
+                    }
+                }
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # Root instance has env=prod, audit_trail[0] has branch error on 'code' (str instead of int)
+        # and genuine rogue 'rogue_metric'.
+        # 'action' declared in then must be recognized as declared!
+        inst = {
+            "env": "prod",
+            "audit_trail": [{"action": "login", "code": "bad_code", "rogue_metric": 42}]
+        }
+        out = mod.validate(inst, composed)
+        check("nested code branch error is reported", any("code" in err for err in out), True)
+        check("declared action under root condition is not reported as unevaluated artefact",
+              any("action" in err for err in out), False)
+        check("genuine rogue_metric in nested item is refused",
+              any("rogue_metric" in err for err in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_pattern_properties_recognized():
+    """`find_declared_props()` recognizes properties evaluated by `patternProperties`
+    so that matching properties are not flagged as unevaluated artefacts on branch failure,
+    while non-matching properties remain strictly refused."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_pattern_props")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"base_id": {"type": "string"}},
+            "patternProperties": {
+                "^x-custom-[a-z]+$": {"type": "string"}
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # Case A: valid pattern property + branch failure on base_id (int instead of str)
+        inst_a = {"base_id": 123, "x-custom-metric": "ok"}
+        out_a = mod.validate(inst_a, composed)
+        check("base_id branch failure is reported", any("base_id" in err for err in out_a), True)
+        check("pattern property x-custom-metric is not reported as unevaluated artefact",
+              any("x-custom-metric" in err for err in out_a), False)
+
+        # Case B: non-matching property -> refused!
+        inst_b = {"base_id": 123, "not_custom": "rogue"}
+        out_b = mod.validate(inst_b, composed)
+        check("non-matching property is reported as unexpected", any("not_custom" in err for err in out_b), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_eval_grader_branch_failure_strictly_scoped_to_path():
+    """`has_branch_failure` is strictly scoped to the evaluated path, so that a branch failure
+    in one object does not treat genuine unexpected properties in another object as artefacts."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_branch_scope")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "group_a": {
+                    "type": "object",
+                    "properties": {"req_str": {"type": "string"}},
+                    "unevaluatedProperties": False
+                },
+                "group_b": {
+                    "type": "object",
+                    "properties": {"valid_num": {"type": "number"}},
+                    "unevaluatedProperties": False
+                }
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # group_a has branch failure (req_str is int).
+        # group_b has NO branch failure, but has unexpected property 'spurious_b'.
+        # spurious_b in group_b must be reported!
+        inst = {
+            "group_a": {"req_str": 999},
+            "group_b": {"valid_num": 10, "spurious_b": "rogue"}
+        }
+        out = mod.validate(inst, composed)
+        check("group_a branch error is reported", any("group_a" in err and "req_str" in err for err in out), True)
+        check("spurious_b in group_b is reported", any("group_b" in err and "spurious_b" in err for err in out), True)
+    finally:
+        shutil.rmtree(d)
+
 
 
 def test_schema_cache_cleared_on_run_checks():
@@ -741,6 +1422,134 @@ def test_tooling_checked_out_into_the_workspace_is_not_the_consumers():
         check("tooling checked out into the workspace is not read as the consumer's",
               (p.returncode, "agents-tools" in p.stdout, "guardrails" in p.stdout),
               (0, False, False))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_branch_failure_isolation_between_sibling_objects():
+    """An invalid property in a sibling object (e.g. group_b with 'then' without 'if')
+    is not suppressed when another object (group_a) has a branch failure."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_branch_isolation")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "group_a": {
+                    "type": "object",
+                    "properties": {"req_str": {"type": "string"}},
+                    "unevaluatedProperties": False
+                },
+                "group_b": {
+                    "type": "object",
+                    "properties": {"valid_num": {"type": "number"}},
+                    "then": {"properties": {"rogue_then": {"type": "string"}}},
+                    "unevaluatedProperties": False
+                }
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        inst = {
+            "group_a": {"req_str": 999},
+            "group_b": {"valid_num": 10, "rogue_then": "should_be_rejected"}
+        }
+        out = mod.validate(inst, composed)
+        check("group_a branch error is reported", any("group_a" in err and "req_str" in err for err in out), True)
+        check("rogue_then in group_b is reported despite group_a failure",
+              any("group_b" in err and "rogue_then" in err for err in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_check_if_match_file_uri_path_escape_blocked():
+    """`check_if_match()` blocks path escape via 'file://' URIs targeting paths outside the repository."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_if_file_escape")
+        esc_file = "/tmp/test_outside_if_escape.json"
+        try:
+            write(esc_file, json.dumps({"properties": {"leak": {"const": "secret"}}, "required": ["leak"]}))
+            # if condition with file:// URI pointing outside repository
+            res = mod.check_if_match({"$ref": "file://" + esc_file}, {"leak": "secret"}, base_dir=mod.REPO)
+            check("check_if_match refuses file:// escape outside repository", res, False)
+        finally:
+            if os.path.exists(esc_file):
+                os.remove(esc_file)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_check_if_match_nested_ref_resolution_and_fail_closed():
+    """`check_if_match()` evaluates nested `$ref` conditions fail-closed, so that unfulfilled
+    conditions do not falsely activate 'then' branches or mask rogue properties."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_nested_if_fail_closed")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "is_prod": {
+                    "properties": {"env": {"const": "prod"}},
+                    "required": ["env"]
+                }
+            },
+            "properties": {
+                "env": {"type": "string"},
+                "status": {"type": "string"}
+            },
+            "if": {
+                "properties": {
+                    "sub": {"$ref": "#/$defs/is_prod"}
+                }
+            },
+            "then": {
+                "properties": {"prod_secret": {"type": "string"}}
+            },
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        # env=dev (not prod!), status=123 (branch failure: int instead of str).
+        # prod_secret="hacked" must be REFUSED because condition is not satisfied!
+        inst = {
+            "env": "dev",
+            "status": 123,
+            "sub": {"env": "dev"},
+            "prod_secret": "hacked"
+        }
+        out = mod.validate(inst, composed)
+        check("status branch error is reported", any("status" in err for err in out), True)
+        check("prod_secret from inactive then is refused", any("prod_secret" in err for err in out), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_then_else_without_if_is_ignored():
+    """Per JSON Schema Draft 2020-12, 'then' and 'else' without 'if' have no effect,
+    and their properties are not considered evaluated."""
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_then_without_if")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"base_field": {"type": "string"}},
+            "then": {"properties": {"standalone_then": {"type": "string"}}},
+            "else": {"properties": {"standalone_else": {"type": "string"}}},
+            "unevaluatedProperties": False
+        }
+        write(composed, json.dumps(schema))
+
+        inst_then = {"base_field": "ok", "standalone_then": "rogue"}
+        out_then = mod.validate(inst_then, composed)
+        check("standalone then property is refused under unevaluatedProperties",
+              any("standalone_then" in err for err in out_then), True)
+
+        inst_else = {"base_field": "ok", "standalone_else": "rogue"}
+        out_else = mod.validate(inst_else, composed)
+        check("standalone else property is refused under unevaluatedProperties",
+              any("standalone_else" in err for err in out_else), True)
     finally:
         shutil.rmtree(d)
 
