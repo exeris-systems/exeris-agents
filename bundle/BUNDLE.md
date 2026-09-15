@@ -60,7 +60,15 @@ decision through a `$ref` into the base; when anything inside that branch fails,
 and a failing subschema contributes no annotations — so the `unevaluatedProperties` above it sees
 nothing as evaluated and reports every property present. The eval runner (`evals/run.py`) filters
 these secondary annotation artefacts corresponding to declared schema properties while preserving
-genuine unexpected properties; when validating outside the runner, read the other errors first —
-the unevaluated line disappears the moment the real failure is fixed, and a decision that validates
-never produces it.
+genuine unexpected properties.
+
+Declared means declared anywhere the schema reaches at that location: through a `$ref`, every
+`allOf` branch, the condition that holds together with its `then` — or the `else` of one that does
+not — a dependent schema the decision triggers, a recursive `$defs` at any depth, and the `oneOf` /
+`anyOf` variant that holds. An array closed by `unevaluatedItems` is cleaned only where the schema
+accounts for every position, because that message names the values it refused rather than their
+positions, and a line that cannot be trimmed honestly is left standing.
+
+When validating outside the runner, read the other errors first — the unevaluated line disappears
+the moment the real failure is fixed, and a decision that validates never produces it.
 

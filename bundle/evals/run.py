@@ -164,6 +164,26 @@ UNEXPECTED_RE = re.compile(
     r"Unevaluated properties are not allowed \((.*?) were unexpected\)"
 )
 
+# Recognised, not parsed. The items message names the VALUES it refused — measured,
+# `Unevaluated items are not allowed ('a', 'b' were unexpected)` — and two equal items are one
+# string in it, so the positions cannot be read back out. `find_declared_item_indexes()` decides
+# this line by coverage instead, and a regex that pretended to capture would be the one place
+# claiming otherwise.
+UNEVALUATED_ITEMS_RE = re.compile(r"Unevaluated items are not allowed \(")
+
+
+def instance_at(instance, path: tuple):
+    """The value at `path` inside `instance`, or None when the path is not there."""
+    curr = instance
+    for step in path:
+        if isinstance(step, str) and isinstance(curr, dict):
+            curr = curr.get(step)
+        elif isinstance(step, int) and isinstance(curr, list) and 0 <= step < len(curr):
+            curr = curr[step]
+        else:
+            return None
+    return curr
+
 
 def resolve_pointer(doc: dict | list | None, pointer: str):
     """Resolve a JSON Pointer fragment (e.g. '#/$defs/Name' or '/properties/foo') within `doc`."""
@@ -194,6 +214,38 @@ def resolve_pointer(doc: dict | list | None, pointer: str):
     return curr
 
 
+def in_definition_context(node: dict, owner: dict | None) -> dict:
+    """`node` as a document of its own that can still reach `owner`'s local definitions.
+
+    A subschema handed to `Draft202012Validator` becomes the root of its own document, and a
+    `$ref: "#/$defs/..."` inside it then resolves against itself — where `$defs` is not. The
+    resolver raises `Unresolvable`, the caller reads that as "the condition does not hold", and a
+    branch the schema really does evaluate is reported as a foreign property. Measured: an
+    instance satisfying its own `if` matched `False`, and the `then` branch's field came back as
+    unexpected.
+
+    Carrying the definition pools across is also what keeps a RECURSIVE condition working —
+    `#/$defs/Node` resolves inside the probe, hop after hop — which inlining the reference would
+    have needed a second cycle guard to survive.
+
+    No `$id` is carried. The location `located()` supplies is a file URI, and putting it on a
+    fragment of that file would send every relative `$ref` inside the fragment off to join a URL
+    the tree knows nothing about: the exact redirection `located()`'s own docstring refuses.
+    """
+    if not isinstance(node, dict) or not isinstance(owner, dict) or node is owner:
+        return node
+    carried = {}
+    for pool in ("$defs", "definitions"):
+        theirs = owner.get(pool)
+        if isinstance(theirs, dict):
+            merged = dict(theirs)
+            mine = node.get(pool)
+            if isinstance(mine, dict):
+                merged.update(mine)          # the node's own definitions win over the owner's
+            carried[pool] = merged
+    return {**node, **carried} if carried else node
+
+
 def check_if_match(
     if_node: dict,
     inst_node,
@@ -201,9 +253,16 @@ def check_if_match(
     root_schema: dict | None = None,
     registry=None,
 ) -> bool:
-    """Whether `inst_node` satisfies the conditional `if` subschema."""
-    if not isinstance(inst_node, dict):
+    """Whether `inst_node` satisfies the subschema `if_node`.
+
+    Asked of an `if`, and of a `oneOf` / `anyOf` branch: it is one question, because only a
+    subschema that HOLDS contributes annotations at this location, and that is the whole of what
+    the caller needs to know. An absent instance value satisfies nothing — there is no value to
+    condition on, and `None` here is also how a missing member arrives.
+    """
+    if inst_node is None:
         return False
+    defs_owner = root_schema
     if "$ref" in if_node and isinstance(if_node["$ref"], str):
         ref = if_node["$ref"]
         if ref.startswith("#") and root_schema:
@@ -226,23 +285,37 @@ def check_if_match(
                     resolved = resolve_pointer(ext_doc, "#" + fragment) if fragment else ext_doc
                     if isinstance(resolved, dict):
                         if_node = resolved
+                        # The definitions this node's own pointers mean are ITS file's, not the
+                        # composition's. Keeping the composed root here sent `#/$defs/x` inside
+                        # an externally-referenced condition looking in the wrong document.
+                        defs_owner = ext_doc
             except PathEscapeError:
                 return False
     try:
         import jsonschema
-        validator = jsonschema.Draft202012Validator(if_node, registry=registry)
+        validator = jsonschema.Draft202012Validator(
+            in_definition_context(if_node, defs_owner), registry=registry)
         return bool(validator.is_valid(inst_node))
     except ImportError:
         pass
     except Exception:
-        # If schema validation fails (e.g. unresolvable ref or path escape), fail-closed
+        # A reference that goes nowhere even in context, or a schema this validator refuses:
+        # fail-closed. No longer the ordinary nested `$ref`, which now resolves.
         return False
 
     # Fallback only when jsonschema is not installed
-    if "$ref" in if_node:
+    if "$ref" in if_node or not isinstance(inst_node, dict):
         return False
     if_props = if_node.get("properties") or {}
     for k, v in if_props.items():
+        if k not in inst_node:
+            # `properties` constrains the members that are THERE. Asking `inst_node.get(k)` for an
+            # absent one compared `None` against the condition's `const`, `enum` and `type`, so a
+            # condition naming any optional property could not be satisfied at all — measured:
+            # `{"env": "prod"}` failed `{"env": {"const": "prod"}, "note": {"type": "string"}}`.
+            # `required` below is the keyword that makes presence mandatory, and it is its own
+            # check.
+            continue
         if isinstance(v, dict):
             if "const" in v and inst_node.get(k) != v["const"]:
                 return False
@@ -269,6 +342,161 @@ def check_if_match(
     return True
 
 
+def inplace_branches(
+    schema_node: dict,
+    inst_node,
+    base_dir: str,
+    root_schema: dict | None,
+    registry=None,
+) -> list[dict]:
+    """The in-place applicators at this node that account for what THIS instance evaluated.
+
+    One list, read by both folds below. The two were the same walk with a different fold, and
+    the fold that was missing is the one that never got written.
+    """
+    out: list[dict] = []
+    for b in (schema_node.get("allOf") or []):
+        if isinstance(b, dict):
+            # Every branch, the failing ones included: a failing branch is precisely the case
+            # this filter exists for. It declared the property, and its failure is what dropped
+            # the annotation that said so.
+            out.append(b)
+    for key, dep in (schema_node.get("dependentSchemas") or {}).items():
+        if isinstance(dep, dict) and isinstance(inst_node, dict) and key in inst_node:
+            out.append(dep)
+    if_node = schema_node.get("if")
+    if isinstance(if_node, dict) and inst_node is not None:
+        # `then` / `else` without `if` have no effect (Draft 2020-12), so they are reached only
+        # from here.
+        if check_if_match(if_node, inst_node, base_dir, root_schema, registry=registry):
+            # The condition held, so the `if` subschema's OWN properties were evaluated too —
+            # jsonschema credits them beside `then`'s. A schema naming a property only in its
+            # condition was being reported as if it had never declared it.
+            out.append(if_node)
+            then_b = schema_node.get("then")
+            if isinstance(then_b, dict):
+                out.append(then_b)
+        else:
+            else_b = schema_node.get("else")
+            if isinstance(else_b, dict):
+                out.append(else_b)
+    for key in ("oneOf", "anyOf"):
+        alts = [b for b in (schema_node.get(key) or []) if isinstance(b, dict)]
+        if not alts:
+            continue
+        holds = [b for b in alts
+                 if check_if_match(b, inst_node, base_dir, root_schema, registry=registry)]
+        # The branch that holds, which is exactly the one the validator counts. When NONE holds,
+        # the union: the union's own failure is already reported on this path, so trimming its
+        # secondary line cannot turn a failing case green — while leaving the union out reports
+        # every field of the variant the answer was reaching for as a foreign property. Measured
+        # on a discriminated `oneOf`: `'a_field' was unexpected`, beside the real failure.
+        out.extend(holds or alts)
+    return out
+
+
+def nodes_at(
+    schema_node: dict | None,
+    path: tuple,
+    base_dir: str,
+    root_schema: dict | None = None,
+    stack: tuple = (),
+    inst_node=None,
+    registry=None,
+) -> list[dict]:
+    """Every schema node that applies to the instance location `path`.
+
+    Expanded through `$ref`, `$dynamicRef` and `inplace_branches()`, then down one instance step
+    at a time. What each node then contributes is the caller's business — property names for
+    `find_declared_props()`, item positions for `find_declared_item_indexes()`.
+
+    `stack` breaks reference cycles WITHIN one step of the path, and is reset at every step the
+    path advances. It has to be: carried down the descent, a recursive schema —
+    `child: {"$ref": "#/$defs/Node"}` — looked like a cycle the moment its own root had been
+    expanded, so every property below the first hop was collected as declared by nobody and
+    reported as unexpected. Measured: `declared at ('child',)` was empty for a `Node` that
+    declares three. The walk still terminates, because `path` strictly shrinks.
+    """
+    if not isinstance(schema_node, dict):
+        return []
+    if root_schema is None:
+        root_schema = schema_node
+    found: list[dict] = []
+
+    for ref_key in ("$ref", "$dynamicRef"):
+        ref = schema_node.get(ref_key)
+        if not isinstance(ref, str):
+            continue
+        if "#" in ref:
+            file_part, fragment = ref.split("#", 1)
+            fragment = "#" + fragment
+        else:
+            file_part, fragment = ref, ""
+
+        if not file_part:
+            ref_id = (id(root_schema), fragment)
+            if ref_id not in stack:
+                target_sch = resolve_pointer(root_schema, fragment)
+                if isinstance(target_sch, dict):
+                    found += nodes_at(target_sch, path, base_dir, root_schema,
+                                      stack + (ref_id,), inst_node, registry)
+            continue
+
+        if file_part.startswith("file:"):
+            target = unquote(urlparse(file_part).path)
+        elif os.path.isabs(file_part):
+            target = file_part
+        else:
+            target = os.path.normpath(os.path.join(base_dir, file_part))
+        try:
+            target = within_repo(target, f"{ref_key} '{ref}'")
+        except PathEscapeError:
+            target = None
+
+        if target and os.path.exists(target):
+            ref_id = (target, fragment)
+            if ref_id not in stack:
+                try:
+                    with open(target, encoding="utf-8") as fh:
+                        ext_doc = json.load(fh)
+                    target_sch = resolve_pointer(ext_doc, fragment) if fragment else ext_doc
+                    if isinstance(target_sch, dict):
+                        found += nodes_at(target_sch, path, os.path.dirname(target), ext_doc,
+                                          stack + (ref_id,), inst_node, registry)
+                except Exception:
+                    pass
+
+    for b in inplace_branches(schema_node, inst_node, base_dir, root_schema, registry):
+        found += nodes_at(b, path, base_dir, root_schema, stack, inst_node, registry)
+
+    if not path:
+        found.append(schema_node)
+        return found
+
+    step, rest = path[0], path[1:]
+    if isinstance(step, str):
+        next_inst = inst_node.get(step) if isinstance(inst_node, dict) else None
+        sub = (schema_node.get("properties") or {}).get(step)
+        if isinstance(sub, dict):
+            found += nodes_at(sub, rest, base_dir, root_schema, (), next_inst, registry)
+        for pat, pat_sch in (schema_node.get("patternProperties") or {}).items():
+            try:
+                if re.search(pat, step) and isinstance(pat_sch, dict):
+                    found += nodes_at(pat_sch, rest, base_dir, root_schema, (), next_inst, registry)
+            except re.error:
+                pass
+    elif isinstance(step, int):
+        next_inst = (inst_node[step] if isinstance(inst_node, list) and 0 <= step < len(inst_node)
+                     else None)
+        items = schema_node.get("items")
+        if isinstance(items, dict):
+            found += nodes_at(items, rest, base_dir, root_schema, (), next_inst, registry)
+        prefix = schema_node.get("prefixItems") or []
+        if isinstance(prefix, list) and step < len(prefix) and isinstance(prefix[step], dict):
+            found += nodes_at(prefix[step], rest, base_dir, root_schema, (), next_inst, registry)
+    return found
+
+
 def find_declared_props(
     schema_node: dict | None,
     path: tuple,
@@ -278,122 +506,83 @@ def find_declared_props(
     inst_node=None,
     registry=None,
 ) -> set[str]:
-    """Find property names declared by this schema node (and its allOf/$ref/conditional hierarchy) at `path`."""
-    if not isinstance(schema_node, dict):
-        return set()
-    if root_schema is None:
-        root_schema = schema_node
-
-    props = set()
-
-    for ref_key in ("$ref", "$dynamicRef"):
-        ref = schema_node.get(ref_key)
-        if isinstance(ref, str):
-            if "#" in ref:
-                file_part, fragment = ref.split("#", 1)
-                fragment = "#" + fragment
-            else:
-                file_part, fragment = ref, ""
-
-            if not file_part:
-                ref_id = (id(root_schema), fragment)
-                if ref_id not in stack:
-                    target_sch = resolve_pointer(root_schema, fragment)
-                    if isinstance(target_sch, dict):
-                        props.update(find_declared_props(target_sch, path, base_dir, root_schema, stack + (ref_id,), inst_node, registry=registry))
-            else:
-                if file_part.startswith("file:"):
-                    target = unquote(urlparse(file_part).path)
-                elif os.path.isabs(file_part):
-                    target = file_part
-                else:
-                    target = os.path.normpath(os.path.join(base_dir, file_part))
+    """Property names this schema declares at `path` — through `$ref` and `$dynamicRef`, every
+    `allOf` branch, the active conditional and dependent branches, the polymorphic branch that
+    holds, and the `patternProperties` this instance's own keys match."""
+    here = instance_at(inst_node, path)
+    props: set[str] = set()
+    for node in nodes_at(schema_node, path, base_dir, root_schema, stack, inst_node, registry):
+        props.update((node.get("properties") or {}).keys())
+        if not isinstance(here, dict):
+            continue
+        for pat in (node.get("patternProperties") or {}):
+            for k in here:
                 try:
-                    target = within_repo(target, f"{ref_key} '{ref}'")
-                except PathEscapeError:
-                    target = None
-
-                if target and os.path.exists(target):
-                    ref_id = (target, fragment)
-                    if ref_id not in stack:
-                        try:
-                            with open(target, encoding="utf-8") as fh:
-                                ext_doc = json.load(fh)
-                            target_sch = resolve_pointer(ext_doc, fragment) if fragment else ext_doc
-                            if isinstance(target_sch, dict):
-                                props.update(find_declared_props(target_sch, path, os.path.dirname(target), ext_doc, stack + (ref_id,), inst_node, registry=registry))
-                        except Exception:
-                            pass
-
-    if not path:
-        props.update((schema_node.get("properties") or {}).keys())
-        for pat, _ in (schema_node.get("patternProperties") or {}).items():
-            if isinstance(inst_node, dict):
-                for k in inst_node.keys():
-                    try:
-                        if re.search(pat, k):
-                            props.add(k)
-                    except re.error:
-                        pass
-        for b in (schema_node.get("allOf") or []):
-            props.update(find_declared_props(b, (), base_dir, root_schema, stack, inst_node, registry=registry))
-
-        for dep_key, dep in (schema_node.get("dependentSchemas") or {}).items():
-            if isinstance(dep, dict) and isinstance(inst_node, dict) and dep_key in inst_node:
-                props.update(find_declared_props(dep, (), base_dir, root_schema, stack, inst_node, registry=registry))
-
-        if_node = schema_node.get("if")
-        then_b = schema_node.get("then")
-        else_b = schema_node.get("else")
-        if isinstance(if_node, dict) and isinstance(inst_node, dict):
-            if check_if_match(if_node, inst_node, base_dir, root_schema, registry=registry):
-                if isinstance(then_b, dict):
-                    props.update(find_declared_props(then_b, (), base_dir, root_schema, stack, inst_node, registry=registry))
-            else:
-                if isinstance(else_b, dict):
-                    props.update(find_declared_props(else_b, (), base_dir, root_schema, stack, inst_node, registry=registry))
-        return props
-
-    step, rest = path[0], path[1:]
-    for b in (schema_node.get("allOf") or []):
-        props.update(find_declared_props(b, path, base_dir, root_schema, stack, inst_node, registry=registry))
-
-    for dep_key, dep in (schema_node.get("dependentSchemas") or {}).items():
-        if isinstance(dep, dict) and isinstance(inst_node, dict) and dep_key in inst_node:
-            props.update(find_declared_props(dep, path, base_dir, root_schema, stack, inst_node, registry=registry))
-
-    if_node = schema_node.get("if")
-    then_b = schema_node.get("then")
-    else_b = schema_node.get("else")
-    if isinstance(if_node, dict) and isinstance(inst_node, dict):
-        if check_if_match(if_node, inst_node, base_dir, root_schema, registry=registry):
-            if isinstance(then_b, dict):
-                props.update(find_declared_props(then_b, path, base_dir, root_schema, stack, inst_node, registry=registry))
-        else:
-            if isinstance(else_b, dict):
-                props.update(find_declared_props(else_b, path, base_dir, root_schema, stack, inst_node, registry=registry))
-
-    if isinstance(step, str):
-        sub = (schema_node.get("properties") or {}).get(step)
-        if isinstance(sub, dict):
-            next_inst = inst_node.get(step) if isinstance(inst_node, dict) else None
-            props.update(find_declared_props(sub, rest, base_dir, root_schema, stack, next_inst, registry=registry))
-        for pat, pat_sch in (schema_node.get("patternProperties") or {}).items():
-            try:
-                if re.search(pat, step) and isinstance(pat_sch, dict):
-                    next_inst = inst_node.get(step) if isinstance(inst_node, dict) else None
-                    props.update(find_declared_props(pat_sch, rest, base_dir, root_schema, stack, next_inst, registry=registry))
-            except re.error:
-                pass
-    elif isinstance(step, int):
-        next_inst = inst_node[step] if isinstance(inst_node, list) and 0 <= step < len(inst_node) else None
-        items = schema_node.get("items")
-        if isinstance(items, dict):
-            props.update(find_declared_props(items, rest, base_dir, root_schema, stack, next_inst, registry=registry))
-        prefix = schema_node.get("prefixItems") or []
-        if isinstance(prefix, list) and step < len(prefix):
-            props.update(find_declared_props(prefix[step], rest, base_dir, root_schema, stack, next_inst, registry=registry))
+                    if re.search(pat, k):
+                        props.add(k)
+                except re.error:
+                    pass
     return props
+
+
+def find_declared_item_indexes(
+    schema_node: dict | None,
+    path: tuple,
+    base_dir: str,
+    root_schema: dict | None = None,
+    stack: tuple = (),
+    inst_node=None,
+    registry=None,
+) -> set[int] | None:
+    """Item positions this schema accounts for at `path`; `None` means every position.
+
+    The array-side twin of `find_declared_props()`, over the same walk: `items` accounts for the
+    whole array, `prefixItems` for its own length, `contains` for the positions that satisfy it.
+    That is how jsonschema recomputes what an array location evaluated, and the reason this has
+    to be positions rather than names is `unevaluatedItems`' message, which carries neither.
+    """
+    here = instance_at(inst_node, path)
+    covered: set[int] = set()
+    for node in nodes_at(schema_node, path, base_dir, root_schema, stack, inst_node, registry):
+        if "items" in node:
+            return None
+        prefix = node.get("prefixItems")
+        if isinstance(prefix, list):
+            covered.update(range(len(prefix)))
+        contains = node.get("contains")
+        if isinstance(contains, dict) and isinstance(here, list):
+            covered.update(i for i, v in enumerate(here)
+                           if check_if_match(contains, v, base_dir, root_schema,
+                                             registry=registry))
+    return covered
+
+
+def artefact(error, errors) -> bool:
+    """Whether an `unevaluated*` error is the annotation artefact `BUNDLE.md` tells readers to
+    skip: a subschema at or below this location failed, contributed no annotations, and the
+    closer above it reported everything the instance carries.
+
+    The same rule as `artefact()` in `tools/agents_file_check.py`, and deliberately the same
+    shape. Neither can import the other — this file ships inside the vendored bundle and the
+    checker does not ship at all — so the least the two owe a reader is to agree, and to say
+    where the other one is.
+
+    Scoped to the path, and by prefix: a failing in-place applicator reports from its own
+    location or deeper, and nothing above it changes what this location evaluated, because the
+    annotations are recomputed here. The document-wide reading this replaces let one error at the
+    root switch the filter on inside every other object — which cannot green a failing case,
+    since the error that enables it is itself reported, but can drop the one line that was the
+    answer, and the comment above it claimed the scope the code did not have.
+
+    `other is not error`, rather than "not an `unevaluated*` error": a closer firing one level
+    down IS a cause here, because it fails the branch that carries it and that branch is what
+    would have annotated this location. What no error may do is justify itself.
+    """
+    if error.validator not in ("unevaluatedProperties", "unevaluatedItems"):
+        return False
+    path = tuple(error.absolute_path)
+    return any(other is not error and tuple(other.absolute_path)[:len(path)] == path
+               for other in errors)
 
 
 def validate(instance, schema_path: str) -> list[str]:
@@ -463,14 +652,10 @@ def validate(instance, schema_path: str) -> list[str]:
         result = []
         for e in errors:
             path = tuple(e.path)
-            if e.validator == "unevaluatedProperties":
-                # An unevaluatedProperties error is an annotation artefact ONLY if
-                # an underlying branch error on this path failed to produce annotations.
-                has_branch_failure = any(
-                    o.validator not in ("unevaluatedProperties", "unevaluatedItems")
-                    for o in errors
-                )
-                if has_branch_failure:
+            # Both keywords, because both are secondary in the same way and only the properties
+            # one was ever cleaned.
+            if artefact(e, errors):
+                if e.validator == "unevaluatedProperties":
                     m = UNEXPECTED_RE.match(e.message)
                     if m:
                         raw = m.group(1) or m.group(2)
@@ -486,6 +671,17 @@ def validate(instance, schema_path: str) -> list[str]:
                             quoted = ", ".join(f"'{g}'" for g in sorted(genuine))
                             msg = f"Unevaluated properties are not allowed ({quoted} were unexpected)"
                         result.append((path, msg))
+                        continue
+                elif UNEVALUATED_ITEMS_RE.match(e.message):
+                    # Whole line or nothing. The properties message can be rebuilt around the
+                    # names that are genuine; this one names values, so there is no position to
+                    # subtract — two equal items are one string in it. Drop it only where the
+                    # schema accounts for EVERY position, and otherwise report it as it stands.
+                    covered = find_declared_item_indexes(schema, path, base_dir,
+                                                         inst_node=instance, registry=registry)
+                    here = instance_at(instance, path)
+                    if covered is None or (isinstance(here, list)
+                                           and covered >= set(range(len(here)))):
                         continue
             result.append((path, e.message))
         return [f"{'/'.join(str(p) for p in path) or '<root>'}: {msg}" for path, msg in result]

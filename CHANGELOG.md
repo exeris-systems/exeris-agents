@@ -22,7 +22,7 @@ above, decides the number.
 
 ## [Unreleased]
 
-## [2.0.0] - 2026-09-10
+## [2.0.0] - 2026-09-15
 
 The base schemas stop closing themselves, because a composing schema cannot add a property to a
 base that does. Three shapes, measured side by side: with `additionalProperties: false` in the base
@@ -44,7 +44,7 @@ number.
   `handoff.base.schema.json` or `triage-result.base.schema.json` declares `additionalProperties` or
   `unevaluatedProperties` — not a root, not a finding, not a check entry, not a validation gate.
   Each file's `description` says so and says where the closers belong, because that is the thing a
-  later reader would otherwise put back.
+  later reader would otherwise put back. (#10, ADR-085)
 - **What a consumer must add: one closer per object, not one per schema.**
   `"unevaluatedProperties": false` at the root of every schema that `$ref`s a base, and again in a
   subschema over every object that base leaves open. Eight objects across the three schemas: a
@@ -56,7 +56,7 @@ number.
   a composition closing only its root refuses a foreign property at the root and admits one in a
   check entry. An object the repository does not extend still needs a subschema of its own,
   carrying the `$ref` and the closer. `agents_file_check.py` names every object left open, so the
-  work is enumerated rather than discovered.
+  work is enumerated rather than discovered. (#10, ADR-085)
 - **Every graded failure will carry a line naming your own fields as unexpected under raw validation.**
   A composition validates through a `$ref` into the base; when anything inside that branch fails, the
   branch fails, and a failing subschema contributes no annotations — so a Draft 2020-12
@@ -65,11 +65,11 @@ number.
   reports; the eval runner (`evals/run.py`) filters these secondary annotation artefacts
   corresponding to declared schema properties while preserving genuine unexpected properties, but
   outside that runner read the other errors first and it goes when they do. `BUNDLE.md` says so
-  where a consumer meets it.
+  where a consumer meets it. (#10, ADR-085)
 - **The root closer can be added before the bump.** Over 1.4.0's closed base it changes no outcome:
   a conforming instance still validates and a foreign root property is still refused, by the base.
   An extension cannot be added early — 1.4.0's base refuses the added field, which is the whole
-  reason for this release.
+  reason for this release. (#10, ADR-085)
 
 ### Added
 
@@ -92,7 +92,7 @@ number.
   one carrying the base, which no probe can tell from a correct closer and which is named by its
   shape. Both see only the properties written beside them, so both reject everything the base
   declares while looking closed to a check that asks only whether a foreign property can get in. A
-  conforming decision graded against such a schema is refused outright.
+  conforming decision graded against such a schema is refused outright. (#10, ADR-085)
 - **The check builds a decision the schema accepts, and asks one question of it.** A conforming
   instance is generated from the composed schema — `required`, `type`, `pattern`, `minLength`,
   `minItems`, `enum`, `const` — validated against that schema, and only then is a property added at
@@ -111,7 +111,7 @@ number.
   quantifier, the first alternative of a group — and where it cannot, the schema is declined with
   the reason, at warning level: a value this check could not construct is its own limit as much as
   the schema's, and failing a conforming repository over it is the mistake the level protects
-  against.
+  against. (#10, ADR-085)
 - **A value the check cannot build costs one location, not the schema.** The generator says where
   it could not construct something; that value is left out of the decision, the rest is measured,
   and the location is named. Declining the whole schema is now reserved for a root that cannot be
@@ -119,6 +119,7 @@ number.
   Every assertion keyword is either satisfied or declined by name, partitioned like the subschema
   vocabulary and with the same two-hands test behind it, because an assertion neither satisfied nor
   declined produces a value the schema refuses and reports that as the schema's fault.
+  (#10, ADR-085)
 - **The check names what it did not measure.** The probe understands a stated set of shapes —
   `properties`, arrays by `items` or `prefixItems`, references into the bundle and inside the
   document that named them — and every construct it meets and does not walk is now a warning
@@ -131,7 +132,7 @@ number.
   would put warnings on every composition in the ecosystem — and "only tightens" is decided by
   comparing the branch, level by level, with what the parts applying at each level declare,
   not by scanning the branch for a shape: the scan read `$ref` and not `$dynamicRef`, and an
-  object introduced through the second was neither built, probed nor declared.
+  object introduced through the second was neither built, probed nor declared. (#10, ADR-085)
 - **Only what is measured is an error.** Two findings come out of this check, and they are not
   the same kind of thing. An object that took a property the base does not name, on a decision the
   schema accepted, is a measurement: the instance conformed, the property got in, and no limit of
@@ -151,7 +152,7 @@ number.
   failed there and what it could not measure, rather than a verdict. That is the one false green
   this rule chooses: a schema that is wide open and also makes this check raise is not red, and
   `tests/test_schema_closers.py` says so in as many words, so that it is a decision on record and
-  not a gap found later. The checker failing as a whole is still red.
+  not a gap found later. The checker failing as a whole is still red. (#10, ADR-085)
 - **The probe is fair to a name rule.** `patternProperties: {"^exeris": false}` refused every
   probe name — all three began with `exeris` — and the root was reported closed while any other
   name walked in. A closer refuses undeclared names, not names that look a certain way, so the
@@ -159,13 +160,13 @@ number.
   refuses for their shape, from a wider set of shapes plus one built from the rule's own
   pattern; when none passes, it says so. The one name rule that is a closer — a `propertyNames`
   enumerating the base's names — is read as one: closed, without a warning, and open by the name
-  it lets through when it allows one the base does not declare.
+  it lets through when it allows one the base does not declare. (#10, ADR-085)
 - **`$dynamicRef` composes.** It resolves exactly as `$ref` does until its fragment names a
   dynamic anchor, so a composition written with it validated every decision through the base —
   and the check, looking for `$ref` alone, saw no composition at all: zero errors, zero warnings,
   nothing closed anywhere. Both keywords are one thing to the check now, everywhere a reference
   is read; a `$dynamicRef` to a dynamic anchor is declined by name, because the dynamic scope is
-  what this does not model.
+  what this does not model. (#10, ADR-085)
 - **Every reference inside the checkout is followed**, the way the validator follows it: a
   wrapper of the repository's own composing the base one file over, and the neighbouring
   `handoff.schema.json` the standard names as the way to close a verdict's `handoffs` items. The
@@ -174,7 +175,7 @@ number.
   what the neighbour declares built and probed. What is declined is what the validator itself
   cannot follow — a URL, a path leaving the checkout, a file that is not a schema object — by
   name, and `items: false` past a prefix builds nothing rather than an element it then reports
-  the schema for refusing.
+  the schema for refusing. (#10, ADR-085)
 - Two more things the schema check reads, both of which this release makes load-bearing. A `$ref`
   into a vendored tree that **no** import pins is a finding, not a shrug: it resolves, so no other
   check reports it, and it is precisely what a half-finished bump looks like. And a `$ref`'s
@@ -185,7 +186,7 @@ number.
   release's second piece of consumer work and it shipped as advice; advice is not a check, and the
   closer rule got one. A base now accepts a foreign property anywhere and any value the
   repository's own enums exclude, so a case graded against one passes on answers the repository
-  refuses. Point `expect.schema` at the composed schema in `.agents/schemas/`.
+  refuses. Point `expect.schema` at the composed schema in `.agents/schemas/`. (#10, ADR-085)
 - `tests/test_schema_closers.py`, run in CI: what a composition over the open bases refuses, what
   the bare base no longer does, what an unclosed object admits, and the checker's answer to every
   closer removed in turn. The instance cases are graded through `bundle/evals/run.py`'s own
@@ -203,7 +204,7 @@ number.
   reference in the file does not resolve (the reference is the finding, already reported), and
   above every check sits one guard: a check that raises is a finding naming the frame and the
   exception, everything reported before it still reaches the reader, and the report says what is
-  missing past that point. A run that fails still fails; it no longer fails silently.
+  missing past that point. A run that fails still fails; it no longer fails silently. (#10, ADR-085)
 - **An eval run no longer ends on one bad reference — third statement, and the first two were
   wrong.** The first fix made a base's own relative `$ref` resolve next to the base rather than
   next to the composed schema, which is why a verdict carrying a handoff had been ending the run
@@ -222,7 +223,7 @@ number.
   unparseable schema still lost the run — `main()` checks that the file exists and never that it
   parses. It is read inside the guard now. The history is here rather than tidied away because this
   release's argument is that a claim nothing re-measures is worth less than a run, and this
-  particular claim has needed four.
+  particular claim has needed four. (#10, ADR-085)
 - **The checker read a `$ref` target before deciding it was allowed to.** `load_schema` opened
   whatever path it was handed; what stopped it leaving the checkout was `ref_target()`, two modules
   away, which every caller happened to go through. Measured on a direct call, it read and parsed a
@@ -231,14 +232,14 @@ number.
   itself, the value opened is the one the check returned, and a `$ref` that resolves outside the
   repository is reported rather than surfacing as a target that does not exist or a pointer that
   does not resolve. Raised by SonarCloud as path injection, which as reported was a false positive:
-  the sanitiser was real, it was just in another module — and so was the defect.
+  the sanitiser was real, it was just in another module — and so was the defect. (#10, ADR-085)
 - **A case naming a path that is not there was told it had named a bundle base.** The refusal ran
   before the existence check, so a typo under `.agents/vendor/` was answered with advice about
   composed schemas. And a `$ref` target that exists but does not parse was reported as a pointer
-  that does not resolve, sending the reader to the pointer rather than to the file.
+  that does not resolve, sending the reader to the pointer rather than to the file. (#10, ADR-085)
 - **Every failure was reported as a `$ref` that did not resolve.** The catch-all told each case the
   same story, path and all, whatever had actually gone wrong — a grader that misnames a failure
-  sends its reader to the wrong file.
+  sends its reader to the wrong file. (#10, ADR-085)
 - **A schema declaring its own `$id` never got the location that makes its references resolve.**
   `located()` supplies the file a schema was read from as its identifier, and it deferred whenever
   the schema already carried one. A repository that gives its schema an `$id`, as JSON Schema
@@ -246,30 +247,45 @@ number.
   the failure surfaced as a missing file — pointing the reader at the vendored tree rather than at
   the identifier that had redirected them. The file wins now: rule 8 lets a reference resolve from
   the filesystem and nowhere else, so where the document is *is* what its references are relative
-  to.
+  to. (#10, ADR-085)
 - **The grader's fallback rebuilt itself without the reference registry and said nothing.** A
   validator without the registry and without the location `$id` resolves no vendored `$ref` at all;
   it reported like the whole contract while checking the repository's own keywords. Each half now
-  says which one is missing instead of degrading quietly.
+  says which one is missing instead of degrading quietly. (#10, ADR-085)
 - **An `expect.schema` or `fixture` resolving outside the repository aborted the eval run.**
   `within_repo()` exits on an escape; for a CLI argument this is right, but when evaluating a scenario
   case naming a schema or fixture outside the checkout, raising `SystemExit` took the entire run with
   it instead of recording that single case as an error. It now raises `PathEscapeError`, caught per-case
-  and handled cleanly without in-band `SystemExit` control flow.
+  and handled cleanly without in-band `SystemExit` control flow. (#10, ADR-085)
 - **The eval grader filtered no `unevaluatedProperties` artefacts.** When any property inside an
   instance failed, the enclosing `allOf` branch contributed no annotations, causing
   `unevaluatedProperties` to report every property as unexpected. The grader now strips secondary
   annotation artefacts corresponding to declared schema properties in active branches and matching
   `patternProperties` across root and nested array/object paths when an underlying branch error is
   present, while strictly refusing genuine unexpected properties from clean instances, inactive
-  conditional branches and absent dependent schemas.
+  conditional branches and absent dependent schemas. (#10, ADR-085)
 - **Conditional schema evaluation and fragment references lacked path-escape guards and strict RFC 6901 conformance.**
   Conditional `if` references now validate against a sandboxed reference registry fail-closed, `file://` URIs
   are checked against the repository root, `resolve_pointer()` decodes percent-encoding prior to `~1`/`~0`
   unescaping per RFC 6901 §6, and `find_declared_props()` resolves both `$ref` and `$dynamicRef`.
+  (#10, ADR-085)
+- **evals:** the declared-property filter accused a decision of fields its schema declares, in
+  four shapes. A condition behind a nested `$ref` was unsatisfiable — the subschema was handed to
+  the validator as a document of its own, so `#/$defs/...` had nowhere to resolve and the raise
+  read as "the condition does not hold"; a matched `if`'s own properties were credited to nobody;
+  a recursive `$defs` collected nothing below its first hop, because the reference cycle guard was
+  carried down the instance path and recursion looked like a loop; and `oneOf` / `anyOf` were left
+  out of the walk, so every field of a discriminated variant came back as unexpected beside the
+  real failure. Each is measured by a regression case that reports the false line before the fix
+  and only the real failure after it. The artefact rule itself is now scoped to the path it is
+  asked about — the same rule, and now the same shape, as `artefact()` in
+  `tools/agents_file_check.py` — `unevaluatedItems` is cleaned where the schema accounts for every
+  position (and never by halves: its message names values, not positions), and a condition naming
+  an optional property no longer fails the jsonschema-less fallback, where `properties` constrains
+  only the members the instance carries. (#10, ADR-085)
 - **The checker's schema AST cache leaked between in-process runs.** Module-level `_PARSED` in
   `tools/agents_file_check.py` was never cleared on `run_checks()`, so consecutive invocations within
-  a test or runner process re-used stale parsed schemas from earlier trees.
+  a test or runner process re-used stale parsed schemas from earlier trees. (#10, ADR-085)
 
 ## [1.4.0] - 2026-09-09
 

@@ -97,6 +97,10 @@ consumer reads when deciding whether a bump is safe. A `### Breaking` section is
 release (ADR-085 §H.27), so its presence never implies MAJOR — its content, against those cases,
 does.
 
+When that content is not empty, [`MIGRATION.md`](MIGRATION.md) says what to type: the changelog is
+the list of what moved, and the migration guide is the upgrade path for a repository that was
+already conforming.
+
 ## Licence
 
 Apache-2.0. Contributions follow the terms in the organisation's

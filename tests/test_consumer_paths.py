@@ -670,8 +670,22 @@ def test_eval_grader_filters_unevaluated_properties_artefacts():
         check("the branch error is reported", any("INVALID_DECISION" in err for err in out3), True)
         check("the genuine unexpected root property is reported despite branch failure",
               any("spurious_root" in err for err in out3), True)
-        check("declared properties in checks_run are not reported as unevaluated artefacts",
-              any("checks_run/0" in err and "'check'" in err for err in out3), False)
+        # This assertion used to say the opposite, and it was green only while the filter read
+        # branch failures document-wide: `decision` failing at the ROOT switched the artefact
+        # filter on inside `checks_run/0`, an object that had not failed, and the line vanished
+        # because the base declares those fields somewhere. It measured the unscoped gate.
+        #
+        # Measured now, and the same either way: the nested closer here carries NO `$ref`, so
+        # nothing is evaluated at `checks_run/0` and the base's own `check` / `result` are
+        # unevaluated there. Case 2 above already reports it with no failure anywhere, and with
+        # the composition 2.0.0 actually asks for — `items` carrying the `$ref` AND the closer —
+        # the line does not exist at all (measured against the real base). So it is not an
+        # artefact of a failed branch; it is this composition's own defect, the one
+        # `agents_file_check.py`'s closer rule enumerates, and a report that appears only when
+        # something unrelated fails is the shape `artefact()` is now scoped against.
+        check("a closer carrying no `$ref` reports the base's own fields, either way",
+              (any("checks_run/0" in err and "'check'" in err for err in out3),
+               any("checks_run/0" in err and "'check'" in err for err in out2)), (True, True))
     finally:
         shutil.rmtree(d)
 
@@ -1307,8 +1321,16 @@ def test_eval_grader_pattern_properties_recognized():
 
 
 def test_eval_grader_branch_failure_strictly_scoped_to_path():
-    """`has_branch_failure` is strictly scoped to the evaluated path, so that a branch failure
-    in one object does not treat genuine unexpected properties in another object as artefacts."""
+    """A branch failure in one object does not turn a genuine unexpected property in another
+    object into an artefact.
+
+    What this measures is the outcome, not the scoping: `spurious_b` is reported here because
+    nothing in the schema declares it at `group_b`, which held before the rule was scoped too.
+    The scope itself is measured directly, on the rule, in
+    `test_the_artefact_rule_is_scoped_to_the_path_it_is_asked_about` — a docstring claiming a
+    guard that the case cannot fail on is how the last one of these came to be green for the
+    wrong reason.
+    """
     d, composed, runner = grader_tree()
     try:
         mod = load_runner(runner, "test_evalrun_branch_scope")
@@ -1481,49 +1503,280 @@ def test_check_if_match_file_uri_path_escape_blocked():
         shutil.rmtree(d)
 
 
-def test_check_if_match_nested_ref_resolution_and_fail_closed():
-    """`check_if_match()` evaluates nested `$ref` conditions fail-closed, so that unfulfilled
-    conditions do not falsely activate 'then' branches or mask rogue properties."""
+def test_check_if_match_resolves_a_nested_ref_condition():
+    """A `$ref` nested inside an `if` used to make the condition unsatisfiable.
+
+    `check_if_match()` handed the condition to `Draft202012Validator` as a document of its own,
+    so `#/$defs/is_prod` had nowhere to resolve, `referencing` raised `Unresolvable`, and the
+    `except` around it read the raise as "the condition does not hold". Measured on the instance
+    that DOES hold: the `then` branch's own field came back as unexpected, beside the real
+    failure — the grader accusing a decision of a field its schema declares.
+
+    The case the test that stood here asserted — the condition unmet — is kept below, because it
+    was right. It was also the only one, and that is what let `False` look like the contract
+    instead of the defect: its docstring called fail-closed the behaviour under test.
+    """
     d, composed, runner = grader_tree()
     try:
-        mod = load_runner(runner, "test_evalrun_nested_if_fail_closed")
+        mod = load_runner(runner, "test_evalrun_nested_if_ref")
         schema = {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$defs": {
-                "is_prod": {
-                    "properties": {"env": {"const": "prod"}},
-                    "required": ["env"]
-                }
-            },
-            "properties": {
-                "env": {"type": "string"},
-                "status": {"type": "string"}
-            },
-            "if": {
-                "properties": {
-                    "sub": {"$ref": "#/$defs/is_prod"}
-                }
-            },
-            "then": {
-                "properties": {"prod_secret": {"type": "string"}}
-            },
-            "unevaluatedProperties": False
+            "$defs": {"is_prod": {"properties": {"env": {"const": "prod"}},
+                                  "required": ["env"]}},
+            "properties": {"env": {"type": "string"}, "status": {"type": "string"}},
+            "allOf": [{
+                "required": ["must"],
+                "if": {"properties": {"sub": {"$ref": "#/$defs/is_prod"}}, "required": ["sub"]},
+                "then": {"properties": {"prod_secret": {"type": "string"}}},
+            }],
+            "unevaluatedProperties": False,
         }
         write(composed, json.dumps(schema))
 
-        # env=dev (not prod!), status=123 (branch failure: int instead of str).
-        # prod_secret="hacked" must be REFUSED because condition is not satisfied!
-        inst = {
-            "env": "dev",
-            "status": 123,
-            "sub": {"env": "dev"},
-            "prod_secret": "hacked"
-        }
-        out = mod.validate(inst, composed)
-        check("status branch error is reported", any("status" in err for err in out), True)
-        check("prod_secret from inactive then is refused", any("prod_secret" in err for err in out), True)
+        met = mod.validate({"env": "prod", "sub": {"env": "prod"}, "prod_secret": "fine"},
+                           composed)
+        check("the real failure is reported", any("'must'" in err for err in met), True)
+        check("the then-branch's field is not called unexpected once the condition resolves",
+              any("prod_secret" in err for err in met), False)
+        check("nor is the field the condition itself declares",
+              any("'sub'" in err for err in met), False)
+
+        unmet = mod.validate({"env": "dev", "sub": {"env": "dev"}, "prod_secret": "hacked"},
+                             composed)
+        check("and the same field stays refused when the condition does not hold",
+              any("prod_secret" in err for err in unmet), True)
+
+        # A condition that cannot resolve even in context still fails closed, which is what the
+        # `except` is for now that it is no longer catching the ordinary case.
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"env": {"type": "string"}},
+            "allOf": [{"required": ["must"],
+                       "if": {"properties": {"sub": {"$ref": "#/$defs/nowhere"}},
+                              "required": ["sub"]},
+                       "then": {"properties": {"prod_secret": {"type": "string"}}}}],
+            "unevaluatedProperties": False}))
+        broken = mod.validate({"env": "prod", "sub": {"env": "prod"}, "prod_secret": "hacked"},
+                              composed)
+        check("a reference that resolves nowhere leaves the then-branch inactive",
+              any("prod_secret" in err for err in broken), True)
     finally:
         shutil.rmtree(d)
+
+
+def test_the_matched_if_subschema_declares_its_own_properties():
+    """When the condition holds, the `if` subschema's OWN properties are evaluated too.
+
+    jsonschema credits them beside `then`'s, and the walk credited neither — so a schema that
+    names a property only in its condition had that property reported as foreign. Measured:
+    `flagged`, named nowhere but in the `if`, came back as unexpected.
+    """
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_if_own_props")
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"env": {"type": "string"}},
+            "allOf": [{"required": ["must"],
+                       "if": {"properties": {"env": {"const": "prod"},
+                                             "flagged": {"type": "boolean"}},
+                              "required": ["env"]},
+                       "then": {"properties": {"prod_secret": {"type": "string"}}}}],
+            "unevaluatedProperties": False}))
+
+        out = mod.validate({"env": "prod", "flagged": True, "prod_secret": "fine"}, composed)
+        check("the real failure is reported", any("'must'" in err for err in out), True)
+        check("a property the condition declares is not called unexpected",
+              any("flagged" in err for err in out), False)
+
+        # And when the condition does not hold, its annotations are dropped — jsonschema's rule,
+        # so the same field is refused there and this is not a licence to name anything.
+        out_unmet = mod.validate({"env": "dev", "flagged": True}, composed)
+        check("the condition's own property is refused when the condition fails",
+              any("flagged" in err for err in out_unmet), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_recursive_defs_declares_properties_below_the_first_hop():
+    """The reference cycle guard was carried down the path, so recursion looked like a cycle.
+
+    `child: {"$ref": "#/$defs/Node"}` is the same reference the root already expanded, and with
+    the guard accumulated along the descent it was skipped as a loop. Measured: the properties
+    declared at `('child',)` came back as none at all, so every one of them was reported as
+    unexpected one level down.
+    """
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_recursive_defs")
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"Node": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "child": {"$ref": "#/$defs/Node"}},
+                "allOf": [{"required": ["name"], "properties": {"tag": {"type": "string"}}}],
+                "unevaluatedProperties": False}},
+            "allOf": [{"$ref": "#/$defs/Node"}],
+            "unevaluatedProperties": False}))
+
+        out = mod.validate({"name": "root", "child": {"tag": "x"}}, composed)
+        check("the real failure one level down is reported",
+              any("child" in err and "'name'" in err for err in out), True)
+        check("a property the recursive branch declares is not called unexpected",
+              any("'tag'" in err for err in out), False)
+
+        rogue = mod.validate({"name": "root", "child": {"rogue": "x"}}, composed)
+        check("a property no level declares is still refused in the child",
+              any("child" in err and "rogue" in err for err in rogue), True)
+
+        deeper = mod.validate({"name": "a", "child": {"name": "b", "child": {"tag": "x"}}},
+                              composed)
+        check("and the same holds two hops down",
+              (any("child/child" in err and "'name'" in err for err in deeper),
+               any("'tag'" in err for err in deeper)), (True, False))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_a_polymorphic_variant_is_not_reported_as_a_rogue_property():
+    """`oneOf` / `anyOf` were left out of the walk entirely.
+
+    Measured on a discriminated union whose intended variant fails for its own reason: every
+    field that variant declares came back as unexpected, beside the real failure. The branch that
+    HOLDS is the one the validator counts, and when none holds the union is taken — the union's
+    own failure is already on the path, so trimming its secondary line cannot turn a failing case
+    green, while leaving it out accuses the answer of fields its variant declares.
+
+    The direction this must not move is in
+    `test_eval_grader_refuses_rogue_properties_in_oneof_and_anyof`, where a variant holds and the
+    other variant's field is genuinely foreign.
+    """
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_polymorphic")
+        write(composed, json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "oneOf": [{"properties": {"kind": {"const": "a"}, "a_field": {"type": "string"}},
+                       "required": ["kind", "a_field", "must"]},
+                      {"properties": {"kind": {"const": "b"}, "b_field": {"type": "string"}},
+                       "required": ["kind", "b_field"]}],
+            "properties": {"kind": {"type": "string"}},
+            "unevaluatedProperties": False}))
+
+        out = mod.validate({"kind": "a", "a_field": "x"}, composed)
+        check("the union's own failure is reported",
+              any("is not valid under any" in err for err in out), True)
+        check("the intended variant's field is not called unexpected",
+              any("Unevaluated properties" in err and "a_field" in err for err in out), False)
+
+        rogue = mod.validate({"kind": "a", "a_field": "x", "totally_rogue": 1}, composed)
+        check("a property no variant declares is still refused",
+              any("Unevaluated properties" in err and "totally_rogue" in err for err in rogue),
+              True)
+        check("and it is named alone, not beside the variant's own field",
+              any("Unevaluated properties" in err and "a_field" in err for err in rogue), False)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_unevaluated_items_are_dropped_only_when_every_position_is_covered():
+    """The array side of the same artefact, which was never cleaned at all.
+
+    `unevaluatedItems` was excluded from the filter while being excluded from its evidence too,
+    so an array under a failing branch carried a secondary line for good. It cannot be cleaned
+    by halves: the message names the VALUES it refused — measured, `('a', 'b' were unexpected)`
+    — and two equal items are one string in it, so there is no position to subtract. The whole
+    line goes only where the schema accounts for every position, and stands otherwise.
+    """
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_unevaluated_items")
+
+        def schema(items_branch):
+            return {"$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "properties": {"xs": {"type": "array",
+                                          "allOf": [items_branch],
+                                          "unevaluatedItems": False}}}
+
+        write(composed, json.dumps(schema({"items": {"type": "string"}, "minItems": 9})))
+        covered = mod.validate({"xs": ["a", "b"]}, composed)
+        check("the real failure is reported", any("too short" in err for err in covered), True)
+        check("and `items` accounts for every position, so the items line is an artefact",
+              any("Unevaluated items" in err for err in covered), False)
+
+        write(composed, json.dumps(schema({"prefixItems": [{"type": "string"}], "minItems": 9})))
+        partial = mod.validate({"xs": ["a", "b"]}, composed)
+        check("the real failure is reported on the partial branch too",
+              any("too short" in err for err in partial), True)
+        check("but one `prefixItems` entry does not account for position 1, so the line stands",
+              any("Unevaluated items" in err for err in partial), True)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_the_fallback_condition_ignores_a_property_the_instance_does_not_carry():
+    """Without jsonschema, a condition naming an optional property could not be satisfied.
+
+    The shallow matcher asked `inst_node.get(k)` for every key the condition names, so an absent
+    one compared `None` against its `const`, `enum` or `type` and refused the instance. Measured:
+    `{"env": "prod"}` did not satisfy `{"env": {"const": "prod"}, "note": {"type": "string"}}`,
+    where `note` is not required and JSON Schema constrains only the members that are there.
+    """
+    d, composed, runner = grader_tree()
+    try:
+        mod = load_runner(runner, "test_evalrun_fallback_optional")
+        condition = {"properties": {"env": {"const": "prod"}, "note": {"type": "string"}},
+                     "required": ["env"]}
+        real = dict(sys.modules)
+        sys.modules["jsonschema"] = None            # force the ImportError branch
+        try:
+            check("an optional property the instance omits does not refuse the condition",
+                  mod.check_if_match(condition, {"env": "prod"}, "", {}), True)
+            check("carrying it, and carrying it well, still holds",
+                  mod.check_if_match(condition, {"env": "prod", "note": "x"}, "", {}), True)
+            check("carrying it badly does not",
+                  mod.check_if_match(condition, {"env": "prod", "note": 7}, "", {}), False)
+            check("and a required property the instance omits still refuses it",
+                  mod.check_if_match(condition, {"note": "x"}, "", {}), False)
+        finally:
+            sys.modules.clear(); sys.modules.update(real)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_the_artefact_rule_is_scoped_to_the_path_it_is_asked_about():
+    """`artefact()` itself, on the rule rather than through an instance.
+
+    The runner read branch failures document-wide while its comment claimed this path, so one
+    error at the root switched the filter on inside every other object. Asked directly, because
+    an instance where the two readings differ is hard to build and a case that cannot fail on a
+    guard is not a test of it — `tools/agents_file_check.py` states the same rule, and these are
+    the assertions that keep the two agreeing.
+    """
+    mod = load_runner(RUNNER, "test_evalrun_artefact_rule")
+
+    class Err:
+        def __init__(self, validator, path):
+            self.validator, self.absolute_path = validator, path
+
+    line = Err("unevaluatedProperties", ("group_b",))
+    elsewhere = Err("required", ("group_a",))
+    at_path = Err("required", ("group_b",))
+    under_path = Err("type", ("group_b", "x"))
+    closer_below = Err("unevaluatedProperties", ("group_b", "x"))
+    root_line = Err("unevaluatedItems", ())
+
+    check("an error in another object is not evidence about this one",
+          mod.artefact(line, [line, elsewhere]), False)
+    check("an error at this path is", mod.artefact(line, [line, at_path]), True)
+    check("an error under it is too", mod.artefact(line, [line, under_path]), True)
+    check("a closer firing one level down is a cause, since it fails the branch that carries it",
+          mod.artefact(line, [line, closer_below]), True)
+    check("nothing justifies itself", mod.artefact(line, [line]), False)
+    check("the root asks about everything, so any other error answers it",
+          mod.artefact(root_line, [root_line, elsewhere]), True)
+    check("and the rule answers only about an unevaluated* line",
+          mod.artefact(at_path, [at_path, under_path]), False)
 
 
 def test_then_else_without_if_is_ignored():

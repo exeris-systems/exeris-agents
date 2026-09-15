@@ -60,6 +60,7 @@ English everywhere — source, comments, commit messages, pull-request titles, d
 | [`bundle/`](bundle) | What a consuming repository vendors: `policies/`, `schemas/`, `hooks/bin/`, `evals/`. Read [`bundle/BUNDLE.md`](bundle/BUNDLE.md) first. |
 | [`tools/`](tools) | What CI checks out: the renderer, the agent-file checker, the bundle materialiser, the vendor mappings. |
 | [`CHANGELOG.md`](CHANGELOG.md) | The contract history. A `bundle/` change without an entry is incomplete. |
+| [`MIGRATION.md`](MIGRATION.md) | What a consumer has to type to cross a version. A release with a non-empty `### Breaking` section gains a section here before its tag (`changelog-conventions.md` rule 8). |
 
 ## Verification and reporting
 
