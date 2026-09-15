@@ -293,8 +293,16 @@ def check_if_match(
                 return False
     try:
         import jsonschema
+        # `registry=None` is not "no registry": it replaces jsonschema's own default with None,
+        # and the validator raises `AttributeError` reaching for `_resources` on first use. The
+        # `except` below would then answer "the condition does not hold" — the defect this
+        # function was just fixed for, arriving through a different door and silent, because the
+        # catch is what answered. Everything inside `validate()` carries a real registry; the
+        # callers that do not are this function's own signature, where `registry` defaults, and
+        # `find_declared_props()`, which five cases in the regression suite call positionally.
+        carried = {"registry": registry} if registry is not None else {}
         validator = jsonschema.Draft202012Validator(
-            in_definition_context(if_node, defs_owner), registry=registry)
+            in_definition_context(if_node, defs_owner), **carried)
         return bool(validator.is_valid(inst_node))
     except ImportError:
         pass

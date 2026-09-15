@@ -1564,6 +1564,44 @@ def test_check_if_match_resolves_a_nested_ref_condition():
         shutil.rmtree(d)
 
 
+def test_a_condition_resolves_without_a_registry_being_handed_in():
+    """The same defect as the nested `$ref` one above, through a different door.
+
+    `registry=None` is not "no registry": it replaces jsonschema's default with None and the
+    validator raises `AttributeError` on first use, which `check_if_match()`'s own `except` reads
+    as "the condition does not hold". Measured: a satisfied condition answered `False`, and
+    `find_declared_props()` — called the way five cases in this file call it, positionally and
+    with no registry — lost the whole `then` branch and fell back to the union of both `oneOf`
+    variants. Invisible, because the catch is what answered.
+
+    Inside `validate()` the registry is always real, so this is about the helpers' own contract:
+    a default that cannot be used is not a default.
+    """
+    mod = load_runner(RUNNER, "test_evalrun_default_registry")
+    condition = {"properties": {"env": {"const": "prod"}}, "required": ["env"]}
+    check("a satisfied condition holds when no registry is handed in",
+          mod.check_if_match(condition, {"env": "prod"}), True)
+    check("and an unsatisfied one still does not",
+          mod.check_if_match(condition, {"env": "dev"}), False)
+
+    conditional = {"properties": {"env": {"type": "string"}},
+                   "if": condition,
+                   "then": {"properties": {"prod_secret": {"type": "string"}}}}
+    check("the active `then` branch is declared without a registry too",
+          sorted(mod.find_declared_props(conditional, (), ".",
+                                         inst_node={"env": "prod", "prod_secret": "x"})),
+          ["env", "prod_secret"])
+
+    poly = {"oneOf": [{"properties": {"kind": {"const": "a"}, "a_field": {"type": "string"}},
+                       "required": ["kind"]},
+                      {"properties": {"kind": {"const": "b"}, "b_field": {"type": "string"}},
+                       "required": ["kind"]}],
+            "properties": {"kind": {"type": "string"}}}
+    check("and the variant that holds is the one taken, rather than the union of both",
+          sorted(mod.find_declared_props(poly, (), ".", inst_node={"kind": "a", "a_field": "x"})),
+          ["a_field", "kind"])
+
+
 def test_the_matched_if_subschema_declares_its_own_properties():
     """When the condition holds, the `if` subschema's OWN properties are evaluated too.
 

@@ -282,7 +282,10 @@ number.
   `tools/agents_file_check.py` — `unevaluatedItems` is cleaned where the schema accounts for every
   position (and never by halves: its message names values, not positions), and a condition naming
   an optional property no longer fails the jsonschema-less fallback, where `properties` constrains
-  only the members the instance carries. (#10, ADR-085)
+  only the members the instance carries. A defaulted registry no longer reaches the validator as
+  `None`, where it raised and the catch turned the raise back into a condition that does not hold:
+  `validate()` always passed a real one, so this was the helpers' own contract and the same defect
+  through a different door. (#10, ADR-085)
 - **The checker's schema AST cache leaked between in-process runs.** Module-level `_PARSED` in
   `tools/agents_file_check.py` was never cleared on `run_checks()`, so consecutive invocations within
   a test or runner process re-used stale parsed schemas from earlier trees. (#10, ADR-085)
