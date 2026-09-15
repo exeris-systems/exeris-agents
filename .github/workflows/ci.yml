@@ -11,8 +11,8 @@ jobs:
   tools:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install pyyaml jsonschema
       - name: Tools import and parse
@@ -40,6 +40,12 @@ jobs:
       # review environment is in on every bump.
       - name: Hook dispatcher regression suite
         run: python tests/test_dispatch.py
+      # From 2.0.0 the bases close nothing and the composition closes everything, so the refusals
+      # a consumer relies on live in a schema this repository does not hold. This suite builds one
+      # and measures both halves: what the composition refuses, and what the checker says when a
+      # composition carries no closer.
+      - name: Schema closer regression suite
+        run: python tests/test_schema_closers.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'
@@ -66,10 +72,10 @@ jobs:
   against-consumer:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with: { repository: exeris-systems/exeris-docs, path: consumer }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install pyyaml jsonschema
       - name: agent-file check against exeris-docs

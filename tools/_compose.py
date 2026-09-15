@@ -60,6 +60,66 @@ def vendor_root(manifest: dict) -> str | None:
     return os.path.join(VENDOR, f"{imp['bundle']}-{imp['version']}")
 
 
+def located(schema: dict, path: str) -> dict:
+    """The schema, carrying the file it was read from as its `$id`.
+
+    Nothing in the bundle carries one — an `$id` in a vendored base would make its canonical
+    identifier a URL to fetch or register — and a validator without one starts from an empty base
+    URI, where `urljoin` normalises the leading `../` off a relative reference and the second hop
+    lands nowhere. The file is the identifier because rule 8 lets a reference resolve from the
+    filesystem and nowhere else, so it wins over an `$id` a schema declares.
+    """
+    from pathlib import Path
+    if not isinstance(schema, dict):
+        return schema
+    return {**schema, "$id": Path(os.path.abspath(path)).as_uri()}
+
+
+def resolves_from(uri: str, base_dir: str) -> str:
+    """The file a `$ref` names: a `file:` URI, an absolute path, or one relative to `base_dir`."""
+    from urllib.parse import unquote, urlparse
+    if uri.startswith("file:"):
+        return unquote(urlparse(uri).path)
+    if os.path.isabs(uri):
+        return uri
+    return os.path.normpath(os.path.join(base_dir, uri))
+
+
+def registry_over(read, base_dir: str):
+    """A `referencing` registry that retrieves through `read`, a caller's schema reader.
+
+    The third copy of this was the one that had to move. `bundle/evals/run.py` keeps its own,
+    because a vendored runner cannot import `tools/`; everything on this side comes here. `read`
+    returns a parsed document or None, and what it does about containment is its own business —
+    the grader guards against the repository it evaluates, the checker against the tree it walks.
+    """
+    from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
+
+    def retrieve(uri: str):
+        document = read(resolves_from(uri, base_dir))
+        if document is None:
+            raise FileNotFoundError(f"$ref '{uri}' is not readable JSON inside this repository")
+        return Resource.from_contents(document, default_specification=DRAFT202012)
+
+    return Registry(retrieve=retrieve)
+
+
+def vendor_roots(manifest: dict) -> list[str]:
+    """Every `.agents/vendor/<bundle>-<version>` the manifest pins.
+
+    `vendor_root()` above answers with the first import, which is right for what it is asked: a
+    `bundle:` prefix resolves against the one bundle whose policies a profile composes. Whether a
+    `$ref` lands in *a* pinned tree is a different question, and answering it with the first import
+    calls every other pinned bundle a tree the manifest does not pin.
+    """
+    roots = []
+    for imp in manifest.get("imports") or []:
+        if isinstance(imp, dict) and imp.get("bundle") and imp.get("version"):
+            roots.append(os.path.join(VENDOR, f"{imp['bundle']}-{imp['version']}"))
+    return roots
+
+
 def resolve(kind: str, name: str, root: str | None) -> tuple[str | None, str | None]:
     """Return (path, error). `kind` is a directory under `.agents/` — policies, references.
 
