@@ -35,6 +35,21 @@ hooks:
       - 'git\\s+push\\b[^|;&]*\\s\\+?[^\\s:]*:(refs/heads/)?(main|master)'
       - '(^|[|;&]\\s*)npm\\s+publish\\b'
       - 'git\\s+tag\\s+(?!-(l|-list|n\\d*)\\b)(-[a-zA-Z]+\\s+)*\\S'
+  - id: deny-credential-shell
+    event: pre-tool
+    tool: shell
+    decision: deny
+    reason: "test policy: founder credentials"
+    match:
+      - '(~|\\$HOME|/home/[^/\\s]+|/Users/[^/\\s]+)/\\.ssh(/|\\s|$)'
+      - '(~|\\$HOME|/home/[^/\\s]+|/Users/[^/\\s]+)/\\.config/(gh|exeris-agent)(/|\\s|$)'
+      - '(~|\\$HOME|/home/[^/\\s]+|/Users/[^/\\s]+)/\\.git-credentials\\b'
+  - id: deny-credential-read
+    event: pre-tool
+    tool: read
+    decision: deny
+    reason: "test policy: founder credentials"
+    paths: ['~/.ssh/**', '~/.config/gh/**', '~/.config/exeris-agent/**', '~/.git-credentials']
   - id: record-guardrail-run
     event: post-tool
     tool: shell
@@ -369,6 +384,46 @@ def test_deny_matcher():
                 "grep -rn 'npm publish' README.md"]:
         out, _ = call(r, "deny-irreversible", {"tool_input": {"command": cmd}})
         check(f"allow: {cmd}", decision_of(out), "allow")
+    shutil.rmtree(r)
+
+
+def test_deny_reads_a_path_not_only_a_command():
+    """A deny rule read the command and nothing else, so wired to the read tool it allowed every
+    file: the file arrives as `file_path`, not as a command. `paths` on a deny rule is the
+    recorders' vocabulary and a hit is a deny. Home-anchored globs (`~/...`) are matched against
+    the absolute path, because a credential store is outside the repository by definition."""
+    r = fresh_repo()
+    home = os.path.expanduser("~")
+    for p in [f"{home}/.ssh/id_ed25519", f"{home}/.config/gh/hosts.yml",
+              f"{home}/.config/exeris-agent/exeris-agent.2026-09-17.private-key.pem",
+              f"{home}/.git-credentials", "~/.ssh/config"]:
+        out, _ = call(r, "deny-credential-read", {"tool_input": {"file_path": p}})
+        check(f"deny read: {p}", decision_of(out), "deny")
+    for p in ["README.md", os.path.join(r, "docs", "x.md"), ".ssh/not-a-home-dir",
+              f"{home}/projects/x/hosts.yml"]:
+        out, _ = call(r, "deny-credential-read", {"tool_input": {"file_path": p}})
+        check(f"allow read: {p}", decision_of(out), "allow")
+    # A command-only deny rule given a file event stays an allow — no regression for the
+    # existing rules, which never named `paths`.
+    out, _ = call(r, "deny-irreversible", {"tool_input": {"file_path": f"{home}/.ssh/id_ed25519"}})
+    check("a command-only deny rule ignores a path", decision_of(out), "allow")
+    shutil.rmtree(r)
+
+
+def test_deny_credential_paths_in_shell_commands():
+    """The shell half of the same rule: a credential path named in a command is a deny, whichever
+    spelling of the home directory the model reaches for."""
+    r = fresh_repo()
+    for cmd in ["cat ~/.ssh/id_ed25519", "cat $HOME/.config/gh/hosts.yml",
+                "cp /home/arkstack/.config/exeris-agent/key.pem /tmp/k",
+                "ssh-keygen -y -f ~/.ssh/id_rsa", "gh auth token --hostname github.com > x; cat ~/.git-credentials",
+                "ls ~/.ssh"]:
+        out, _ = call(r, "deny-credential-shell", {"tool_input": {"command": cmd}})
+        check(f"deny shell: {cmd}", decision_of(out), "deny")
+    for cmd in ["cat README.md", "ls .ssh-notes", "git push -u origin feat/x",
+                "grep -rn 'ssh' docs/", "cat ~/.config/git/ignore", "echo $HOME"]:
+        out, _ = call(r, "deny-credential-shell", {"tool_input": {"command": cmd}})
+        check(f"allow shell: {cmd}", decision_of(out), "allow")
     shutil.rmtree(r)
 
 
