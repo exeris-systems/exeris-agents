@@ -4,7 +4,7 @@ type: reference
 visibility: public
 owning-repo: exeris-agents
 status: active
-last-verified: 2026-09-08
+last-verified: 2026-09-18
 ---
 
 # exeris-agents: the shared agent bundle
@@ -59,6 +59,7 @@ English everywhere — source, comments, commit messages, pull-request titles, d
 |:--|:--|
 | [`bundle/`](bundle) | What a consuming repository vendors: `policies/`, `schemas/`, `hooks/bin/`, `evals/`. Read [`bundle/BUNDLE.md`](bundle/BUNDLE.md) first. |
 | [`tools/`](tools) | What CI checks out: the renderer, the agent-file checker, the bundle materialiser, the vendor mappings. |
+| [`ci/`](ci) | What this repository's own CI runs and no consumer vendors: the contract gate of [`docs/repo-review-rules.md`](docs/repo-review-rules.md). |
 | [`CHANGELOG.md`](CHANGELOG.md) | The contract history. A `bundle/` change without an entry is incomplete. |
 | [`MIGRATION.md`](MIGRATION.md) | What a consumer has to type to cross a version. A release with a non-empty `### Breaking` section gains a section here before its tag (`changelog-conventions.md` rule 8). |
 
@@ -73,6 +74,12 @@ python3 tools/agents_render.py --check --root ../exeris-docs
 python3 tools/agents_bundle.py verify  --root ../exeris-docs
 python3 tools/agents_bundle.py digest  --from .
 
+# the rules of docs/repo-review-rules.md that are a program rather than a reader. Two of
+# them are diff-scoped, so it needs a base — handed one it cannot resolve, it reports them
+# as not-run rather than passing them.
+python3 ci/contract_check.py gate      --root .
+python3 tests/test_contract_check.py
+
 # and the evals, driven by THIS branch's runner rather than the consumer's pinned copy — otherwise
 # the run only re-reports whichever version that repository is behind on. Copy into a scratch copy
 # of the consumer: the runner writes its report inside the tree it evaluates.
@@ -86,6 +93,11 @@ and report a check that did not run as not run
 ([`bundle/policies/error-handling-and-fallback.md`](bundle/policies/error-handling-and-fallback.md)
 rule 1). A change to `bundle/` that a consumer's evals cover reruns them and the pull request names
 the run (schema rule 14) — a change to `bundle/schemas/` or to `evals/run.py` always covers them.
+
+## Review
+
+This repository's review rules are [`docs/repo-review-rules.md`](docs/repo-review-rules.md), which
+also says which of them are a program (`ci/contract_check.py`) and which need a reader.
 
 ## Safety
 

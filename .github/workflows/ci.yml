@@ -17,7 +17,7 @@ jobs:
       - run: pip install pyyaml jsonschema
       - name: Tools import and parse
         run: |
-          python -m compileall -q tools bundle/hooks/bin bundle/evals
+          python -m compileall -q tools bundle/hooks/bin bundle/evals ci
           python tools/agents_render.py --help > /dev/null
           python tools/agents_file_check.py --help > /dev/null
           python tools/agents_bundle.py --help > /dev/null
@@ -46,6 +46,8 @@ jobs:
       # composition carries no closer.
       - name: Schema closer regression suite
         run: python tests/test_schema_closers.py
+      - name: Contract gate regression suite
+        run: python tests/test_contract_check.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'
@@ -66,6 +68,21 @@ jobs:
           a=$(python tools/agents_bundle.py digest --from .)
           b=$(python tools/agents_bundle.py digest --from .)
           echo "$a"; [ "$a" = "$b" ] || { echo "::error::digest is not reproducible"; exit 1; }
+
+  # Its own job for the checkout alone: the diff-scoped rules need a base, and the `tools` job
+  # clones at depth 1, where none resolves — the gate would report them not-run and pass, looking
+  # exactly like a gate that ran. The rules are docs/repo-review-rules.md.
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+      - name: The bundle's own contract rules
+        env:
+          GUARDRAILS_BASE: ${{ github.event.pull_request.base.sha }}
+        run: python ci/contract_check.py gate --root .
 
   # A renderer that is green against nothing has proved nothing. exeris-docs is the pilot consumer,
   # so the tools are exercised against its real tree on every change to them.

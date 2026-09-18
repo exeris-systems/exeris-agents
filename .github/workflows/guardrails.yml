@@ -38,6 +38,12 @@ jobs:
         {"docs-lint": "${{ needs.docs.result }}",
          "commit-lint": "${{ needs.commits.result }}",
          "pr-body-check": "${{ needs.pr-body.result }}"}
+      # This repository's own rules, and the checks CI runs for the reviewer before the model
+      # starts. Both seams are documented in docs-review.yml's input descriptions.
+      repo-routine: docs/repo-review-rules.md
+      repo-checks: >-
+        python3 tests/test_contract_check.py;
+        python3 ci/contract_check.py locate --root .
     secrets:
       claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
