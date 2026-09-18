@@ -22,7 +22,7 @@ what is true; this repository is what makes it run.**
 
 ```bash
 # once, when choosing a version — the network is used here, by a human, and nowhere else
-python3 tools/agents_bundle.py vendor --root ../my-repo --from . --version 2.0.0 --ref <sha>
+python3 tools/agents_bundle.py vendor --root ../my-repo --from . --version 2.1.0 --ref <sha>
 ```
 
 It prints the pin to paste into `.agents/manifest.yaml`:
@@ -30,7 +30,7 @@ It prints the pin to paste into `.agents/manifest.yaml`:
 ```yaml
 imports:
   - bundle: exeris-agents
-    version: 2.0.0
+    version: 2.1.0
     ref: <full commit sha>
     sha256: sha256:<digest over every vendored byte>
 ```
@@ -46,19 +46,19 @@ and a repository's schema narrows a base one instead of copying it:
 
 ```json
 { "allOf": [
-    { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json" },
+    { "$ref": "../vendor/exeris-agents-2.1.0/schemas/verdict.base.schema.json" },
     { "properties": {
         "agent": { "enum": ["my-repo-reviewer"] },
         "findings": { "items": {
           "allOf": [
-            { "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/findings/items" },
+            { "$ref": "../vendor/exeris-agents-2.1.0/schemas/verdict.base.schema.json#/properties/findings/items" },
             { "properties": { "tag": { "enum": ["style", "correctness"] } } } ],
           "unevaluatedProperties": false } },
         "checks_run": { "items": {
-          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/checks_run/items",
+          "$ref": "../vendor/exeris-agents-2.1.0/schemas/verdict.base.schema.json#/properties/checks_run/items",
           "unevaluatedProperties": false } },
         "handoffs": { "items": {
-          "$ref": "../vendor/exeris-agents-2.0.0/schemas/verdict.base.schema.json#/properties/handoffs/items",
+          "$ref": "../vendor/exeris-agents-2.1.0/schemas/verdict.base.schema.json#/properties/handoffs/items",
           "unevaluatedProperties": false } } } } ],
   "unevaluatedProperties": false }
 ```

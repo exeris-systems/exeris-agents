@@ -4,7 +4,7 @@ type: changelog
 visibility: public
 owning-repo: exeris-agents
 status: active
-last-verified: 2026-09-15
+last-verified: 2026-09-18
 ---
 
 # Changelog
@@ -30,6 +30,36 @@ is an answer and the section's presence never implies MAJOR. Its content, agains
 above, decides the number.
 
 ## [Unreleased]
+
+## [2.1.0] - 2026-09-18
+
+### Breaking
+
+- Nothing. A deny rule that names no `paths` behaves exactly as before; a repository-relative glob
+  keeps its meaning. MINOR by the preamble's rule: a new capability of a rule kind that already
+  existed.
+
+### Added
+
+- **A deny rule reads the path, not only the command.** `decision: deny` matched the shell command
+  and nothing else, so a deny rule wired to the read or edit tool (`tool: read`, `tool: edit`)
+  answered "allow" to every file — a file arrives on the event as `file_path`, never as a command,
+  and the branch never looked. `paths:` on a deny rule now uses the recorders' vocabulary, and a hit
+  is a deny. The first consumer is the credential rule RFC-2026-09-17 (agent execution identity)
+  needs as its Q8 baseline: `~/.ssh/**`, `~/.config/gh/**`, `~/.config/exeris-agent/**`,
+  `~/.git-credentials` — the founder's credentials from the agent's point of view, which under an
+  environment-only isolation stay readable on disk and are caught here as a tripwire (ADR-085
+  §J.31a's word), never as a proof.
+- **Home-anchored globs.** A glob beginning `~/` or `$HOME/` is about a file outside the
+  repository and is matched against the tool's path made absolute, `~` expanded on both sides.
+  Every other glob keeps its repository-relative meaning, and the two never mix: `~/.ssh/**` does
+  not match a `.ssh` vendored under the checkout and `**/.ssh/**` does not start denying the home
+  directory. Without this, `relpath` turned `~/.ssh/id_ed25519` into `../../.ssh/id_ed25519` and
+  no glob a person would write matched it.
+- `tests/test_hook.py`: `deny-credential-read` and `deny-credential-shell` in the fixture, with
+  the deny cases (five paths, six command spellings including `$HOME` and an absolute home) and
+  the allow cases (repository files, a `.ssh` directory inside the checkout, `~/.config/git/**`,
+  a command-only deny rule handed a file event). 75 assertions, from 53.
 
 ## [2.0.0] - 2026-09-15
 
