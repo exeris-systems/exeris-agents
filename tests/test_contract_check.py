@@ -2,16 +2,14 @@
 """One case per way of failing each contract gate — `ci/contract_check.py`.
 
 The suite exists for the same reason `.github`'s own R2 does: a rule nothing can fail on is not
-enforced, it is described. Every case here was run against a checker with the rule it covers
-removed, which is the only sense in which a case "covers" anything: G1, both halves of G2, G3, G4,
-the R5 locator, `migration_covers`, the ref shape check, the stated-base resolution check, the root
-directory check and the read allowlist each turned this suite red.
+enforced, it is described. So a case here earns its place by failing when the rule it covers is
+taken out of the checker, and that is the standard a new case is held to — every gate, every
+locator and every input guard below meets it.
 
-`release_section`'s boundary is the one exception, and it is a fact about the coverage rather than
-a gap in it: removing the `break` that ends a section at the next release heading fails nothing
-here, because the loop also leaves the section when that heading flips `inside` to False. The
-boundary is enforced twice and neither half is load-bearing alone, so the case asserts the
-behaviour and not the line.
+`release_section`'s boundary is the one that cannot: the loop leaves a section both by the `break`
+at the next release heading and by that heading flipping `inside`, so removing either alone changes
+nothing a case can observe. The boundary is enforced twice and neither half is load-bearing, which
+is why the case asserts the behaviour rather than the line.
 
 Run: python3 tests/test_contract_check.py
 """
@@ -462,12 +460,26 @@ def test_a_policy_change_that_only_adds_is_not_a_relaxation():
     check("adding is not relaxing", rules(r), [])
 
 
-def test_the_standing_debt_is_this_repository_s_own():
-    """Measured, and the reason G3/G4 are forward-only: three releases cannot satisfy them."""
+def test_a_breaking_section_with_no_migration_is_standing_debt():
+    d = tree(RELEASED, "# Migration\n")
     r = rep()
-    cc.locate_standing_debt(ROOT, r)
-    check("three standing gaps", len(r.findings), 3)
-    check("all of them debt", set(rules(r)), {"debt"})
+    cc.locate_standing_debt(d, r)
+    check("both releases", len(r.findings), 2)
+    check("as debt", set(rules(r)), {"debt"})
+
+
+def test_a_release_that_paid_for_its_breaking_is_not_debt():
+    d = tree(RELEASED, "# Migration\n\n## 2.0 → 3.0\n\n## 1.4 → 2.0\n")
+    r = rep()
+    cc.locate_standing_debt(d, r)
+    check("nothing standing", rules(r), [])
+
+
+def test_a_release_missing_its_breaking_section_is_standing_debt():
+    d = tree(NO_SECTION, "# Migration\n\n## 1.4 → 2.0\n")
+    r = rep()
+    cc.locate_standing_debt(d, r)
+    check("the absent section", rules(r), ["debt"])
 
 
 if __name__ == "__main__":

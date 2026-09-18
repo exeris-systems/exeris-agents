@@ -34,9 +34,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from _common import Report                                             # noqa: E402
 
 # The three keys that close a schema. A base that carries one cannot be extended by the schema that
-# composes it — which is the whole of the 2.0.0 release, and the state a later edit can undo in one
-# line with nothing going red. `unevaluatedItems` is here beside the other two because an array
-# closed in the base is closed for a composition just as an object is.
+# composes it, and the loss is silent: the composition still validates, it simply stops refusing.
+# `unevaluatedItems` is here beside the other two because an array closed in the base is closed for
+# a composition just as an object is.
 CLOSERS = ("additionalProperties", "unevaluatedProperties", "unevaluatedItems")
 # Role vocabulary is per-repository by design: the base leaves these open and the repository
 # narrows them (agents-md-schema.md rule 10 keeps the repository prefix). A name that appears in a
@@ -293,10 +293,9 @@ def gate_release_sections(root: str, changed: set[str], changelog_diff: str,
                           migration_diff: str, rep: Report) -> None:
     """G3 and G4 — a release added HERE carries a Breaking section, and pays for a non-empty one.
 
-    Forward-only, on measurement: `1.1.1` carries no `### Breaking` section at all, and `1.1.0`
-    and `1.4.0` carry non-empty ones with no section in `MIGRATION.md`. A whole-tree form would be
-    red on history that cannot be edited — the permanently-red gate `commit-lint.yml` describes and
-    works around for the same reason. `locate` reports those gaps instead.
+    Forward-only: a release already cut cannot be edited to satisfy a rule added after it, so a
+    whole-tree form of this would be a permanently red gate, which is a gate people learn to
+    ignore. Releases that predate the rule are `locate`'s to report, never this one's to refuse.
     """
     text = read(root, "CHANGELOG.md")
     migration = read(root, "MIGRATION.md")
