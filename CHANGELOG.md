@@ -4,7 +4,7 @@ type: changelog
 visibility: public
 owning-repo: exeris-agents
 status: active
-last-verified: 2026-09-15
+last-verified: 2026-09-18
 ---
 
 # Changelog
@@ -31,7 +31,7 @@ above, decides the number.
 
 ## [Unreleased]
 
-## [2.1.0] - 2026-09-17
+## [2.1.0] - 2026-09-18
 
 ### Breaking
 
