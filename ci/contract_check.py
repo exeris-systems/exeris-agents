@@ -53,6 +53,18 @@ VERSION_IN_HEADING = re.compile(r"\d+\.\d+(?:\.\d+)?")
 # The executable surface: a change here is a change to what runs in twenty checkouts.
 EXECUTABLE = ("tools/", "bundle/hooks/bin/", "bundle/evals/run.py", "ci/")
 PUBLICATION = (".github/workflows/release.yml", "bundle/policies/agent-safety-and-autonomy.md")
+# A ref reaches `git` as an argument, and one beginning with `-` is an OPTION rather than a
+# revision — `--upload-pack=…` is the well-known shape of that. The value arrives from a CLI flag or
+# an environment variable, which is repository configuration rather than repository content, but it
+# is shape-checked before it is used rather than trusted for where it came from. Deliberately the
+# same expression as `agents_pin.py` in exeris-systems/.github, which guards the same class of value
+# for the same reason: a second spelling of one rule is a rule that drifts.
+SAFE_REF = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,119}\Z")
+# Every file this checker reads, by name. It reads four things and no others, so the set is written
+# down rather than implied by three separate `os.path.join` calls — which is also what keeps a root
+# it was handed from reaching a path nobody here intended.
+READS = ("CHANGELOG.md", "MIGRATION.md", "package.json")
+SCHEMA_DIR = ("bundle", "schemas")
 
 
 # --------------------------------------------------------------------------- git
@@ -67,17 +79,42 @@ def git(root: str, *args: str) -> str | None:
 
 
 def resolve_base(root: str, explicit: str | None) -> str | None:
-    """The ref to diff against, first of the candidates that git can actually resolve.
+    """The ref to diff against: what the caller STATED, or failing that what this can derive.
 
-    `GUARDRAILS_BASE` is the name `docs-lint.yml` already passes a base SHA under, so a caller that
-    sets it for one check sets it for both rather than learning a second spelling.
+    The two halves answer to different rules, and collapsing them is how a gate comes to answer a
+    question nobody asked. A base the caller stated — `--base`, or `GUARDRAILS_BASE`, the name
+    `docs-lint.yml` already passes one under — must be well-shaped and must resolve; when it is
+    neither, this stops rather than falling through, because diffing against `main` instead and
+    reporting the result as though it answered is the confident-wrong-answer class
+    `bundle/policies/error-handling-and-fallback.md` exists for. A candidate this function derived
+    is a guess by construction, so a guess that does not resolve simply yields to the next one.
+
+    Shape before git either way: a ref beginning with `-` is an OPTION to `git`, not a revision.
     """
+    stated = explicit or os.environ.get("GUARDRAILS_BASE") or None
+    if stated:
+        if not SAFE_REF.match(stated):
+            raise SystemExit(f"contract_check: base {stated!r} is not a plain ref name, so it was "
+                             f"not passed to git")
+        if not git(root, "rev-parse", "--verify", "--quiet", f"{stated}^{{commit}}"):
+            raise SystemExit(f"contract_check: base {stated!r} does not resolve in this checkout — "
+                             f"a shallow clone is the usual reason, and the diff-scoped rules need "
+                             f"the base commit")
+        return stated
     branch = os.environ.get("GITHUB_BASE_REF")
-    for candidate in (explicit, os.environ.get("GUARDRAILS_BASE"),
-                      f"origin/{branch}" if branch else None, "origin/main", "main"):
-        if candidate and git(root, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"):
+    for candidate in (f"origin/{branch}" if branch else None, "origin/main", "main"):
+        if (candidate and SAFE_REF.match(candidate)
+                and git(root, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}")):
             return candidate
     return None
+
+
+def resolved_root(path: str) -> str:
+    """The root, made absolute once, so every read below joins onto a directory that exists."""
+    real = os.path.realpath(path)
+    if not os.path.isdir(real):
+        raise SystemExit(f"contract_check: --root {path!r} is not a directory")
+    return real
 
 
 def changed_paths(root: str, base: str) -> set[str]:
@@ -166,8 +203,13 @@ def migration_covers(text: str, version: str) -> bool:
 
 
 def read(root: str, name: str) -> str:
+    """One of the files in `READS`, from `root`. A name outside that set is a programming error
+    here rather than a configuration one, so it raises rather than returning an empty string that
+    would read downstream as "the file is not there"."""
+    if name not in READS:
+        raise ValueError(f"contract_check reads {READS}, not {name!r}")
     try:
-        with open(os.path.join(root, name), encoding="utf-8") as fh:
+        with open(os.path.join(resolved_root(root), name), encoding="utf-8") as fh:
             return fh.read()
     except OSError:
         return ""
@@ -198,7 +240,7 @@ def gate_bases_are_open(root: str, rep: Report) -> None:
     and a base that acquired a closer through a merge nobody diffed is exactly as broken as one
     that acquired it here.
     """
-    schema_dir = os.path.join(root, "bundle", "schemas")
+    schema_dir = os.path.join(resolved_root(root), *SCHEMA_DIR)
     for name in sorted(os.listdir(schema_dir)) if os.path.isdir(schema_dir) else []:
         if not name.endswith(".base.schema.json"):
             continue
@@ -354,9 +396,8 @@ def locate_version_coherence(root: str, rep: Report) -> None:
     the tag. Here it is evidence: a mismatch on a branch is normal mid-release and tells a reader
     which half of the release is done."""
     try:
-        with open(os.path.join(root, "package.json"), encoding="utf-8") as fh:
-            pkg = json.load(fh).get("version")
-    except (OSError, ValueError):
+        pkg = json.loads(read(root, "package.json") or "{}").get("version")
+    except ValueError:
         return
     newest = next(iter(released_versions(read(root, "CHANGELOG.md"))), None)
     if pkg and newest and pkg != newest:

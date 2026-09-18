@@ -4,7 +4,8 @@
 The suite exists for the same reason `.github`'s own R2 does: a rule nothing can fail on is not
 enforced, it is described. So every case here was run against a checker with the rule it covers
 removed, which is the only sense in which a case "covers" anything: G1, both halves of G2, G3, G4,
-the R5 locator and `migration_covers` each turned this suite red when their rule was taken out.
+the R5 locator, `migration_covers`, the ref shape check, the stated-base resolution check, the root
+directory check and the read allowlist each turned this suite red when their rule was taken out.
 
 One mutation did not, and it is recorded rather than tidied away. Removing the `break` that ends
 `release_section` at the next release heading changes nothing the suite can see, because the loop
@@ -316,6 +317,7 @@ def git_repo() -> str:
 
 
 def test_the_diff_plumbing_answers_over_a_real_repository():
+    no_ambient_base()
     d = git_repo()
     open(os.path.join(d, "bundle", "policies", "p.md"), "w").write("Always do Y.\n")
     subprocess.run(["git", "commit", "-qam", "relax"], cwd=d, check=True, capture_output=True)
@@ -327,6 +329,82 @@ def test_the_diff_plumbing_answers_over_a_real_repository():
     g = rep()
     cc.gate_bundle_carries_changelog(cc.changed_paths(d, "base-ref"), g)
     check("and G1 fires on the same diff", rules(g), ["G1"])
+
+
+def refused(fn) -> str:
+    """Why the run stopped, not merely that it did.
+
+    The reason is the assertion: with the shape check taken out, `--upload-pack=…` still stops the
+    run — git cannot resolve it either — so a case asserting only "it stopped" passes against a
+    checker that no longer has the guard it is supposed to cover. The two refusals say different
+    things and the cases read which one spoke.
+    """
+    try:
+        fn()
+    except SystemExit as exc:
+        text = str(exc)
+        if "not a plain ref name" in text:
+            return "shape"
+        if "does not resolve" in text:
+            return "unresolved"
+        if "is not a directory" in text:
+            return "not-a-directory"
+        return f"stopped: {text}"
+    return "returned"
+
+
+def no_ambient_base():
+    """`resolve_base` reads the environment, so a case about it has to own the environment.
+
+    Without this the suite passes or fails by where it is run: `GUARDRAILS_BASE` is set in the
+    `contract` job and absent in `tools`, and a case asserting the derived chain would be answering
+    a different question in each.
+    """
+    for key in ("GUARDRAILS_BASE", "GITHUB_BASE_REF"):
+        os.environ.pop(key, None)
+
+
+def test_a_stated_base_that_is_an_option_stops_the_run():
+    """`git` reads a leading `-` as an option, not a revision — `--upload-pack=` is the shape.
+
+    It stops rather than falling back: a base the caller named and this refused, answered by
+    diffing against `main` instead, is a gate reporting on a question nobody asked.
+    """
+    no_ambient_base()
+    d = git_repo()
+    check("an option", refused(lambda: cc.resolve_base(d, "--upload-pack=touch /tmp/x")), "shape")
+    check("a shell attempt", refused(lambda: cc.resolve_base(d, "base-ref; rm -rf /")), "shape")
+    check("a plain ref is not refused", cc.resolve_base(d, "base-ref"), "base-ref")
+
+
+def test_a_stated_base_that_does_not_resolve_stops_the_run():
+    """The shape check is a filter in front of git, never a substitute for asking it."""
+    no_ambient_base()
+    d = git_repo()
+    check("well-shaped and absent", refused(lambda: cc.resolve_base(d, "no-such-branch")), "unresolved")
+
+
+def test_a_derived_candidate_only_yields_to_the_next():
+    """Nothing stated, so the chain is this function's own guesswork and a miss is not an error."""
+    no_ambient_base()
+    d = git_repo()
+    check("falls through to main", cc.resolve_base(d, None), "main")
+
+
+def test_the_root_must_be_a_directory():
+    missing = os.path.join(tempfile.mkdtemp(), "not-there")
+    check("a missing root", refused(lambda: cc.resolved_root(missing)), "not-a-directory")
+
+
+def test_the_checker_reads_only_the_files_it_names():
+    """Three files and no others. A name outside the set is a programming error, not an empty read."""
+    d = tree("# Changelog\n")
+    check("a named file", cc.read(d, "CHANGELOG.md"), "# Changelog\n")
+    try:
+        cc.read(d, "../../../etc/passwd")
+        check("anything else raises", "returned", "ValueError")
+    except ValueError:
+        check("anything else raises", "ValueError", "ValueError")
 
 
 def test_no_base_is_reported_not_skipped():
