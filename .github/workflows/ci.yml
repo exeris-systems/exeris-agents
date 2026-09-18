@@ -17,7 +17,7 @@ jobs:
       - run: pip install pyyaml jsonschema
       - name: Tools import and parse
         run: |
-          python -m compileall -q tools bundle/hooks/bin bundle/evals
+          python -m compileall -q tools bundle/hooks/bin bundle/evals ci
           python tools/agents_render.py --help > /dev/null
           python tools/agents_file_check.py --help > /dev/null
           python tools/agents_bundle.py --help > /dev/null
@@ -46,6 +46,11 @@ jobs:
       # composition carries no closer.
       - name: Schema closer regression suite
         run: python tests/test_schema_closers.py
+      # The contract gate's own suite. The gate itself is a separate job below, because it needs
+      # the full history this one does not fetch — the suite needs neither and belongs here beside
+      # the others.
+      - name: Contract gate regression suite
+        run: python tests/test_contract_check.py
       - name: Base schemas are valid JSON Schema
         run: |
           python - <<'PY'
@@ -66,6 +71,29 @@ jobs:
           a=$(python tools/agents_bundle.py digest --from .)
           b=$(python tools/agents_bundle.py digest --from .)
           echo "$a"; [ "$a" = "$b" ] || { echo "::error::digest is not reproducible"; exit 1; }
+
+  # The rules of `docs/repo-review-rules.md` that are a program rather than a reader: a change to
+  # `bundle/` carries its changelog entry, a base refuses nothing and names no role, and a release
+  # with a non-empty `### Breaking` section gains a MIGRATION.md section naming it. They were prose
+  # in `AGENTS.md` and nothing read them.
+  #
+  # ITS OWN JOB, FOR THE CHECKOUT. Two of the three are diff-scoped, and the `tools` job above
+  # clones at depth 1 — where no base ref resolves, so the gate would report those two as not-run
+  # and pass, every time, looking exactly like a gate that ran. `fetch-depth: 0` is the whole reason
+  # this is not a fourteenth step up there.
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+      - name: The bundle's own contract rules
+        env:
+          # The pull request's base, under the name docs-lint.yml already passes one by. Empty on a
+          # push to main, where the gate resolves `origin/main` itself and the diff is empty.
+          GUARDRAILS_BASE: ${{ github.event.pull_request.base.sha }}
+        run: python ci/contract_check.py gate --root .
 
   # A renderer that is green against nothing has proved nothing. exeris-docs is the pilot consumer,
   # so the tools are exercised against its real tree on every change to them.
