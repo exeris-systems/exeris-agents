@@ -96,16 +96,8 @@ the run (schema rule 14) — a change to `bundle/schemas/` or to `evals/run.py` 
 
 ## Review
 
-Every pull request here is read by the organisation's L2 review — `.github/workflows/guardrails.yml`
-calls it, and `docs-guardrails-review.md` in `exeris-systems/.github` is the routine. This
-repository's own rules are [`docs/repo-review-rules.md`](docs/repo-review-rules.md), applied after
-that routine's steps and under its severity tags, output format and verdict schema: an extension
-adds checks and raises severities, and may not lower one, skip a step or invent a second verdict
-shape. There is deliberately no verdict schema in this repository's `.agents/` — the review
-validates against the organisation's, and a second one here would be a second contract.
-
-The rules of that file which are a program are `ci/contract_check.py`; the rest need a reader and
-say so. A rule added there without a case that can fail it is the defect its own R5 describes.
+This repository's review rules are [`docs/repo-review-rules.md`](docs/repo-review-rules.md), which
+also says which of them are a program (`ci/contract_check.py`) and which need a reader.
 
 ## Safety
 
