@@ -1,0 +1,44 @@
+# The per-repo footprint of ADR-085 §C.11. The gates live once in exeris-systems/.github, and
+# caller-example/guardrails.yml there is the documented copy — what each input means and why each
+# line is shaped this way belongs there, not in a third copy here.
+name: guardrails
+on:
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review, labeled, unlabeled]
+concurrency:
+  group: guardrails-${{ github.event.pull_request.number }}
+  cancel-in-progress: ${{ !endsWith(github.actor, '[bot]') }}
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+
+jobs:
+  docs:
+    uses: exeris-systems/.github/.github/workflows/docs-lint.yml@main
+    with:
+      mode: strict
+      section-check: true
+      # The one deviation, authored in docs/repo-review-rules.md R11: this repository is the bundle
+      # and pins none, so the gate would fetch the tools from `main` and judge a change to them by
+      # the version it replaces. ci.yml runs the checker from the pull request's own tree.
+      agent-check: false
+  commits:
+    uses: exeris-systems/.github/.github/workflows/commit-lint.yml@main
+  pr-body:
+    uses: exeris-systems/.github/.github/workflows/pr-body-check.yml@main
+  docs-review:
+    needs: [docs, commits, pr-body]
+    if: ${{ always() }}
+    uses: exeris-systems/.github/.github/workflows/docs-review.yml@main
+    with:
+      publish: true
+      l1-results: >-
+        {"docs-lint": "${{ needs.docs.result }}",
+         "commit-lint": "${{ needs.commits.result }}",
+         "pr-body-check": "${{ needs.pr-body.result }}"}
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
+      exeris_bot_private_key: ${{ secrets.EXERIS_BOT_PRIVATE_KEY }}

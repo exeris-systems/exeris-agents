@@ -1,3 +1,12 @@
+---
+title: "Changelog — the Exeris agent bundle"
+type: changelog
+visibility: public
+owning-repo: exeris-agents
+status: active
+last-verified: 2026-09-15
+---
+
 # Changelog
 
 All notable changes to the Exeris agent bundle. Keep a Changelog 1.1, SemVer, ADR-085 §H.27.
