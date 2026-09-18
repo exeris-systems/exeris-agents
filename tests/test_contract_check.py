@@ -396,6 +396,17 @@ def test_the_root_must_be_a_directory():
     check("a missing root", refused(lambda: cc.resolved_root(missing)), "not-a-directory")
 
 
+def test_every_file_opened_lies_inside_the_root():
+    d = tree("# Changelog\n")
+    check("a name inside", cc.under_root(d, "CHANGELOG.md"), os.path.join(os.path.realpath(d), "CHANGELOG.md"))
+    check("the root itself", cc.under_root(d), os.path.realpath(d))
+    try:
+        cc.under_root(d, "..", "..", "etc", "passwd")
+        check("a name that escapes", "returned", "ValueError")
+    except ValueError:
+        check("a name that escapes", "ValueError", "ValueError")
+
+
 def test_the_checker_reads_only_the_files_it_names():
     """Three files and no others. A name outside the set is a programming error, not an empty read."""
     d = tree("# Changelog\n")

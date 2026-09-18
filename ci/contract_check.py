@@ -117,6 +117,21 @@ def resolved_root(path: str) -> str:
     return real
 
 
+def under_root(root: str, *parts: str) -> str:
+    """A path inside `root`, or a refusal.
+
+    Stating the invariant rather than relying on the callers to hold it: every file this checker
+    opens lies inside the tree it was handed. The names it joins are constants today, so the check
+    refuses nothing that happens — which is the point at which an invariant is cheapest to write
+    down and easiest to lose.
+    """
+    base = resolved_root(root)
+    path = os.path.realpath(os.path.join(base, *parts))
+    if base != path and os.path.commonpath((base, path)) != base:
+        raise ValueError(f"contract_check: {os.path.join(*parts)!r} leaves the root it was given")
+    return path
+
+
 def changed_paths(root: str, base: str) -> set[str]:
     out = git(root, "diff", "--name-only", f"{base}...HEAD")
     if out is None:                      # a shallow clone has no merge base; the two-dot form still answers
@@ -209,7 +224,7 @@ def read(root: str, name: str) -> str:
     if name not in READS:
         raise ValueError(f"contract_check reads {READS}, not {name!r}")
     try:
-        with open(os.path.join(resolved_root(root), name), encoding="utf-8") as fh:
+        with open(under_root(root, name), encoding="utf-8") as fh:
             return fh.read()
     except OSError:
         return ""
@@ -240,14 +255,14 @@ def gate_bases_are_open(root: str, rep: Report) -> None:
     and a base that acquired a closer through a merge nobody diffed is exactly as broken as one
     that acquired it here.
     """
-    schema_dir = os.path.join(resolved_root(root), *SCHEMA_DIR)
+    schema_dir = under_root(root, *SCHEMA_DIR)
     for name in sorted(os.listdir(schema_dir)) if os.path.isdir(schema_dir) else []:
         if not name.endswith(".base.schema.json"):
             continue
         rel = f"bundle/schemas/{name}"
         rep.checked += 1
         try:
-            with open(os.path.join(schema_dir, name), encoding="utf-8") as fh:
+            with open(under_root(root, *SCHEMA_DIR, name), encoding="utf-8") as fh:
                 doc = json.load(fh)
         except (OSError, ValueError) as exc:
             rep.error(rel, f"unreadable as JSON ({type(exc).__name__}: {exc})", rule="G2")
