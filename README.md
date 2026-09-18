@@ -104,7 +104,7 @@ already conforming.
 ## Licence
 
 Apache-2.0. Contributions follow the terms in the organisation's
-[`CONTRIBUTING.md`](https://github.com/exeris-systems/.github/blob/main/CONTRIBUTING.md).
+[`CONTRIBUTING.md`](https://github.com/exeris-systems/.github/blob/main/.github/CONTRIBUTING.md).
 
 [schema]: https://github.com/exeris-systems/exeris-docs/blob/main/standards/agents-md-schema.md
 [adr]: https://github.com/exeris-systems/exeris-docs/blob/main/adr/ADR-085-documentation-architecture-and-repo-hygiene-standards.md
