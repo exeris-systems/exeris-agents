@@ -1,3 +1,12 @@
+---
+title: "Migration — the Exeris agent bundle"
+type: migration-guide
+visibility: public
+owning-repo: exeris-agents
+status: active
+last-verified: 2026-09-15
+---
+
 # Migration
 
 What a conforming repository has to do to move between two versions of this bundle. One section

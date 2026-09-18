@@ -1,0 +1,112 @@
+# The whole per-repo footprint of ADR-085 §C.11. The gates themselves live once, in
+# exeris-systems/.github; this file is the opt-in.
+#
+# It is the last one written, and that is the thing worth saying about it. This repository holds
+# the organisation's policies, its base decision schemas, the L0 dispatcher and the eval runner —
+# the material every other repository vendors and is judged against — and until this file existed
+# it ran none of it on itself. `ci.yml` proves the tools work; nothing read a pull request body,
+# a commit subject, a document's frontmatter or the substance of a change to `bundle/`. A standard
+# whose own home does not follow it is the first thing a reader stops believing, and the manifest
+# already says so about the agent layout.
+name: guardrails
+on:
+  # labeled/unlabeled matter twice over: adr-conventions rule 9 wants the `adr` label on a pull
+  # request that amends an ADR, and `needs-l2-review` is how a person asks for a re-review after
+  # acting on findings. Without these events, adding either label after a red run cannot turn it
+  # green.
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review, labeled, unlabeled]
+concurrency:
+  group: guardrails-${{ github.event.pull_request.number }}
+  # Not `true`. The publishing half removes the review label as one of its last steps, and that
+  # removal is an `unlabeled` event whose run would cancel the run still publishing it — measured
+  # in exeris-systems/.github#35, where the cancel arrived in the same second the publishing job
+  # finished. A bot-triggered run queues instead; human pushes still collapse, which is what the
+  # setting is for.
+  cancel-in-progress: ${{ !endsWith(github.actor, '[bot]') }}
+
+# A called workflow can only narrow the caller's permissions, never raise them, so this block must
+# be the UNION of what every job below declares. Omitting one does not run that job with less — it
+# makes the whole file invalid, in this repository, on the first push, with no logs. That is how
+# exeris-kernel's first adoption of this file failed. The last two belong to `docs-review`:
+# `id-token: write` for the OIDC exchange the runner action performs, `issues: read` so the routine
+# can see the debt issues of issue-conventions.md rule 6. Neither job writes with them — every
+# write goes through the App's installation token (ADR-087 §B.5).
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+
+jobs:
+  docs:
+    uses: exeris-systems/.github/.github/workflows/docs-lint.yml@main
+    with:
+      # Strict from the first run rather than a ramp, because the backfill is in this same change
+      # and is three files wide: CHANGELOG.md, MIGRATION.md and CLAUDE.md gained frontmatter here.
+      # Measured afterwards, `frontmatter_check.py --root . --mode strict` reports 0 errors over
+      # the ten documents this repository holds. A ramp would be a mandate to re-check later
+      # something that is already clean.
+      mode: strict
+      # Binds nothing today — no page here is typed `subsystem` or `module` — and binds the first
+      # one written. Enabling it while the set is empty is free; enabling it after is a backfill.
+      section-check: true
+      # OFF, and this is the one place this repository cannot use the shared gate as written.
+      # docs-lint fetches the agent bundle from exeris-systems/exeris-agents at the ref the CALLER
+      # pins in `.agents/manifest.yaml`, falling back to `main` when it pins none. This repository
+      # pins none and never will: it *is* the bundle, and `imports: []` here is structural rather
+      # than provisional. So the fallback is always taken, and the checks would run from `main` —
+      # a pull request changing `agents_file_check.py` judged by the version it replaces, silently,
+      # and in the direction that matters, because the wrong rules pass.
+      #
+      # Nothing is lost by turning it off. `ci.yml` runs `agents_file_check.py --root .` from the
+      # pull request's own tree, which is the same check at the right ref, and the adapter half has
+      # nothing to compare: this manifest declares no adapters.
+      agent-check: false
+  commits:
+    uses: exeris-systems/.github/.github/workflows/commit-lint.yml@main
+  pr-body:
+    uses: exeris-systems/.github/.github/workflows/pr-body-check.yml@main
+  # The L2 review of ADR-085 §J.33, published under the organisation's identity by ADR-087 §B.
+  # There is no `claude-code-review.yml` here to replace: this repository had no review at all, so
+  # what this adds is the first reading of a pull request that anything has ever done.
+  #
+  # `needs` is ordering, not dependency: a review judges what the gates cannot, so running it
+  # against a pull request whose commit subject does not lint spends a model to repeat what a
+  # script already said. `l1-results` hands the reviewer their conclusions — without it the runner
+  # tries to read a CI step summary, its harness denies the network call, and all three mandatory
+  # gates land in the verdict as `not-run`, which the publish step correctly turns red for ever.
+  #
+  # `always()` so the publish half still reports when a gate failed: the produce job skips itself
+  # on the results below and the publish half turns that skip into a red naming the failing gates.
+  # A check that does not report is worse than a red one.
+  #
+  # THE REVIEW RUNS ON READINESS, not on every push — when the pull request is opened, reopened,
+  # marked ready for review, or labelled `needs-l2-review` by a person. A push afterwards starts
+  # nothing and leaves the standing verdict visibly covering an older commit, which the publish
+  # half reports as red until a review is asked for again. A verdict is about the tree it read.
+  docs-review:
+    needs: [docs, commits, pr-body]
+    if: ${{ always() }}
+    uses: exeris-systems/.github/.github/workflows/docs-review.yml@main
+    with:
+      # ON. The question `publish: false` was staging for — whether the runner produces a verdict
+      # and what identity it posts under, ADR-087 Engineering Protocol 4 — has been answered on
+      # exeris-systems/.github and on exeris-docs, which both publish. Nothing here is a required
+      # check yet: the name `docs-review / publish / verdict` goes into a branch protection rule
+      # only after a real run has shown it, because a required check whose name does not exist
+      # never reports and the pull request waiting on it can never merge.
+      publish: true
+      l1-results: >-
+        {"docs-lint": "${{ needs.docs.result }}",
+         "commit-lint": "${{ needs.commits.result }}",
+         "pr-body-check": "${{ needs.pr-body.result }}"}
+    # Named rather than inherited, matching exeris-kernel and exeris-sdk, which both refused
+    # `secrets: inherit` under SonarCloud S7631. All three are organisation secrets; the two
+    # EXERIS_BOT_* are optional, and without them the gate still decides while nothing is posted
+    # under the organisation's byline.
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      exeris_bot_app_id: ${{ secrets.EXERIS_BOT_APP_ID }}
+      exeris_bot_private_key: ${{ secrets.EXERIS_BOT_PRIVATE_KEY }}
+  # No javadoc or tsdoc job: this repository ships Python and YAML.

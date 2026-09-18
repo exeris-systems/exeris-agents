@@ -1,0 +1,47 @@
+# The issue-side footprint of issue-conventions.md rules 3 and 5, copied from
+# `caller-example/issues.yml` in exeris-systems/.github.
+#
+# It is here because the taxonomy was absent, and measured absent rather than assumed: on
+# 2026-09-18 this repository held the nine labels GitHub creates with a repository and none of the
+# organisation's. Two of the nine that are missing decide whether the review works at all.
+# `needs-l2-review` is what the readiness trigger waits for, so without it nobody can ask for a
+# re-review after acting on findings — the review runs once, when the pull request is opened, and
+# never again. `l2-human-reviewed` is the door a person walks through when the routine cannot read
+# a change, and a door that does not exist is not an override, it is a dead end.
+#
+# The rest matter in a quieter way: `hard-block`, `doc-debt`, `cross-repo` and `tck-debt` are what
+# the publication applies from a verdict, and the issues API creates a label that does not exist
+# implicitly, in a colour of its own choosing — the taxonomy bypassed in the act of using it.
+#
+# Separate from guardrails.yml because it is not pull-request-triggered and needs `issues: write`,
+# which the pull-request gates deliberately do not have.
+name: issues
+on:
+  # On this file itself, so this merge performs the first sync. Without it the taxonomy stays
+  # absent until somebody dispatches this by hand, and the review wired up in the same change
+  # would go looking for a label nobody can apply.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/issues.yml
+  schedule:
+    - cron: "17 4 * * 1"     # Monday, early. Label drift and stale evidence are not urgent.
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Report label changes without making them"
+        type: boolean
+        default: false
+permissions:
+  issues: write
+
+jobs:
+  labels:
+    uses: exeris-systems/.github/.github/workflows/labels-sync.yml@main
+    with:
+      dry-run: ${{ inputs.dry-run == true }}
+  hygiene:
+    # Not on a taxonomy push. This job closes issues that have gone quiet, and a label definition
+    # changing is no reason to age one out — the weekly run is when that judgement belongs.
+    if: ${{ github.event_name != 'push' }}
+    uses: exeris-systems/.github/.github/workflows/issue-hygiene.yml@main
