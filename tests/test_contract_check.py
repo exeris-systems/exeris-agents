@@ -2,23 +2,16 @@
 """One case per way of failing each contract gate — `ci/contract_check.py`.
 
 The suite exists for the same reason `.github`'s own R2 does: a rule nothing can fail on is not
-enforced, it is described. So every case here was run against a checker with the rule it covers
+enforced, it is described. Every case here was run against a checker with the rule it covers
 removed, which is the only sense in which a case "covers" anything: G1, both halves of G2, G3, G4,
 the R5 locator, `migration_covers`, the ref shape check, the stated-base resolution check, the root
-directory check and the read allowlist each turned this suite red when their rule was taken out.
+directory check and the read allowlist each turned this suite red.
 
-One mutation did not, and it is recorded rather than tidied away. Removing the `break` that ends
-`release_section` at the next release heading changes nothing the suite can see, because the loop
-also leaves the section when that heading flips `inside` to False. The boundary is enforced twice
-and neither half is load-bearing alone, so the case below asserts the behaviour and not that one
-line. A green run that means less than it looks is worth saying out loud.
-
-Two of them are regressions rather than requirements. `test_migration_range_covers_its_target_only`
-is the bug this checker shipped with for an hour: `## 1.4 → 2.0` was read as covering 1.4.0 as well
-as 2.0.0, which hid a standing debt behind the section that supersedes it. And
-`test_release_section_is_bounded` is `release.yml`'s own lesson — a fixed window after a heading
-spills into the neighbouring release, so a version with no Breaking section of its own passes on
-somebody else's.
+`release_section`'s boundary is the one exception, and it is a fact about the coverage rather than
+a gap in it: removing the `break` that ends a section at the next release heading fails nothing
+here, because the loop also leaves the section when that heading flips `inside` to False. The
+boundary is enforced twice and neither half is load-bearing alone, so the case asserts the
+behaviour and not the line.
 
 Run: python3 tests/test_contract_check.py
 """

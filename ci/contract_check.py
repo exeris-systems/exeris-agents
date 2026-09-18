@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """The bundle's own contract rules, as a program rather than as prose.
 
-`AGENTS.md` states seven rules under "Operating contract" and nothing has ever read them. Three of
-them are mechanical — they are true or false about a diff, with no judgement in between — and those
-are `gate` below, which fails. The rest need a reader, and for them this file is `locate`: it finds
-the candidates and says nothing about whether they are defects, because a script that decided that
-would be a reviewer nobody appointed.
+The five rules under "Operating contract" in `AGENTS.md` are prose. Those of them that are true or
+false about a diff, with no judgement in between, are `gate` below, which fails. The rest need a
+reader, and for them this file is `locate`: it finds candidates and decides nothing, because a
+script that decided would be a reviewer nobody appointed.
 
-The split matters more than either half. A rule enforced by a gate is enforced; a rule named in
+Three states, kept apart: a rule a gate decides is enforced; a rule named in
 `docs/repo-review-rules.md` and handed a locator's output is *reported*; a rule that is only prose
-is described. This file is where the first two are kept apart from the third on purpose, and
-`tests/test_contract_check.py` holds one case per way of failing each gate — a rule nothing can
-fail on is not enforced.
+is described. `tests/test_contract_check.py` holds one case per way of failing each gate.
 
-Not in `tools/`, and that is not tidiness: `package.json` publishes `tools` in the npm tarball and
-`docs-lint` checks the tree out into consuming repositories. This asserts things about THIS
-repository's history and would be dead weight in twenty others.
+Not in `tools/`: `package.json` publishes `tools` in the npm tarball and `docs-lint` checks that
+tree out into consuming repositories. This asserts things about THIS repository's history.
 
     python3 ci/contract_check.py gate   [--root .] [--base <ref>]   # exits 1 on a violation
     python3 ci/contract_check.py locate [--root .] [--base <ref>]   # exits 1 when it found candidates
@@ -120,10 +116,9 @@ def resolved_root(path: str) -> str:
 def under_root(root: str, *parts: str) -> str:
     """A path inside `root`, or a refusal.
 
-    Stating the invariant rather than relying on the callers to hold it: every file this checker
-    opens lies inside the tree it was handed. The names it joins are constants today, so the check
-    refuses nothing that happens — which is the point at which an invariant is cheapest to write
-    down and easiest to lose.
+    Every file this checker opens lies inside the tree it was handed. The names it joins are
+    constants today, so this refuses nothing that currently happens; it holds when they stop being
+    constants.
     """
     base = resolved_root(root)
     path = os.path.realpath(os.path.join(base, *parts))
@@ -203,9 +198,8 @@ def migration_covers(text: str, version: str) -> bool:
 
     The file's convention is a range between two `major.minor` — `## 1.4 → 2.0` is the section for
     2.0.0 — so the version a heading covers is the LAST one it names, not any one it mentions. Read
-    the other way round, that heading also claims to cover 1.4.0, whose own breaking change it says
-    nothing about: the first draft of this function did exactly that and hid a standing debt behind
-    the section that supersedes it.
+    the other way round, that heading also covers 1.4.0, whose own breaking change it says nothing
+    about, and the standing debt disappears behind the section that supersedes it.
     """
     short = ".".join(version.split(".")[:2])
     for line in text.splitlines():
@@ -299,11 +293,10 @@ def gate_release_sections(root: str, changed: set[str], changelog_diff: str,
                           migration_diff: str, rep: Report) -> None:
     """G3 and G4 — a release added HERE carries a Breaking section, and pays for a non-empty one.
 
-    Forward-only, and measured rather than chosen that way: `1.1.1` carries no `### Breaking`
-    section at all, and `1.1.0` and `1.4.0` carry non-empty ones with no section in `MIGRATION.md`.
-    A whole-tree form of this rule would be red on history that cannot be edited, which is the
-    permanently-red gate `commit-lint.yml` describes and works around for the same reason. The
-    standing gaps are reported by `locate` instead, where a reader can decide what they are worth.
+    Forward-only, on measurement: `1.1.1` carries no `### Breaking` section at all, and `1.1.0`
+    and `1.4.0` carry non-empty ones with no section in `MIGRATION.md`. A whole-tree form would be
+    red on history that cannot be edited — the permanently-red gate `commit-lint.yml` describes and
+    works around for the same reason. `locate` reports those gaps instead.
     """
     text = read(root, "CHANGELOG.md")
     migration = read(root, "MIGRATION.md")
