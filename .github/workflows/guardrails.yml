@@ -28,10 +28,10 @@ jobs:
     uses: exeris-systems/.github/.github/workflows/commit-lint.yml@main
   pr-body:
     uses: exeris-systems/.github/.github/workflows/pr-body-check.yml@main
-  docs-review:
+  review:
     needs: [docs, commits, pr-body]
     if: ${{ always() }}
-    uses: exeris-systems/.github/.github/workflows/docs-review.yml@main
+    uses: exeris-systems/.github/.github/workflows/review.yml@main
     with:
       publish: true
       l1-results: >-
